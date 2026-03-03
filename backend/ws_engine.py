@@ -45,7 +45,6 @@ from Scalping_Signal import (
     ScalpingSignalEngine,
     SignalWatchlistManager,
     OHLCVBar,
-    SignalPayload,
 )
 
 logger = logging.getLogger(__name__)
