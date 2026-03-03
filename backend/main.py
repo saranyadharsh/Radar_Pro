@@ -36,6 +36,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase_db import SupabaseDB
 from ws_engine    import WSEngine
 
+# Fix yfinance TzCache warning on Render (read-only default path)
+import yfinance as _yf
+try:
+    import os as _os
+    _os.makedirs("/tmp/yf_cache", exist_ok=True)
+    _yf.set_tz_cache_location("/tmp/yf_cache")
+except Exception:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
