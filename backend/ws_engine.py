@@ -45,6 +45,7 @@ from Scalping_Signal import (
     ScalpingSignalEngine,
     SignalWatchlistManager,
     OHLCVBar,
+    TradeSignal,  # <--- Change from SignalPayload to TradeSignal
 )
 
 logger = logging.getLogger(__name__)
