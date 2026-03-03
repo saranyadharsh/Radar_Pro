@@ -81,12 +81,13 @@ export default function LiveDashboard({
   const [loading,      setLoading]      = useState(false)
   const [portfolioData, setPortfolioData] = useState([])
   const [monitorData,   setMonitorData]   = useState([])
+  const [earningsData,  setEarningsData]  = useState([])
 
   const session = metrics?.session ?? 'MARKET_HOURS'
   const isAH    = session === 'AFTER_HOURS'
   const isClosed = session === 'OVERNIGHT_SLEEP' || session === 'CLOSED_WEEKEND'
 
-  // Fetch portfolio and monitor data when source changes
+  // Fetch portfolio, monitor, and earnings data when source changes
   useEffect(() => {
     if (source === 'portfolio') {
       fetch(`${API}/api/portfolio`)
@@ -98,6 +99,13 @@ export default function LiveDashboard({
         .then(r => r.json())
         .then(data => setMonitorData(data.tickers || []))
         .catch(() => setMonitorData([]))
+    } else if (source === 'earnings') {
+      const today = new Date().toISOString().slice(0, 10)
+      const end   = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10)
+      fetch(`${API}/api/earnings?start=${today}&end=${end}`)
+        .then(r => r.json())
+        .then(data => setEarningsData((data || []).map(e => e.ticker)))
+        .catch(() => setEarningsData([]))
     }
   }, [source])
 
@@ -110,7 +118,7 @@ export default function LiveDashboard({
     } else if (source === 'monitor' && monitorData.length > 0) {
       arr = arr.filter(r => monitorData.includes(r.ticker))
     } else if (source === 'earnings') {
-      arr = arr.filter(r => r.is_earnings_gap_play || r.earnings_date)
+      if (earningsData.length > 0) arr = arr.filter(r => earningsData.includes(r.ticker))
     } else if (source === 'favorites') {
       // Favorites would need to be passed as prop or fetched from API
       // For now, filter by diamond stocks as placeholder
@@ -146,7 +154,7 @@ export default function LiveDashboard({
 
     arr.sort((a, b) => (b[sortKey] ?? 0) - (a[sortKey] ?? 0))
     return arr
-  }, [tickers, showNegative, activeFilter, minChange, cfMinPct, cfVol, cfFlags, sortKey, sector, source, portfolioData, monitorData])
+  }, [tickers, showNegative, activeFilter, minChange, cfMinPct, cfVol, cfFlags, sortKey, sector, source, portfolioData, monitorData, earningsData])
 
   // Column config with sparkline
   const tableCols = isAH
@@ -271,18 +279,18 @@ export default function LiveDashboard({
           {!loading && rows.length === 0 && (
             wsStatus === 'connecting' ? (
               <LoadingEmptyState />
-            ) : activeFilter || cfActive ? (
-              <NoResultsEmptyState 
+            ) : tickers.size === 0 ? (
+              <NoDataEmptyState onRetry={() => window.location.reload()} />
+            ) : (
+              <NoResultsEmptyState
                 onClear={() => {
                   setActiveFilter?.(null)
                   setCfMinPct(0)
                   setCfVol('Any')
                   setCfFlags([])
                 }}
-                filterName={activeFilter || 'custom filter'}
+                filterName={source !== 'all' ? source : (activeFilter || 'current filter')}
               />
-            ) : (
-              <NoDataEmptyState onRetry={() => window.location.reload()} />
             )
           )}
           
@@ -409,9 +417,62 @@ export default function LiveDashboard({
             </table>
           </div>
 
+          {/* Load More Section */}
+          {hasMore && (
+            <div className="mt-4 flex flex-col items-center gap-3">
+              <div className={clsx(
+                'flex items-center gap-2 text-xs',
+                darkMode ? 'text-gray-500' : 'text-slate-500'
+              )}>
+                <span>Showing {displayCount} of {rows.length} stocks</span>
+                <span>•</span>
+                <span>{rows.length - displayCount} more available</span>
+              </div>
+              
+              <button
+                onClick={loadMore}
+                disabled={isLoadingMore}
+                className={clsx(
+                  'px-6 py-2.5 rounded-lg font-semibold text-sm transition-all flex items-center gap-2',
+                  darkMode
+                    ? 'bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 hover:bg-cyan-500/30'
+                    : 'bg-blue-500 text-white hover:bg-blue-600',
+                  isLoadingMore && 'opacity-50 cursor-not-allowed'
+                )}
+              >
+                {isLoadingMore ? (
+                  <>
+                    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                    Loading...
+                  </>
+                ) : (
+                  <>
+                    <span>↓ Load More Stocks</span>
+                    <span className={clsx(
+                      'px-2 py-0.5 rounded text-xs font-bold',
+                      darkMode ? 'bg-cyan-500/30' : 'bg-white/30'
+                    )}>
+                      +50
+                    </span>
+                  </>
+                )}
+              </button>
+
+              <p className={clsx(
+                'text-[10px]',
+                darkMode ? 'text-gray-600' : 'text-slate-400'
+              )}>
+                💡 Scroll down to automatically load more stocks
+              </p>
+            </div>
+          )}
+
           {/* Caption */}
-          <p className="text-[10px] text-gray-600 mt-1">
-            Showing {rows.length} stocks | {session}
+          <p className="text-[10px] text-gray-600 mt-3">
+            Showing {displayCount} of {rows.length} stocks | {session}
             {sector && sector !== 'all' ? ` | 🔵 Sector: ${sector}` : ''}
             {activeFilter ? ` | 🔍 Filter: ${activeFilter}` : ''}
             {isAH && rows.some(r => isStale(r)) ? ` | ⏱️ ${rows.filter(r => isStale(r)).length} stale price(s)` : ''}
@@ -439,15 +500,25 @@ export default function LiveDashboard({
           {!loading && rows.length === 0 && (
             wsStatus === 'connecting' ? (
               <LoadingEmptyState />
-            ) : (
+            ) : tickers.size === 0 ? (
               <NoDataEmptyState onRetry={() => window.location.reload()} />
+            ) : (
+              <NoResultsEmptyState
+                onClear={() => {
+                  setActiveFilter?.(null)
+                  setCfMinPct(0)
+                  setCfVol('Any')
+                  setCfFlags([])
+                }}
+                filterName={source !== 'all' ? source : (activeFilter || 'current filter')}
+              />
             )
           )}
           
           {/* Matrix Grid */}
           {!loading && rows.length > 0 && (
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2">
-            {rows.slice(0, 50).map(row => {
+            {displayedRows.map(row => {
               const isPos  = (row.change_value ?? 0) >= 0
               const stale  = isStale(row)
               const sparklineData = generateSparklineData(
@@ -497,9 +568,46 @@ export default function LiveDashboard({
           </div>
           )}
           
+          {/* Load More for Matrix View */}
+          {!loading && rows.length > 0 && hasMore && (
+            <div className="mt-4 flex flex-col items-center gap-3">
+              <button
+                onClick={loadMore}
+                disabled={isLoadingMore}
+                className={clsx(
+                  'px-6 py-2.5 rounded-lg font-semibold text-sm transition-all flex items-center gap-2',
+                  darkMode
+                    ? 'bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 hover:bg-cyan-500/30'
+                    : 'bg-blue-500 text-white hover:bg-blue-600',
+                  isLoadingMore && 'opacity-50 cursor-not-allowed'
+                )}
+              >
+                {isLoadingMore ? (
+                  <>
+                    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                    Loading...
+                  </>
+                ) : (
+                  <>
+                    <span>↓ Load More Cards</span>
+                    <span className={clsx(
+                      'px-2 py-0.5 rounded text-xs font-bold',
+                      darkMode ? 'bg-cyan-500/30' : 'bg-white/30'
+                    )}>
+                      +50
+                    </span>
+                  </>
+                )}
+              </button>
+            </div>
+          )}
+          
           {!loading && rows.length > 0 && (
-            <p className="text-[10px] text-gray-600 mt-1">
-              Showing {Math.min(rows.length, 50)} stocks (top 50) | Matrix View
+            <p className="text-[10px] text-gray-600 mt-3">
+              Showing {displayCount} of {rows.length} stocks | Matrix View
               {sector && sector !== 'all' ? ` | 🔵 ${sector}` : ''}
               {activeFilter ? ` | 🔍 ${activeFilter}` : ''}
             </p>

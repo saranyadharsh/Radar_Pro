@@ -223,6 +223,20 @@ export default function App() {
           {/* RIGHT: Controls */}
           <div className="flex items-center gap-1">
 
+            {/* System Status - Compact */}
+            {m && (
+              <div className={clsx(
+                'hidden lg:flex items-center gap-2 px-3 py-1.5 rounded-lg border text-[10px] mr-1',
+                darkMode ? 'bg-white/5 border-white/10' : 'bg-slate-100 border-slate-200'
+              )}>
+                <span className={clsx('font-bold', wsHealthColor)}>
+                  {m.ws_health === 'Healthy' ? '🟢' : '🟡'} SYS
+                </span>
+                <span className={clsx('text-gray-500', darkMode ? '' : 'text-slate-600')}>|</span>
+                <span className="text-gray-400">{m.live_count ?? 0} live</span>
+              </div>
+            )}
+
             {/* Session toggle */}
             <button
               onClick={() => setAutoSession(a => !a)}
