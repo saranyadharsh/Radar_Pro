@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.env
+config.env
+.env
+.env.local
+*.egg-info/
+.venv/
+venv/
+
+# Secrets — never commit these
+*service_key*
+*api_key*
+*secret*
+
+# Node
+node_modules/
+dist/
+.env.local
+.env.production
+
+# Data files
+*.xlsx
+*.xls
+*.csv
+Cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
