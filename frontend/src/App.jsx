@@ -1,15 +1,17 @@
 /**
  * App.jsx — NexRadar Pro v4.2
  * Professional trading dashboard redesign
+ * NexRadarDashboard added as "🏠 Dashboard" home tab
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import clsx from 'clsx'
 import { useWebSocket } from './hooks/useWebSocket'
-import LiveDashboard from './components/LiveDashboard'
-import SignalFeed    from './components/SignalFeed'
-import ChartPanel    from './components/ChartPanel'
-import Sidebar       from './components/Sidebar'
+import LiveDashboard    from './components/LiveDashboard'
+import SignalFeed       from './components/SignalFeed'
+import ChartPanel       from './components/ChartPanel'
+import Sidebar          from './components/Sidebar'
+import NexRadarDashboard from './components/NexRadarDashboard'   // ← NEW
 
 const API = import.meta.env.VITE_API_BASE || ''
 
@@ -30,27 +32,22 @@ const FILTER_CARDS = [
   { key: 'diamond',      label: 'Diamond',    icon: '💎', metricKey: 'diamond',             color: 'from-amber-500/20 to-yellow-500/10',  border: 'border-amber-500/30',   text: 'text-amber-400' },
 ]
 
-// ── Notification System ───────────────────────────────────────────────────────
+// ── Notification System ────────────────────────────────────────────────────────
 function useNotifications(metrics) {
   const [notes, setNotes] = useState([])
   const prevMetrics = useRef(null)
 
   useEffect(() => {
-    if (!metrics || !prevMetrics.current) {
-      prevMetrics.current = metrics
-      return
-    }
+    if (!metrics || !prevMetrics.current) { prevMetrics.current = metrics; return }
     const prev = prevMetrics.current
     const newNotes = []
     const ts = new Date().toLocaleTimeString()
-
     if ((metrics.volume_spikes ?? 0) > (prev.volume_spikes ?? 0))
       newNotes.push({ id: Date.now() + 1, icon: '🔊', text: `${metrics.volume_spikes} Volume Spikes detected`, time: ts, type: 'vol' })
     if ((metrics.gap_plays ?? 0) > (prev.gap_plays ?? 0))
       newNotes.push({ id: Date.now() + 2, icon: '📊', text: `${metrics.gap_plays} Gap Plays active`, time: ts, type: 'gap' })
     if ((metrics.diamond ?? 0) > (prev.diamond ?? 0))
       newNotes.push({ id: Date.now() + 3, icon: '💎', text: `Diamond alert triggered!`, time: ts, type: 'diamond' })
-
     if (newNotes.length) setNotes(n => [...newNotes, ...n].slice(0, 20))
     prevMetrics.current = metrics
   }, [metrics])
@@ -60,7 +57,7 @@ function useNotifications(metrics) {
   return { notes, dismiss, clearAll }
 }
 
-// ── Notification Panel ────────────────────────────────────────────────────────
+// ── Notification Panel ─────────────────────────────────────────────────────────
 function NotificationPanel({ notes, dismiss, clearAll, onClose }) {
   return (
     <div className="absolute right-0 top-full mt-2 w-80 z-50 rounded-xl border border-white/10
@@ -95,17 +92,18 @@ function NotificationPanel({ notes, dismiss, clearAll, onClose }) {
 }
 
 export default function App() {
-  const [activeTab,     setActiveTab]     = useState('live')
+  // ── "home" is the new NexRadarDashboard; existing tabs stay untouched ──
+  const [activeTab,     setActiveTab]     = useState('home')      // ← DEFAULT changed to 'home'
   const [darkMode,      setDarkMode]      = useState(true)
   const [metrics,       setMetrics]       = useState(null)
   const [activeFilter,  setActiveFilter]  = useState(null)
   const [chartTicker,   setChartTicker]   = useState(() => {
-    // URL-based symbol: nexradar.info/?symbol=AAPL
     const params = new URLSearchParams(window.location.search)
     return params.get('symbol') || ''
   })
   const [chartInterval, setChartInterval] = useState('D')
   const [source,        setSource]        = useState('all')
+  const [sector,        setSector]        = useState('all')
   const [showNotif,     setShowNotif]     = useState(false)
   const [showProfile,   setShowProfile]   = useState(false)
   const [autoSession,   setAutoSession]   = useState(true)
@@ -121,16 +119,19 @@ export default function App() {
     return () => clearInterval(id)
   }, [])
 
+  const handleSourceChange = useCallback((val) => {
+    setSource(val)
+    if (val !== 'stock_list') setSector('all')   // reset sector when leaving Stock List
+  }, [])
+
   const handleSelectTicker = useCallback((sym) => {
     setChartTicker(sym)
     setActiveTab('search')
-    // Update URL without reload
     const url = new URL(window.location)
     url.searchParams.set('symbol', sym)
     window.history.pushState({}, '', url)
   }, [])
 
-  // Auto-open chart if symbol in URL on load
   useEffect(() => {
     if (chartTicker) setActiveTab('search')
   }, [])
@@ -145,10 +146,53 @@ export default function App() {
   const bg = darkMode ? 'bg-[#080c14]' : 'bg-slate-100'
   const fg = darkMode ? 'text-white' : 'text-slate-900'
 
+  // ── Tab definition — 'home' inserted first ─────────────────────────────────
+  const TABS = [
+    { id: 'home',    label: '🏠 Dashboard' },   // ← NEW
+    { id: 'live',    label: '📊 Live Table' },
+    { id: 'search',  label: '🔍 Chart' },
+    { id: 'signals', label: '⚡ Signals' },
+  ]
+
+  // ── When home tab is active, render NexRadarDashboard full-screen ──────────
+  if (activeTab === 'home') {
+    return (
+      <div style={{ position: 'relative' }}>
+        {/* Tab switcher overlaid on top-left so user can navigate back */}
+        <div style={{
+          position: 'fixed', top: 10, left: 260, zIndex: 9999,
+          display: 'flex', gap: 4,
+          background: 'rgba(3,9,18,0.85)', backdropFilter: 'blur(12px)',
+          border: '1px solid rgba(255,255,255,0.1)', borderRadius: 10, padding: '4px 6px',
+        }}>
+          {TABS.map(t => (
+            <button
+              key={t.id}
+              onClick={() => setActiveTab(t.id)}
+              style={{
+                padding: '4px 12px', borderRadius: 7, fontSize: 11, fontWeight: 600,
+                fontFamily: "'JetBrains Mono', monospace", cursor: 'pointer', border: 'none',
+                background: activeTab === t.id ? 'rgba(34,211,238,0.15)' : 'transparent',
+                color: activeTab === t.id ? '#22d3ee' : '#4a6080',
+                borderBottom: activeTab === t.id ? '2px solid #22d3ee' : '2px solid transparent',
+                transition: 'all 0.12s',
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+        {/* Full-screen NexRadar dashboard */}
+        <NexRadarDashboard />
+      </div>
+    )
+  }
+
+  // ── All other tabs: original App shell ────────────────────────────────────
   return (
     <div className={clsx('min-h-screen font-mono', bg, fg)} style={{ fontFamily: "'IBM Plex Mono', 'Fira Code', monospace" }}>
 
-      {/* ── TOP HEADER BAR ──────────────────────────────────────────────────── */}
+      {/* ── TOP HEADER BAR ─────────────────────────────────────────────────── */}
       <header className={clsx(
         'sticky top-0 z-50 h-14 flex items-center justify-between px-4 border-b',
         darkMode
@@ -156,7 +200,7 @@ export default function App() {
           : 'bg-white/95 border-slate-200 backdrop-blur-xl shadow-sm'
       )}>
 
-        {/* ── LEFT: Logo ── */}
+        {/* LEFT: Logo */}
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
             <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-400 to-blue-600
@@ -173,7 +217,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* WS status dot */}
+          {/* WS status */}
           <div className="hidden sm:flex items-center gap-1.5 ml-3 pl-3 border-l border-white/10">
             <span className={clsx('w-1.5 h-1.5 rounded-full shadow-lg', wsDot)} />
             <span className={clsx('text-[10px] font-bold', wsHealthColor)}>
@@ -191,27 +235,19 @@ export default function App() {
           )}
         </div>
 
-        {/* ── CENTER: Quick symbol search ── */}
+        {/* CENTER: Symbol search */}
         <div className="hidden sm:flex items-center gap-2">
           <SymbolSearchBar onSelect={handleSelectTicker} darkMode={darkMode} />
         </div>
 
-        {/* ── RIGHT: Controls ── */}
+        {/* RIGHT: Controls */}
         <div className="flex items-center gap-1">
 
           {/* Session toggle */}
           <button
             onClick={() => setAutoSession(a => !a)}
-            className={clsx(
-              'hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[10px] font-bold',
-              'border transition-all tracking-wide',
-              'mr-1'
-            )}
-            style={{
-              background: sc.bg,
-              borderColor: sc.color + '60',
-              color: sc.color,
-            }}
+            className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[10px] font-bold border transition-all tracking-wide mr-1"
+            style={{ background: sc.bg, borderColor: sc.color + '60', color: sc.color }}
           >
             <span className={clsx('w-1.5 h-1.5 rounded-full', sc.dot)} />
             {sc.short} · {sc.label.toUpperCase()}
@@ -226,7 +262,6 @@ export default function App() {
                 ? 'bg-white/5 hover:bg-white/10 text-yellow-300 border border-white/10'
                 : 'bg-slate-100 hover:bg-slate-200 text-slate-600 border border-slate-200'
             )}
-            title="Toggle dark mode"
           >
             {darkMode ? '☀️' : '🌙'}
           </button>
@@ -251,20 +286,16 @@ export default function App() {
               )}
             </button>
             {showNotif && (
-              <NotificationPanel
-                notes={notes} dismiss={dismiss} clearAll={clearAll}
-                onClose={() => setShowNotif(false)}
-              />
+              <NotificationPanel notes={notes} dismiss={dismiss} clearAll={clearAll} onClose={() => setShowNotif(false)} />
             )}
           </div>
 
-          {/* User profile */}
+          {/* Profile */}
           <div className="relative">
             <button
               onClick={() => { setShowProfile(v => !v); setShowNotif(false) }}
               className={clsx(
-                'w-8 h-8 rounded-lg flex items-center justify-center transition-all',
-                'text-[11px] font-black border',
+                'w-8 h-8 rounded-lg flex items-center justify-center transition-all text-[11px] font-black border',
                 darkMode
                   ? 'bg-gradient-to-br from-cyan-500/20 to-blue-600/20 border-cyan-500/30 text-cyan-400 hover:border-cyan-400/50'
                   : 'bg-gradient-to-br from-blue-50 to-cyan-50 border-blue-200 text-blue-600'
@@ -280,12 +311,7 @@ export default function App() {
                   <p className="text-[10px] text-gray-500">nexradar.info</p>
                 </div>
                 <div className="px-2 py-1">
-                  {[
-                    ['⚙️', 'Settings'],
-                    ['📊', 'Data Source'],
-                    ['🔑', 'API Keys'],
-                    ['❓', 'Help'],
-                  ].map(([icon, label]) => (
+                  {[['⚙️','Settings'],['📊','Data Source'],['🔑','API Keys'],['❓','Help']].map(([icon, label]) => (
                     <button key={label} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg
                                                    text-xs text-gray-400 hover:bg-white/5 hover:text-white transition-colors">
                       <span>{icon}</span>{label}
@@ -298,21 +324,23 @@ export default function App() {
         </div>
       </header>
 
-      {/* ── BODY ────────────────────────────────────────────────────────────── */}
+      {/* ── BODY ──────────────────────────────────────────────────────────── */}
       <div className="flex">
 
-        {/* ── SIDEBAR ── */}
+        {/* SIDEBAR */}
         <Sidebar
           darkMode={darkMode}
           onDarkMode={setDarkMode}
           metrics={metrics}
           wsStatus={wsStatus}
           source={source}
-          onSource={setSource}
+          onSource={handleSourceChange}
+          sector={sector}
+          onSector={setSector}
           tickers={tickers}
         />
 
-        {/* ── MAIN CONTENT ── */}
+        {/* MAIN CONTENT */}
         <main className="flex-1 min-w-0 px-4 py-3">
 
           {/* Filter cards */}
@@ -325,8 +353,7 @@ export default function App() {
                   key={fc.key}
                   onClick={() => setActiveFilter(f => f === fc.key ? null : fc.key)}
                   className={clsx(
-                    'relative rounded-xl p-3 text-left border transition-all overflow-hidden',
-                    'bg-gradient-to-br',
+                    'relative rounded-xl p-3 text-left border transition-all overflow-hidden bg-gradient-to-br',
                     active
                       ? fc.color + ' ' + fc.border + ' ring-1 ring-inset ' + fc.border
                       : darkMode
@@ -338,13 +365,10 @@ export default function App() {
                     active ? fc.text : 'text-gray-500')}>
                     {fc.icon} {fc.label}
                   </div>
-                  <div className={clsx('text-2xl font-black tabular-nums', active ? fc.text : darkMode ? 'text-white' : 'text-slate-800')}>
+                  <div className={clsx('text-2xl font-black tabular-nums',
+                    active ? fc.text : darkMode ? 'text-white' : 'text-slate-800')}>
                     {count}
                   </div>
-                  {active && (
-                    <div className="absolute inset-0 pointer-events-none rounded-xl ring-1 ring-inset opacity-50"
-                         style={{ borderColor: 'currentColor' }} />
-                  )}
                 </button>
               )
             })}
@@ -356,31 +380,21 @@ export default function App() {
               <span className="px-2 py-0.5 rounded bg-blue-900/40 border border-blue-500/30 text-blue-400 font-bold">
                 {FILTER_CARDS.find(f => f.key === activeFilter)?.label}
               </span>
-              <button onClick={() => setActiveFilter(null)}
-                className="text-gray-600 hover:text-gray-400 text-xs">✕ clear</button>
+              <button onClick={() => setActiveFilter(null)} className="text-gray-600 hover:text-gray-400 text-xs">✕ clear</button>
             </div>
           )}
 
           {/* Tabs */}
-          <div className={clsx('flex gap-0 mb-3 rounded-xl p-1 w-fit',
-            darkMode ? 'bg-white/5' : 'bg-slate-100')}>
-            {[
-              { id: 'live',    label: '📊 Dashboard' },
-              { id: 'search',  label: '🔍 Chart'      },
-              { id: 'signals', label: '⚡ Signals'     },
-            ].map(t => (
+          <div className={clsx('flex gap-0 mb-3 rounded-xl p-1 w-fit', darkMode ? 'bg-white/5' : 'bg-slate-100')}>
+            {TABS.map(t => (
               <button
                 key={t.id}
                 onClick={() => setActiveTab(t.id)}
                 className={clsx(
                   'px-4 py-1.5 rounded-lg text-xs font-bold transition-all',
                   activeTab === t.id
-                    ? darkMode
-                      ? 'bg-white/10 text-white shadow-sm'
-                      : 'bg-white text-slate-900 shadow-sm'
-                    : darkMode
-                      ? 'text-gray-500 hover:text-gray-300'
-                      : 'text-slate-500 hover:text-slate-700'
+                    ? darkMode ? 'bg-white/10 text-white shadow-sm' : 'bg-white text-slate-900 shadow-sm'
+                    : darkMode ? 'text-gray-500 hover:text-gray-300' : 'text-slate-500 hover:text-slate-700'
                 )}
               >
                 {t.label}
@@ -393,11 +407,10 @@ export default function App() {
             <LiveDashboard
               tickers={tickers} wsStatus={wsStatus}
               activeFilter={activeFilter} metrics={metrics}
-              source={source} darkMode={darkMode}
+              source={source} sector={sector} darkMode={darkMode}
               onSelectTicker={handleSelectTicker}
             />
           )}
-
           {activeTab === 'search' && (
             <SearchTab
               tickers={tickers}
@@ -413,7 +426,6 @@ export default function App() {
               darkMode={darkMode}
             />
           )}
-
           {activeTab === 'signals' && <SignalFeed />}
 
         </main>
@@ -428,7 +440,6 @@ export default function App() {
         <span>{new Date().toLocaleTimeString()} ET</span>
       </footer>
 
-      {/* Click outside to close panels */}
       {(showNotif || showProfile) && (
         <div className="fixed inset-0 z-40" onClick={() => { setShowNotif(false); setShowProfile(false) }} />
       )}
@@ -439,10 +450,7 @@ export default function App() {
 // ── Symbol Search Bar ──────────────────────────────────────────────────────────
 function SymbolSearchBar({ onSelect, darkMode }) {
   const [val, setVal] = useState('')
-  const submit = () => {
-    const s = val.trim().toUpperCase()
-    if (s) { onSelect(s); setVal('') }
-  }
+  const submit = () => { const s = val.trim().toUpperCase(); if (s) { onSelect(s); setVal('') } }
   return (
     <div className="flex items-center gap-1">
       <input
@@ -451,8 +459,7 @@ function SymbolSearchBar({ onSelect, darkMode }) {
         onKeyDown={e => e.key === 'Enter' && submit()}
         placeholder="Symbol…"
         className={clsx(
-          'w-28 px-2.5 py-1.5 rounded-lg text-[11px] border outline-none transition-all',
-          'font-mono placeholder-gray-600',
+          'w-28 px-2.5 py-1.5 rounded-lg text-[11px] border outline-none transition-all font-mono placeholder-gray-600',
           darkMode
             ? 'bg-white/5 border-white/10 text-white focus:border-cyan-500/50 focus:bg-white/8'
             : 'bg-slate-50 border-slate-200 text-slate-900 focus:border-blue-300'
@@ -472,26 +479,16 @@ function SymbolSearchBar({ onSelect, darkMode }) {
 // ── Search & Chart Tab ─────────────────────────────────────────────────────────
 function SearchTab({ tickers, chartTicker, setChartTicker, chartInterval, setChartInterval, darkMode }) {
   const [input, setInput] = useState(chartTicker)
-
-  // Sync input when chartTicker changes externally (click from table)
-  useEffect(() => {
-    setInput(chartTicker)
-  }, [chartTicker])
+  useEffect(() => { setInput(chartTicker) }, [chartTicker])
 
   const row    = tickers.get(chartTicker)
   const isPos  = row ? (row.change_value ?? 0) >= 0 : null
   const chgVal = Number(row?.change_value ?? 0)
   const chgPct = Number(row?.percent_change ?? 0)
-
-  const loadChart = () => {
-    const s = input.trim().toUpperCase()
-    if (s) setChartTicker(s)
-  }
+  const loadChart = () => { const s = input.trim().toUpperCase(); if (s) setChartTicker(s) }
 
   return (
     <div className="flex flex-col gap-4">
-
-      {/* Controls */}
       <div className="flex items-end gap-3 flex-wrap">
         <div className="flex flex-col gap-1">
           <label className={clsx('text-[10px] uppercase tracking-wider font-bold', darkMode ? 'text-gray-500' : 'text-slate-500')}>Symbol</label>
@@ -514,38 +511,28 @@ function SearchTab({ tickers, chartTicker, setChartTicker, chartInterval, setCha
           <select
             value={chartInterval}
             onChange={e => setChartInterval(e.target.value)}
-            className={clsx(
-              'px-3 py-2 rounded-lg text-sm border outline-none',
-              darkMode
-                ? 'bg-white/5 border-white/10 text-white'
-                : 'bg-white border-slate-200 text-slate-900'
-            )}
+            className={clsx('px-3 py-2 rounded-lg text-sm border outline-none',
+              darkMode ? 'bg-white/5 border-white/10 text-white' : 'bg-white border-slate-200 text-slate-900')}
           >
             {['1','5','15','60','D','W'].map(v => <option key={v} value={v}>{v}</option>)}
           </select>
         </div>
-        <button
-          onClick={loadChart}
+        <button onClick={loadChart}
           className="px-4 py-2 rounded-lg text-sm font-bold bg-gradient-to-r from-cyan-500 to-blue-600
-                     text-white hover:opacity-90 transition-all shadow-lg shadow-blue-500/20"
-        >
+                     text-white hover:opacity-90 transition-all shadow-lg shadow-blue-500/20">
           Load Chart
         </button>
       </div>
 
-      {/* Live metrics row */}
       {chartTicker && row && (
         <div className="grid grid-cols-4 gap-3">
           {[
-            { label: 'Price',   val: `$${Number(row.live_price ?? 0).toFixed(2)}`,   sub: '', color: 'text-white' },
+            { label: 'Price',   val: `$${Number(row.live_price ?? 0).toFixed(2)}`, sub: '', color: 'text-white' },
             { label: 'Change',  val: `${chgVal >= 0 ? '+' : ''}${chgVal.toFixed(2)}`, sub: `${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%`, color: isPos ? 'text-emerald-400' : 'text-red-400' },
             { label: 'Company', val: row.company_name ?? 'N/A', sub: '', color: 'text-gray-300' },
             { label: 'Status',  val: row.went_positive ? '🎯 Turned +' : Math.abs(chgPct) >= 5 ? '💎 Diamond' : '● Active', sub: '', color: isPos ? 'text-emerald-400' : 'text-gray-300' },
           ].map(({ label, val, sub, color }) => (
-            <div key={label} className={clsx(
-              'rounded-xl p-3 border',
-              darkMode ? 'bg-white/3 border-white/8' : 'bg-white border-slate-200'
-            )}>
+            <div key={label} className={clsx('rounded-xl p-3 border', darkMode ? 'bg-white/3 border-white/8' : 'bg-white border-slate-200')}>
               <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-1">{label}</p>
               <p className={clsx('text-base font-black truncate', color)}>{val}</p>
               {sub && <p className={clsx('text-[11px]', isPos ? 'text-emerald-500' : 'text-red-500')}>{sub}</p>}

@@ -8,7 +8,8 @@ Endpoints:
   GET  /health                 → Render health check + UptimeRobot ping
   GET  /api/metrics            → WS health, alert counts, signal engine stats
   GET  /api/tickers            → live snapshot
-  GET  /api/tickers?source=    → filter by source: all / monitor / portfolio
+  GET  /api/tickers?source=    → filter: all / monitor / portfolio / stock_list
+  GET  /api/tickers?sector=    → filter by sector (only when source=stock_list)
   GET  /api/earnings           → earnings calendar
   GET  /api/signals            → scalping signals (latest 200)
   POST /api/signals            → insert signal
@@ -28,15 +29,12 @@ from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from typing import Set, List
 
-# SSL handled in supabase_db.py
-
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from supabase_db import SupabaseDB
 from ws_engine    import WSEngine
 
-# Fix yfinance TzCache warning on Render (read-only default path)
 import yfinance as _yf
 try:
     import os as _os
@@ -98,17 +96,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="NexRadar Pro API", version="4.2.0", lifespan=lifespan)
 
-# Ensure FRONTEND_ORIGIN is set to https://nexradar.info in Render Env Vars
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://nexradar.info")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         FRONTEND_ORIGIN,
-        "https://nexradar.info",                        # Your custom domain
-        "https://radar-pro-frontend-bxtq.onrender.com",  # Your Render frontend URL
-        "http://localhost:5173",                         # Local Vite dev
-        "http://localhost:3000",                         # Local React dev
+        "https://nexradar.info",
+        "https://radar-pro-frontend-bxtq.onrender.com",
+        "http://localhost:5173",
+        "http://localhost:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -133,10 +130,25 @@ async def get_tickers(
     limit:         int  = Query(1500, le=2000),
     only_positive: bool = Query(True),
     source:        str  = Query("all"),
+    sector:        str  = Query(""),        # ← SECTOR: new param
 ):
+    """
+    source values: all | monitor | portfolio | stock_list
+    sector values: "" (all) | Technology | Financials | Healthcare | etc.
+    sector only applies when source=stock_list (ignored otherwise)
+    """
     if not engine:
         return []
-    return engine.get_live_snapshot(limit=limit, only_positive=only_positive, source=source)
+
+    # Sector filter only makes sense for stock_list source
+    effective_sector = sector if source in ("stock_list", "all") else ""
+
+    return engine.get_live_snapshot(
+        limit=limit,
+        only_positive=only_positive,
+        source=source,
+        sector=effective_sector,     # ← SECTOR
+    )
 
 
 # ── Earnings ───────────────────────────────────────────────────────────────────
@@ -187,10 +199,6 @@ async def get_signal_watchlist():
 
 @app.post("/api/signal-watchlist")
 async def set_signal_watchlist(payload: dict):
-    """
-    Body: { "symbols": ["AAPL", "TSLA", ...] }
-    Mirrors sidebar Apply Watchlist button.
-    """
     if not engine:
         return {"error": "not ready"}
 
@@ -204,7 +212,6 @@ async def set_signal_watchlist(payload: dict):
 
 @app.post("/api/signal-vwap-reset")
 async def reset_vwap():
-    """Mirrors 'Reset VWAP (Market Open)' button."""
     if not engine:
         return {"error": "not ready"}
     engine._signal_engine.reset_vwap_all()
@@ -220,7 +227,6 @@ async def ws_live(websocket: WebSocket):
     logger.info(f"WS client connected — total: {len(_clients)}")
 
     try:
-        # Full snapshot on connect so UI isn't blank
         if engine:
             import orjson
             snapshot = engine.get_live_snapshot()

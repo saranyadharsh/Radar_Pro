@@ -9,11 +9,9 @@ import time
 import logging
 from typing import Dict, List
 
-
-
 # ── SSL fix: remove SSL_CERT_FILE so httpx uses its own bundled certs ─────────
 import os as _os
-_os.environ.pop("SSL_CERT_FILE", None)   # prevents httpx FileNotFoundError on Windows
+_os.environ.pop("SSL_CERT_FILE", None)
 
 from supabase import create_client, Client
 
@@ -62,11 +60,32 @@ class SupabaseDB:
             logger.error(f"get_company_map: {e}")
             return {}
 
+    # ── SECTOR MAP (NEW) ──────────────────────────────────────────────────────
+    def get_sector_map(self) -> Dict[str, str]:
+        """
+        Returns {ticker: sector} for all active tickers.
+        Uses the existing `sector` column in stock_list table.
+        Called once at startup by WSEngine to populate sector_map.
+        """
+        try:
+            resp = (
+                self.client.table("stock_list")
+                .select("ticker, sector")
+                .eq("is_active", 1)
+                .execute()
+            )
+            return {
+                r["ticker"]: (r.get("sector") or "Unknown")
+                for r in (resp.data or [])
+            }
+        except Exception as e:
+            logger.error(f"get_sector_map: {e}")
+            return {}
+
     # ── Live tickers ──────────────────────────────────────────────────────────
     def upsert_tickers(self, rows: List[Dict]) -> bool:
         if not rows:
             return True
-        # Cast types — Supabase rejects Python floats for BIGINT/BOOLEAN columns
         INT_FIELDS  = ("volume", "last_update", "update_count")
         BOOL_FIELDS = ("volume_spike", "is_gap_play", "ah_momentum",
                        "went_positive", "is_positive")

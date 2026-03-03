@@ -3,15 +3,11 @@ ws_engine.py — NexRadar Pro
 ============================
 Cloud-safe WebSocket engine.
 
-Uses:
-  - Massive WebSocketClient (same import as original)
-  - T.* trades + A.* aggregate subscriptions (identical to original)
-  - ALL alert logic from Stock_dashboard_ws_smartalert.py (unchanged)
-  - Scalping_Signal.py ScalpingSignalEngine + SignalWatchlistManager (identical)
-  - Supabase writes instead of SQLite
-
-Removed (Windows-only):
-  winsound, pyttsx3, ctypes, webbrowser, rich.live, winotify
+SECTOR CHANGES (marked with # ← SECTOR):
+  1. sector_map loaded at start() from supabase stock_list
+  2. cache_entry includes sector field on every tick
+  3. get_live_snapshot() accepts sector= param and filters by it
+  4. Source filter now correctly handles "stock_list" (same as "all")
 """
 
 import os
@@ -29,9 +25,7 @@ import pytz
 import yfinance as yf
 import requests
 
-
-
-# ── SSL fix ──────────────────────────────────────────────────────────────────
+# ── SSL fix ───────────────────────────────────────────────────────────────────
 import os as _os
 _os.environ.pop("SSL_CERT_FILE", None)
 
@@ -40,20 +34,18 @@ from massive.websocket.models import WebSocketMessage, Market
 
 from supabase_db import SupabaseDB
 
-# ── Scalping Signal Engine — identical to original ───────────────────────────
-# Change this in ws_engine.py:
 from Scalping_Signal import (
     ScalpingSignalEngine,
     SignalWatchlistManager,
     OHLCVBar,
-    TradeSignal,  # <--- Change from SignalPayload to TradeSignal
+    TradeSignal,
 )
 
 logger = logging.getLogger(__name__)
 
 ET_TZ = pytz.timezone("America/New_York")
 
-# ── Constants (identical to Stock_dashboard_ws_smartalert.py) ─────────────────
+# ── Constants ──────────────────────────────────────────────────────────────────
 VOLUME_SPIKE_THRESHOLD       = 2.0
 VOLUME_SPIKE_HIGH_THRESHOLD  = 5.0
 GAP_THRESHOLD_PERCENT        = 3.0
@@ -74,26 +66,20 @@ DEFAULT_SIGNAL_WATCHLIST = [
 
 def _market_session() -> str:
     t = datetime.now(ET_TZ).time()
-    if dt_time(4, 0) <= t < dt_time(9, 30):   return "pre"
+    if dt_time(4, 0) <= t < dt_time(9, 30):    return "pre"
     elif dt_time(9, 30) <= t < dt_time(16, 0): return "market"
     elif dt_time(16, 0) <= t < dt_time(20, 0): return "after"
     return "closed"
 
 
 def _get_market_status() -> str:
-    """Mirrors get_market_status() from Radar_Production.py."""
     now = datetime.now(ET_TZ)
     t = now.time()
-    if now.weekday() >= 5:
-        return "CLOSED_WEEKEND"
-    if dt_time(20, 0) <= t or t < dt_time(4, 0):
-        return "OVERNIGHT_SLEEP"
-    if dt_time(4, 0) <= t < dt_time(9, 30):
-        return "PRE_MARKET"
-    if dt_time(9, 30) <= t < dt_time(16, 0):
-        return "MARKET_HOURS"
-    if dt_time(16, 0) <= t < dt_time(20, 0):
-        return "AFTER_HOURS"
+    if now.weekday() >= 5:                      return "CLOSED_WEEKEND"
+    if dt_time(20, 0) <= t or t < dt_time(4, 0): return "OVERNIGHT_SLEEP"
+    if dt_time(4, 0) <= t < dt_time(9, 30):    return "PRE_MARKET"
+    if dt_time(9, 30) <= t < dt_time(16, 0):   return "MARKET_HOURS"
+    if dt_time(16, 0) <= t < dt_time(20, 0):   return "AFTER_HOURS"
     return "CLOSED"
 
 
@@ -103,10 +89,6 @@ def _calculate_backoff(retry_count: int) -> float:
 
 
 class WSEngine:
-    """
-    Cloud WebSocket engine — mirrors StockDashboard from
-    Stock_dashboard_ws_smartalert.py with all alert logic preserved.
-    """
 
     def __init__(self, broadcast_cb: Optional[Callable] = None, loop=None):
         self.massive_api_key: str = os.getenv("MASSIVE_API_KEY", "")
@@ -114,38 +96,37 @@ class WSEngine:
         self._broadcast_cb = broadcast_cb
         self._loop = loop
 
-        # ── State mirrors original StockDashboard ─────────────────────────────
+        # ── State ──────────────────────────────────────────────────────────────
         self.all_tickers: Set[str]            = set()
         self.company_map: Dict[str, str]      = {}
+        self.sector_map:  Dict[str, str]      = {}   # ← SECTOR: {ticker: sector}
         self.alert_cache: Dict[str, Dict]     = {}
         self.alert_cache_lock                 = threading.Lock()
         self.historical_data: Dict[str, Dict] = {}
         self.historical_data_lock             = threading.Lock()
         self.intraday_highs: Dict[str, float] = {}
 
-        # ── WebSocket state ───────────────────────────────────────────────────
+        # ── WebSocket state ────────────────────────────────────────────────────
         self.ws_health_status    = "connecting"
         self.ws_retry_count      = 0
         self.last_message_time   = time.time()
         self.polygon_ws_client: Optional[WebSocketClient] = None
         self.ws_lock             = threading.Lock()
 
-        # ── Throttled Broadcast State ────────────────────────────────────────
-        self._last_broadcast_ts = {} 
-        self._BROADCAST_THROTTLE_SEC = 0.35  # Limits UI updates to ~3 per sec per ticker
+        # ── Throttled Broadcast ────────────────────────────────────────────────
+        self._last_broadcast_ts = {}
+        self._BROADCAST_THROTTLE_SEC = 0.35
 
         # ── AH close refresh ──────────────────────────────────────────────────
         self.last_ah_close_refresh = 0.0
 
-        # ── Scalping Signal Engine (identical to original) ────────────────────
+        # ── Scalping Signal Engine ────────────────────────────────────────────
         self._signal_engine  = ScalpingSignalEngine()
         self._signal_watcher = SignalWatchlistManager(self._signal_engine)
         self._signal_watcher.set_watchlist(DEFAULT_SIGNAL_WATCHLIST)
-
-        # Register signal callback → write to Supabase
         self._signal_engine.on_signal(self._on_signal)
 
-        # ── Source stats (mirrors original source_stats) ──────────────────────
+        # ── Source stats ──────────────────────────────────────────────────────
         self.source_stats = {
             "total_attempted": 0,
             "polygon_success": 0,
@@ -174,6 +155,10 @@ class WSEngine:
         self.all_tickers = set(tickers[:MAX_WEBSOCKET_TICKERS])
         self.company_map = company_map
 
+        # ← SECTOR: Load sector map once at startup
+        self.sector_map = self.db.get_sector_map()
+        logger.info(f"Loaded sector map: {len(self.sector_map)} tickers with sector data")
+
         threading.Thread(
             target=self._fetch_historical_batch,
             args=(list(self.all_tickers),),
@@ -199,7 +184,7 @@ class WSEngine:
                     pass
                 self.polygon_ws_client = None
 
-    # ── MASSIVE WS LISTENER (mirrors original _websocket_listener_thread) ────
+    # ── MASSIVE WS LISTENER ───────────────────────────────────────────────────
 
     def _ws_listener_loop(self):
         last_subscribed: Set[str] = set()
@@ -227,7 +212,6 @@ class WSEngine:
                             verbose=False,
                         )
 
-                    # T.* (trades) + A.* (1-min aggregates) — identical to original
                     subs = []
                     for t in current:
                         subs.append(f"T.{t}")
@@ -240,7 +224,6 @@ class WSEngine:
                     self.ws_health_status = "Healthy"
                     logger.info("✅ Massive WS connected (T+A)")
 
-                    # Blocking — mirrors original .run(handle_msg=...)
                     self.polygon_ws_client.run(handle_msg=self._on_websocket_message)
 
                 except Exception as e:
@@ -250,7 +233,7 @@ class WSEngine:
             else:
                 time.sleep(0.5)
 
-    # ── MESSAGE HANDLER (mirrors original _on_websocket_message exactly) ──────
+    # ── MESSAGE HANDLER ───────────────────────────────────────────────────────
 
     def _on_websocket_message(self, msgs):
         if not self.run_event.is_set():
@@ -263,7 +246,6 @@ class WSEngine:
             if not ticker or ticker not in self.all_tickers:
                 continue
 
-            # Try all price attrs — T.* uses price/p, A.* uses close/c
             price = (
                 getattr(msg, "price", None) or
                 getattr(msg, "p",     None) or
@@ -281,11 +263,9 @@ class WSEngine:
                 logger.debug(f"Invalid price {ticker}: {e}")
                 continue
 
-            # Feed A.* bars to Scalping Signal Engine (identical to original)
             if hasattr(msg, "open") or hasattr(msg, "op"):
                 self._signal_watcher.process_aggregate_message(msg)
 
-        # AH close refresh every 2 min (mirrors original)
         if _market_session() == "after":
             now = time.time()
             if (now - self.last_ah_close_refresh) > AH_CLOSE_REFRESH_INTERVAL:
@@ -294,10 +274,11 @@ class WSEngine:
                     target=self._refresh_ah_closing_prices, daemon=True
                 ).start()
 
-    # ── ALERT CACHE LOGIC (mirrors original _update_alert_cache_logic) ───────
+    # ── ALERT CACHE LOGIC ─────────────────────────────────────────────────────
 
     def _update_alert_cache_logic(self, ticker: str, live_price: float, msg=None):
         company_name = self.company_map.get(ticker, ticker)
+        sector       = self.sector_map.get(ticker, "Unknown")  # ← SECTOR
 
         with self.historical_data_lock:
             hist = self.historical_data.get(ticker, {})
@@ -307,7 +288,6 @@ class WSEngine:
         ref_avgvol  = hist.get("avg_volume", 0)
         today_close = hist.get("today_close", 0.0)
 
-        # Change vs open (market hours) or today_close (AH)
         session = _market_session()
         if session == "after" and today_close > 0:
             base = today_close
@@ -317,7 +297,6 @@ class WSEngine:
         change_value   = live_price - base if base else 0
         percent_change = (change_value / base * 100) if base else 0
 
-        # Volume from A.* message if available
         with self.alert_cache_lock:
             prev = self.alert_cache.get(ticker, {})
 
@@ -327,7 +306,6 @@ class WSEngine:
             if vol_raw:
                 try:
                     vol_to_use = float(vol_raw)
-                    # Update avg_volume in historical
                     with self.historical_data_lock:
                         if ticker in self.historical_data:
                             self.historical_data[ticker]["last_volume"] = vol_to_use
@@ -342,7 +320,6 @@ class WSEngine:
             "none"
         )
 
-        # Gap detection (vs prev close)
         gap_pct = ((ref_open - ref_prev) / ref_prev * 100) if ref_prev else 0
         is_gap  = abs(gap_pct) >= GAP_THRESHOLD_PERCENT
         gap_dir = "up" if gap_pct > 0 else ("down" if gap_pct < 0 else "none")
@@ -352,17 +329,14 @@ class WSEngine:
             "normal"
         )
 
-        # Earnings gap play flag
         is_earnings_gap = is_gap and hasattr(self, "earning_date_map") and ticker in getattr(self, "earning_date_map", {})
 
-        # AH momentum (mirrors original)
         ah_mom = False
         if session == "after" and today_close > 0:
             ah_move      = abs(live_price - today_close)
             regular_move = abs(today_close - ref_prev) if ref_prev else 0
             ah_mom = ah_move > regular_move * AH_MOMENTUM_MULTIPLIER
 
-        # Intraday high-water mark (HWM) + pullback state
         hwm = self.intraday_highs.get(ticker, live_price)
         if live_price > hwm:
             self.intraday_highs[ticker] = live_price
@@ -375,7 +349,6 @@ class WSEngine:
             "neutral"
         )
 
-        # Positive / went_positive (60s sticky window — mirrors v4.2 fix)
         is_positive = change_value >= 0
         went_positive = 0
         with self.alert_cache_lock:
@@ -394,6 +367,7 @@ class WSEngine:
         cache_entry = {
             "ticker":              ticker,
             "company_name":        company_name,
+            "sector":              sector,              # ← SECTOR: now in every tick
             "live_price":          live_price,
             "open":                ref_open,
             "prev_close":          ref_prev,
@@ -423,7 +397,6 @@ class WSEngine:
         with self.alert_cache_lock:
             self.alert_cache[ticker] = cache_entry
 
-        # 1. QUEUE FOR DATABASE (Always happens every tick)
         self._pending_writes[ticker] = cache_entry
         now = time.time()
         if now - self._last_db_flush >= self._DB_FLUSH_INTERVAL:
@@ -431,24 +404,20 @@ class WSEngine:
             self._pending_writes.clear()
             self._last_db_flush = now
 
-        # 2. PRIORITY BYPASS CHECK (New logic starts here)
-        # Bypasses the 0.35s throttle for critical market moves
         is_priority = (
-            abs(percent_change) >= 5.0 or   # Big Price Move
-            vol_spike or                    # Volume Surge
-            is_gap or                       # Large Opening Gap
-            went_positive == 1              # Trend Reversal (Red to Green)
+            abs(percent_change) >= 5.0 or
+            vol_spike or
+            is_gap or
+            went_positive == 1
         )
 
-        # 3. THROTTLED BROADCAST TO REACT
         last_sent = self._last_broadcast_ts.get(ticker, 0)
-        
         if is_priority or (now - last_sent) >= self._BROADCAST_THROTTLE_SEC:
             if self._broadcast_cb and self._loop:
                 asyncio.run_coroutine_threadsafe(
                     self._broadcast_cb({
-                        "type": "tick", 
-                        "ticker": ticker, 
+                        "type": "tick",
+                        "ticker": ticker,
                         "data": cache_entry
                     }),
                     self._loop,
@@ -458,7 +427,6 @@ class WSEngine:
     # ── SIGNAL CALLBACK ───────────────────────────────────────────────────────
 
     def _on_signal(self, signal):
-        """Fires when ScalpingSignalEngine emits a TradeSignal. Writes to Supabase."""
         try:
             row = {
                 "symbol":       signal.symbol,
@@ -480,7 +448,7 @@ class WSEngine:
         except Exception as e:
             logger.error(f"Signal write error: {e}")
 
-    # ── AH CLOSE REFRESH (mirrors original _refresh_ah_closing_prices) ────────
+    # ── AH CLOSE REFRESH ──────────────────────────────────────────────────────
 
     def _refresh_ah_closing_prices(self):
         if not self.massive_api_key or not self.all_tickers:
@@ -489,7 +457,7 @@ class WSEngine:
             with self.ws_lock:
                 snap = set(self.all_tickers)
 
-            url  = (
+            url = (
                 f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
                 f"?apiKey={self.massive_api_key}"
             )
@@ -529,7 +497,7 @@ class WSEngine:
         except Exception as e:
             logger.error(f"AH close refresh: {e}")
 
-    # ── HISTORICAL FETCH (mirrors original _fetch_historical_batch) ───────────
+    # ── HISTORICAL FETCH ──────────────────────────────────────────────────────
 
     def _fetch_historical_batch(self, tickers: List[str]):
         logger.info(f"Fetching historical data for {len(tickers)} tickers …")
@@ -606,15 +574,24 @@ class WSEngine:
         limit: int = 1500,
         only_positive: bool = True,
         source: str = "all",
+        sector: str = "",           # ← SECTOR: new param
     ) -> List[Dict]:
         with self.alert_cache_lock:
             rows = list(self.alert_cache.values())
 
-        # Source filter (mirrors data_source selector)
+        # Source filter
+        # "stock_list" and "all" show everything (stock_list IS all tickers)
         if source == "monitor":
-            rows = [r for r in rows if r["ticker"] in self._monitor_tickers]
+            monitor_set = getattr(self, "_monitor_tickers", set())
+            rows = [r for r in rows if r["ticker"] in monitor_set]
         elif source == "portfolio":
-            rows = [r for r in rows if r["ticker"] in self._portfolio_tickers]
+            portfolio_set = getattr(self, "_portfolio_tickers", set())
+            rows = [r for r in rows if r["ticker"] in portfolio_set]
+        # "stock_list" and "all" → no ticker filter, just apply sector below
+
+        # ← SECTOR: filter by sector when Stock List is selected
+        if sector and sector not in ("", "all"):
+            rows = [r for r in rows if r.get("sector", "").lower() == sector.lower()]
 
         if only_positive:
             rows = [r for r in rows if r.get("is_positive")]
@@ -623,9 +600,8 @@ class WSEngine:
         return rows[:limit]
 
     def get_metrics(self) -> Dict:
-        """Mirrors StockDashboard.get_metrics()."""
         with self.alert_cache_lock:
-            cache_vals   = list(self.alert_cache.values())
+            cache_vals = list(self.alert_cache.values())
         active_set   = self.all_tickers
         now_ts       = time.time()
 
@@ -643,24 +619,23 @@ class WSEngine:
         last_msg = datetime.fromtimestamp(self.last_message_time).strftime("%H:%M:%S")
 
         return {
-            "ws_health":        self.ws_health_status,
-            "ws_retry_count":   self.ws_retry_count,
-            "last_update":      last_msg,
-            "last_tick":        last_msg,
-            "total_tickers":    len(self.all_tickers),
-            "cached_tickers":   len(self.alert_cache),
-            "live_count":       live_count,
-            "pos_count":        pos_count,
-            "turned_positive":  turned_count,
-            "volume_spikes":    vol_spikes,
-            "gap_plays":        gap_plays,
-            "ah_momentum":      ah_mom,
+            "ws_health":          self.ws_health_status,
+            "ws_retry_count":     self.ws_retry_count,
+            "last_update":        last_msg,
+            "last_tick":          last_msg,
+            "total_tickers":      len(self.all_tickers),
+            "cached_tickers":     len(self.alert_cache),
+            "live_count":         live_count,
+            "pos_count":          pos_count,
+            "turned_positive":    turned_count,
+            "volume_spikes":      vol_spikes,
+            "gap_plays":          gap_plays,
+            "ah_momentum":        ah_mom,
             "earnings_gap_plays": earnings_gaps,
-            "diamond":          diamond_cnt,
-            "session":          _get_market_status(),
-            "source_stats":     self.source_stats,
-            # Signal engine stats
-            "signal_watched":   len(self._signal_watcher.watched),
-            "signal_count":     len(self._signal_engine.signal_history),
-            "signal_bars":      len(self._signal_engine._calcs),
+            "diamond":            diamond_cnt,
+            "session":            _get_market_status(),
+            "source_stats":       self.source_stats,
+            "signal_watched":     len(self._signal_watcher.watched),
+            "signal_count":       len(self._signal_engine.signal_history),
+            "signal_bars":        len(self._signal_engine._calcs),
         }

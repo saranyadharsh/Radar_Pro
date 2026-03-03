@@ -8,6 +8,7 @@
 
 import { useState, useEffect } from 'react'
 import clsx from 'clsx'
+import SectorFilter from './SectorFilter'
 
 const API = import.meta.env.VITE_API_BASE || ''
 
@@ -49,6 +50,7 @@ export default function Sidebar({
   darkMode, onDarkMode,
   metrics, wsStatus,
   source, onSource,
+  sector, onSector,
   tickers,
 }) {
   const [collapsed,     setCollapsed]     = useState(false)
@@ -206,10 +208,23 @@ export default function Sidebar({
                 : 'bg-white border-slate-200 text-slate-900'
             )}
           >
-            {['all','monitor','portfolio','earnings','favorites'].map(s => (
-              <option key={s} value={s}>{s.charAt(0).toUpperCase() + s.slice(1)}</option>
+            {['all','stock_list','monitor','portfolio','earnings','favorites'].map(s => (
+              <option key={s} value={s}>
+                {s === 'all'        ? 'All'
+                : s === 'stock_list' ? 'Stock List'
+                : s.charAt(0).toUpperCase() + s.slice(1)}
+              </option>
             ))}
           </select>
+
+          {/* Sector filter — only shown when Stock List is selected */}
+          {source === 'stock_list' && (
+            <SectorFilter
+              sector={sector || 'all'}
+              onSector={onSector}
+              darkMode={darkMode}
+            />
+          )}
         </Section>
 
         {/* Display Settings */}

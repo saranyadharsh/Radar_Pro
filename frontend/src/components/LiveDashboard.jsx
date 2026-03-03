@@ -64,7 +64,7 @@ function MatrixBadges({ row }) {
 }
 
 export default function LiveDashboard({
-  tickers, wsStatus, activeFilter, metrics, source, darkMode, onSelectTicker,
+  tickers, wsStatus, activeFilter, metrics, source, sector, darkMode, onSelectTicker,
 }) {
   const [viewMode,     setViewMode]     = useState('table')
   const [minChange,    setMinChange]    = useState(0)
@@ -83,6 +83,11 @@ export default function LiveDashboard({
     let arr = Array.from(tickers.values())
 
     if (!showNegative) arr = arr.filter(r => r.is_positive)
+
+    // Sector filter (only meaningful when source === 'stock_list')
+    if (sector && sector !== 'all') {
+      arr = arr.filter(r => (r.sector ?? '').toLowerCase() === sector.toLowerCase())
+    }
 
     // Active filter card
     if (activeFilter === 'volume_spike') arr = arr.filter(r => r.volume_spike)
@@ -105,7 +110,7 @@ export default function LiveDashboard({
 
     arr.sort((a, b) => (b[sortKey] ?? 0) - (a[sortKey] ?? 0))
     return arr
-  }, [tickers, showNegative, activeFilter, minChange, cfMinPct, cfVol, cfFlags, sortKey])
+  }, [tickers, showNegative, activeFilter, minChange, cfMinPct, cfVol, cfFlags, sortKey, sector])
 
   // Column config mirrors original
   const tableCols = isAH
@@ -312,6 +317,7 @@ export default function LiveDashboard({
           {/* Caption */}
           <p className="text-[10px] text-gray-600 mt-1">
             Showing {rows.length} stocks | {session}
+            {sector && sector !== 'all' ? ` | 🔵 Sector: ${sector}` : ''}
             {activeFilter ? ` | 🔍 Filter: ${activeFilter}` : ''}
             {isAH && rows.some(r => isStale(r)) ? ` | ⏱️ ${rows.filter(r => isStale(r)).length} stale price(s)` : ''}
           </p>
@@ -359,6 +365,7 @@ export default function LiveDashboard({
           </div>
           <p className="text-[10px] text-gray-600 mt-1">
             Showing {Math.min(rows.length, 50)} stocks (top 50) | Matrix View
+            {sector && sector !== 'all' ? ` | 🔵 ${sector}` : ''}
             {activeFilter ? ` | 🔍 ${activeFilter}` : ''}
           </p>
         </div>
