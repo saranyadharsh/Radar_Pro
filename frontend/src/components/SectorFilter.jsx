@@ -1,27 +1,29 @@
 /**
- * SectorFilter.jsx
- * Drop this anywhere — used inside Sidebar when source === 'Stock List'
- * 
- * Props:
- *   sector    : string  — current selected sector ('all' or sector name)
- *   onSector  : fn      — setter
- *   darkMode  : bool
+ * SectorFilter.jsx — NexRadar Pro v4.3
+ * Updated sector list: TECHNOLOGY, CONSUMER, BANKING, BIO, BM & UENE, REALCOM, INDUSTRIALS
  */
 
 const SECTORS = [
   'all',
-  'Technology',
-  'Consumer Discretionary',
-  'Consumer Staples',
-  'Financials',
-  'Healthcare',
-  'Industrials',
-  'Energy',
-  'Utilities',
-  'Materials',
-  'Real Estate',
-  'Communication Services',
+  'TECHNOLOGY',
+  'CONSUMER',
+  'BANKING',
+  'BIO',
+  'BM & UENE',
+  'REALCOM',
+  'INDUSTRIALS',
 ]
+
+const SECTOR_LABELS = {
+  'all':         'All Sectors',
+  'TECHNOLOGY':  '💻 Technology',
+  'CONSUMER':    '🛍 Consumer',
+  'BANKING':     '🏦 Banking',
+  'BIO':         '🧬 Bio / Healthcare',
+  'BM & UENE':   '⚡ BM & Energy',
+  'REALCOM':     '🏢 Real Estate / Comm',
+  'INDUSTRIALS': '🏭 Industrials',
+}
 
 export default function SectorFilter({ sector, onSector, darkMode }) {
   return (
@@ -35,7 +37,7 @@ export default function SectorFilter({ sector, onSector, darkMode }) {
         color: '#4a6080',
         marginBottom: 5,
       }}>
-        Sector
+        Sector / Industry
       </label>
       <select
         value={sector}
@@ -56,12 +58,11 @@ export default function SectorFilter({ sector, onSector, darkMode }) {
       >
         {SECTORS.map(s => (
           <option key={s} value={s}>
-            {s === 'all' ? 'All Sectors' : s}
+            {SECTOR_LABELS[s] || s}
           </option>
         ))}
       </select>
 
-      {/* Active sector badge */}
       {sector !== 'all' && (
         <div style={{
           display: 'flex',
@@ -74,23 +75,16 @@ export default function SectorFilter({ sector, onSector, darkMode }) {
           border: '1px solid rgba(34,211,238,0.2)',
         }}>
           <span style={{ fontSize: 8, color: '#22d3ee', letterSpacing: '.06em' }}>
-            🔵 {sector}
+            🔵 {SECTOR_LABELS[sector] || sector}
           </span>
           <button
             onClick={() => onSector('all')}
             style={{
-              background: 'none',
-              border: 'none',
-              color: '#4a6080',
-              fontSize: 11,
-              cursor: 'pointer',
-              lineHeight: 1,
-              padding: 0,
+              background: 'none', border: 'none', color: '#4a6080',
+              fontSize: 11, cursor: 'pointer', lineHeight: 1, padding: 0,
             }}
             title="Clear sector filter"
-          >
-            ×
-          </button>
+          >×</button>
         </div>
       )}
     </div>

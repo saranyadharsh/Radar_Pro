@@ -119,7 +119,7 @@ export default function Sidebar({
       if (bulkTarget === 'tradingview') {
         window.open(`https://www.tradingview.com/chart/?symbol=${r.ticker}`, '_blank')
       } else {
-        window.open(`https://finance.yahoo.com/chart/${r.ticker}`, '_blank')
+        window.open(`https://finance.yahoo.com/quote/${r.ticker}/`, '_blank')
       }
     })
   }
