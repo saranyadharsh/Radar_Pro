@@ -130,6 +130,10 @@ class WSEngine:
         self.polygon_ws_client: Optional[WebSocketClient] = None
         self.ws_lock             = threading.Lock()
 
+        # ── Throttled Broadcast State ────────────────────────────────────────
+        self._last_broadcast_ts = {} 
+        self._BROADCAST_THROTTLE_SEC = 0.35  # Limits UI updates to ~3 per sec per ticker
+
         # ── AH close refresh ──────────────────────────────────────────────────
         self.last_ah_close_refresh = 0.0
 
@@ -419,7 +423,7 @@ class WSEngine:
         with self.alert_cache_lock:
             self.alert_cache[ticker] = cache_entry
 
-        # Queue DB write
+        # 1. QUEUE FOR DATABASE (Always happens every tick)
         self._pending_writes[ticker] = cache_entry
         now = time.time()
         if now - self._last_db_flush >= self._DB_FLUSH_INTERVAL:
@@ -427,12 +431,29 @@ class WSEngine:
             self._pending_writes.clear()
             self._last_db_flush = now
 
-        # Broadcast to React
-        if self._broadcast_cb and self._loop:
-            asyncio.run_coroutine_threadsafe(
-                self._broadcast_cb({"type": "tick", "ticker": ticker, "data": cache_entry}),
-                self._loop,
-            )
+        # 2. PRIORITY BYPASS CHECK (New logic starts here)
+        # Bypasses the 0.35s throttle for critical market moves
+        is_priority = (
+            abs(percent_change) >= 5.0 or   # Big Price Move
+            vol_spike or                    # Volume Surge
+            is_gap or                       # Large Opening Gap
+            went_positive == 1              # Trend Reversal (Red to Green)
+        )
+
+        # 3. THROTTLED BROADCAST TO REACT
+        last_sent = self._last_broadcast_ts.get(ticker, 0)
+        
+        if is_priority or (now - last_sent) >= self._BROADCAST_THROTTLE_SEC:
+            if self._broadcast_cb and self._loop:
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_cb({
+                        "type": "tick", 
+                        "ticker": ticker, 
+                        "data": cache_entry
+                    }),
+                    self._loop,
+                )
+                self._last_broadcast_ts[ticker] = now
 
     # ── SIGNAL CALLBACK ───────────────────────────────────────────────────────
 
