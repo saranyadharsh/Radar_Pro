@@ -35,5 +35,28 @@ export default {
       },
     },
   },
-  plugins: [],
+  plugins: [
+    function({ addUtilities }) {
+      addUtilities({
+        '.scrollbar-thin': {
+          'scrollbar-width': 'thin',
+          'scrollbar-color': 'rgba(100, 116, 139, 0.5) transparent',
+        },
+        '.scrollbar-thin::-webkit-scrollbar': {
+          height: '6px',
+          width: '6px',
+        },
+        '.scrollbar-thin::-webkit-scrollbar-track': {
+          background: 'transparent',
+        },
+        '.scrollbar-thin::-webkit-scrollbar-thumb': {
+          background: 'rgba(100, 116, 139, 0.5)',
+          'border-radius': '3px',
+        },
+        '.scrollbar-thin::-webkit-scrollbar-thumb:hover': {
+          background: 'rgba(100, 116, 139, 0.7)',
+        },
+      })
+    },
+  ],
 }

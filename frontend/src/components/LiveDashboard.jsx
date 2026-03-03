@@ -329,7 +329,20 @@ export default function LiveDashboard({
                         stale ? 'opacity-40 italic' : rowStyle,
                       )}
                     >
-                      <td className="py-2 px-3 font-bold">{row.ticker}</td>
+                      <td className="py-2 px-3">
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold">{row.ticker}</span>
+                          {activeFilter && (
+                            <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-500/20 border border-blue-500/30 text-blue-400">
+                              {activeFilter === 'gap_play' && row.is_gap_play && '📊'}
+                              {activeFilter === 'volume_spike' && row.volume_spike && '🔊'}
+                              {activeFilter === 'ah_momentum' && row.ah_momentum && '🌙'}
+                              {activeFilter === 'earnings_gap' && row.is_earnings_gap_play && '📰'}
+                              {activeFilter === 'diamond' && Math.abs(row.percent_change ?? 0) >= 5 && '💎'}
+                            </span>
+                          )}
+                        </div>
+                      </td>
                       <td className="py-2 px-3 text-gray-400 max-w-[140px] truncate">{row.company_name}</td>
 
                       {isAH ? (

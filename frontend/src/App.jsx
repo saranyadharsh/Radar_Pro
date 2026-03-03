@@ -163,239 +163,158 @@ export default function App() {
     { id: 'portfolio', label: 'PORTFOLIO' },
   ]
 
-  // ── When home tab is active, render NexRadarDashboard full-screen ──────────
-  if (activeTab === 'home') {
-    return (
-      <div style={{ position: 'relative' }}>
-        {/* Tab switcher overlaid on top-left so user can navigate back */}
-        <div style={{
-          position: 'fixed', top: 10, left: 260, zIndex: 9999,
-          display: 'flex', gap: 4,
-          background: 'rgba(3,9,18,0.85)', backdropFilter: 'blur(12px)',
-          border: '1px solid rgba(255,255,255,0.1)', borderRadius: 10, padding: '4px 6px',
-        }}>
-          {TABS.map(t => (
-            <button
-              key={t.id}
-              onClick={() => setActiveTab(t.id)}
-              style={{
-                padding: '4px 12px', borderRadius: 7, fontSize: 11, fontWeight: 600,
-                fontFamily: "'JetBrains Mono', monospace", cursor: 'pointer', border: 'none',
-                background: activeTab === t.id ? 'rgba(34,211,238,0.15)' : 'transparent',
-                color: activeTab === t.id ? '#22d3ee' : '#4a6080',
-                borderBottom: activeTab === t.id ? '2px solid #22d3ee' : '2px solid transparent',
-                transition: 'all 0.12s',
-              }}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
-        {/* Full-screen NexRadar dashboard */}
-        <NexRadarDashboard />
-      </div>
-    )
-  }
-
-  // ── All other tabs: original App shell ────────────────────────────────────
+  // ── All tabs use the same shell with unified navigation ────────────────────
   return (
     <div className={clsx('min-h-screen font-mono', bg, fg)} style={{ fontFamily: "'IBM Plex Mono', 'Fira Code', monospace" }}>
 
-      {/* ── TOP HEADER BAR ─────────────────────────────────────────────────── */}
+      {/* ── TOP HEADER BAR WITH NAVIGATION ────────────────────────────────── */}
       <header className={clsx(
-        'sticky top-0 z-50 h-14 flex items-center justify-between px-4 border-b',
+        'sticky top-0 z-50 border-b',
         darkMode
           ? 'bg-[#080c14]/95 border-white/10 backdrop-blur-xl'
           : 'bg-white/95 border-slate-200 backdrop-blur-xl shadow-sm'
       )}>
-
-        {/* LEFT: Logo */}
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-400 to-blue-600
-                            flex items-center justify-center text-white font-black text-xs shadow-lg shadow-blue-500/30">
-              N
-            </div>
-            <div className="leading-none">
-              <div className={clsx('text-[13px] font-black tracking-tight', darkMode ? 'text-white' : 'text-slate-900')}>
-                NEXRADAR
+        
+        {/* Top row: Logo, Status, Controls */}
+        <div className="h-14 flex items-center justify-between px-4">
+          {/* LEFT: Logo */}
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2">
+              <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-400 to-blue-600
+                              flex items-center justify-center text-white font-black text-xs shadow-lg shadow-blue-500/30">
+                N
               </div>
-              <div className="text-[9px] tracking-[0.2em] text-cyan-400 font-bold uppercase">
-                Pro
-              </div>
-            </div>
-          </div>
-
-          {/* WS status */}
-          <div className="hidden sm:flex items-center gap-1.5 ml-3 pl-3 border-l border-white/10">
-            <span className={clsx('w-1.5 h-1.5 rounded-full shadow-lg', wsDot)} />
-            <span className={clsx('text-[10px] font-bold', wsHealthColor)}>
-              {wsStatus === 'Healthy' || wsStatus === 'open' ? 'LIVE' : wsStatus.toUpperCase()}
-            </span>
-          </div>
-
-          {/* Live counts */}
-          {m && (
-            <div className="hidden md:flex items-center gap-3 ml-2 text-[10px] text-gray-500">
-              <span>📡 <b className="text-gray-300">{m.live_count ?? 0}</b> live</span>
-              <span>📊 <b className="text-gray-300">{m.total_tickers?.toLocaleString() ?? 0}</b> total</span>
-              <span>🟢 <b className="text-emerald-400">{m.pos_count ?? 0}</b> pos</span>
-            </div>
-          )}
-        </div>
-
-        {/* CENTER: Symbol search */}
-        <div className="hidden sm:flex items-center gap-2">
-          <SymbolSearchBar onSelect={handleSelectTicker} darkMode={darkMode} />
-        </div>
-
-        {/* RIGHT: Controls */}
-        <div className="flex items-center gap-1">
-
-          {/* Session toggle */}
-          <button
-            onClick={() => setAutoSession(a => !a)}
-            className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[10px] font-bold border transition-all tracking-wide mr-1"
-            style={{ background: sc.bg, borderColor: sc.color + '60', color: sc.color }}
-          >
-            <span className={clsx('w-1.5 h-1.5 rounded-full', sc.dot)} />
-            {sc.short} · {sc.label.toUpperCase()}
-          </button>
-
-          {/* Dark mode */}
-          <button
-            onClick={() => setDarkMode(d => !d)}
-            className={clsx(
-              'w-8 h-8 rounded-lg flex items-center justify-center text-sm transition-all',
-              darkMode
-                ? 'bg-white/5 hover:bg-white/10 text-yellow-300 border border-white/10'
-                : 'bg-slate-100 hover:bg-slate-200 text-slate-600 border border-slate-200'
-            )}
-          >
-            {darkMode ? '☀️' : '🌙'}
-          </button>
-
-          {/* Notifications */}
-          <div className="relative">
-            <button
-              onClick={() => { setShowNotif(v => !v); setShowProfile(false) }}
-              className={clsx(
-                'w-8 h-8 rounded-lg flex items-center justify-center text-sm transition-all relative',
-                darkMode
-                  ? 'bg-white/5 hover:bg-white/10 border border-white/10'
-                  : 'bg-slate-100 hover:bg-slate-200 border border-slate-200'
-              )}
-            >
-              🔔
-              {notes.length > 0 && (
-                <span className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-500 text-white
-                                 text-[9px] font-black flex items-center justify-center leading-none">
-                  {notes.length > 9 ? '9+' : notes.length}
-                </span>
-              )}
-            </button>
-            {showNotif && (
-              <NotificationPanel notes={notes} dismiss={dismiss} clearAll={clearAll} onClose={() => setShowNotif(false)} />
-            )}
-          </div>
-
-          {/* Profile */}
-          <div className="relative">
-            <button
-              onClick={() => { setShowProfile(v => !v); setShowNotif(false) }}
-              className={clsx(
-                'w-8 h-8 rounded-lg flex items-center justify-center transition-all text-[11px] font-black border',
-                darkMode
-                  ? 'bg-gradient-to-br from-cyan-500/20 to-blue-600/20 border-cyan-500/30 text-cyan-400 hover:border-cyan-400/50'
-                  : 'bg-gradient-to-br from-blue-50 to-cyan-50 border-blue-200 text-blue-600'
-              )}
-            >
-              NR
-            </button>
-            {showProfile && (
-              <div className="absolute right-0 top-full mt-2 w-52 z-50 rounded-xl border border-white/10
-                              bg-[#0d1117]/95 backdrop-blur-xl shadow-2xl overflow-hidden">
-                <div className="px-4 py-3 border-b border-white/10">
-                  <p className="text-sm font-bold text-white">NexRadar Pro</p>
-                  <p className="text-[10px] text-gray-500">nexradar.info</p>
+              <div className="leading-none">
+                <div className={clsx('text-[13px] font-black tracking-tight', darkMode ? 'text-white' : 'text-slate-900')}>
+                  NEXRADAR
                 </div>
-                <div className="px-2 py-1">
-                  {[['⚙️','Settings'],['📊','Data Source'],['🔑','API Keys'],['❓','Help']].map(([icon, label]) => (
-                    <button key={label} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg
-                                                   text-xs text-gray-400 hover:bg-white/5 hover:text-white transition-colors">
-                      <span>{icon}</span>{label}
-                    </button>
-                  ))}
+                <div className="text-[9px] tracking-[0.2em] text-cyan-400 font-bold uppercase">
+                  Pro
                 </div>
               </div>
-            )}
-          </div>
-        </div>
-      </header>
+            </div>
 
-      {/* ── BODY ──────────────────────────────────────────────────────────── */}
-      <div className="flex">
-
-        {/* SIDEBAR */}
-        <Sidebar
-          darkMode={darkMode}
-          onDarkMode={setDarkMode}
-          metrics={metrics}
-          wsStatus={wsStatus}
-          source={source}
-          onSource={handleSourceChange}
-          sector={sector}
-          onSector={setSector}
-          tickers={tickers}
-        />
-
-        {/* MAIN CONTENT */}
-        <main className="flex-1 min-w-0 px-4 py-3">
-
-          {/* Filter cards */}
-          <div className="grid grid-cols-5 gap-2 mb-3">
-            {FILTER_CARDS.map(fc => {
-              const active = activeFilter === fc.key
-              const count  = m?.[fc.metricKey] ?? 0
-              return (
-                <button
-                  key={fc.key}
-                  onClick={() => setActiveFilter(f => f === fc.key ? null : fc.key)}
-                  className={clsx(
-                    'relative rounded-xl p-3 text-left border transition-all overflow-hidden bg-gradient-to-br',
-                    active
-                      ? fc.color + ' ' + fc.border + ' ring-1 ring-inset ' + fc.border
-                      : darkMode
-                        ? 'from-white/3 to-white/0 border-white/8 hover:border-white/15'
-                        : 'from-slate-50 to-white border-slate-200 hover:border-blue-200'
-                  )}
-                >
-                  <div className={clsx('text-[10px] font-bold uppercase tracking-wider mb-1',
-                    active ? fc.text : 'text-gray-500')}>
-                    {fc.icon} {fc.label}
-                  </div>
-                  <div className={clsx('text-2xl font-black tabular-nums',
-                    active ? fc.text : darkMode ? 'text-white' : 'text-slate-800')}>
-                    {count}
-                  </div>
-                </button>
-              )
-            })}
-          </div>
-
-          {activeFilter && (
-            <div className="flex items-center gap-2 mb-2 text-[11px]">
-              <span className="text-gray-500">Filtering by</span>
-              <span className="px-2 py-0.5 rounded bg-blue-900/40 border border-blue-500/30 text-blue-400 font-bold">
-                {FILTER_CARDS.find(f => f.key === activeFilter)?.label}
+            {/* WS status */}
+            <div className="hidden sm:flex items-center gap-1.5 ml-3 pl-3 border-l border-white/10">
+              <span className={clsx('w-1.5 h-1.5 rounded-full shadow-lg', wsDot)} />
+              <span className={clsx('text-[10px] font-bold', wsHealthColor)}>
+                {wsStatus === 'Healthy' || wsStatus === 'open' ? 'LIVE' : wsStatus.toUpperCase()}
               </span>
-              <button onClick={() => setActiveFilter(null)} className="text-gray-600 hover:text-gray-400 text-xs">✕ clear</button>
             </div>
-          )}
 
-          {/* Tabs */}
-          <div className={clsx('flex gap-1 mb-3 rounded-xl p-1.5 w-fit border', 
-            darkMode ? 'bg-[#0a0f1a] border-white/10' : 'bg-slate-50 border-slate-200')}>
+            {/* Live counts */}
+            {m && (
+              <div className="hidden md:flex items-center gap-3 ml-2 text-[10px] text-gray-500">
+                <span>📡 <b className="text-gray-300">{m.live_count ?? 0}</b> live</span>
+                <span>📊 <b className="text-gray-300">{m.total_tickers?.toLocaleString() ?? 0}</b> total</span>
+                <span>🟢 <b className="text-emerald-400">{m.pos_count ?? 0}</b> pos</span>
+              </div>
+            )}
+          </div>
+
+          {/* CENTER: Symbol search */}
+          <div className="hidden sm:flex items-center gap-2">
+            <SymbolSearchBar onSelect={handleSelectTicker} darkMode={darkMode} />
+          </div>
+
+          {/* RIGHT: Controls */}
+          <div className="flex items-center gap-1">
+
+            {/* Session toggle */}
+            <button
+              onClick={() => setAutoSession(a => !a)}
+              className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[10px] font-bold border transition-all tracking-wide mr-1"
+              style={{ background: sc.bg, borderColor: sc.color + '60', color: sc.color }}
+            >
+              <span className={clsx('w-1.5 h-1.5 rounded-full', sc.dot)} />
+              {sc.short} · {sc.label.toUpperCase()}
+            </button>
+
+            {/* Dark/Light Mode Toggle Switch */}
+            <button
+              onClick={() => setDarkMode(d => !d)}
+              className={clsx(
+                'relative w-14 h-7 rounded-full transition-all duration-300 border',
+                darkMode
+                  ? 'bg-slate-700 border-slate-600'
+                  : 'bg-amber-200 border-amber-300'
+              )}
+              title={darkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+            >
+              <span className={clsx(
+                'absolute top-0.5 w-6 h-6 rounded-full transition-all duration-300 flex items-center justify-center text-xs',
+                darkMode
+                  ? 'left-0.5 bg-slate-900 text-yellow-300'
+                  : 'left-7 bg-white text-amber-600'
+              )}>
+                {darkMode ? '🌙' : '☀️'}
+              </span>
+            </button>
+
+            {/* Notifications */}
+            <div className="relative">
+              <button
+                onClick={() => { setShowNotif(v => !v); setShowProfile(false) }}
+                className={clsx(
+                  'w-8 h-8 rounded-lg flex items-center justify-center text-sm transition-all relative',
+                  darkMode
+                    ? 'bg-white/5 hover:bg-white/10 border border-white/10'
+                    : 'bg-slate-100 hover:bg-slate-200 border border-slate-200'
+                )}
+              >
+                🔔
+                {notes.length > 0 && (
+                  <span className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-500 text-white
+                                   text-[9px] font-black flex items-center justify-center leading-none">
+                    {notes.length > 9 ? '9+' : notes.length}
+                  </span>
+                )}
+              </button>
+              {showNotif && (
+                <NotificationPanel notes={notes} dismiss={dismiss} clearAll={clearAll} onClose={() => setShowNotif(false)} />
+              )}
+            </div>
+
+            {/* Profile */}
+            <div className="relative">
+              <button
+                onClick={() => { setShowProfile(v => !v); setShowNotif(false) }}
+                className={clsx(
+                  'w-8 h-8 rounded-lg flex items-center justify-center transition-all text-[11px] font-black border',
+                  darkMode
+                    ? 'bg-gradient-to-br from-cyan-500/20 to-blue-600/20 border-cyan-500/30 text-cyan-400 hover:border-cyan-400/50'
+                    : 'bg-gradient-to-br from-blue-50 to-cyan-50 border-blue-200 text-blue-600'
+                )}
+              >
+                NR
+              </button>
+              {showProfile && (
+                <div className="absolute right-0 top-full mt-2 w-52 z-50 rounded-xl border border-white/10
+                                bg-[#0d1117]/95 backdrop-blur-xl shadow-2xl overflow-hidden">
+                  <div className="px-4 py-3 border-b border-white/10">
+                    <p className="text-sm font-bold text-white">NexRadar Pro</p>
+                    <p className="text-[10px] text-gray-500">nexradar.info</p>
+                  </div>
+                  <div className="px-2 py-1">
+                    {[['⚙️','Settings'],['📊','Data Source'],['🔑','API Keys'],['❓','Help']].map(([icon, label]) => (
+                      <button key={label} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg
+                                                     text-xs text-gray-400 hover:bg-white/5 hover:text-white transition-colors">
+                        <span>{icon}</span>{label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Navigation Tabs Row - Scrollable */}
+        <div className={clsx(
+          'border-t overflow-x-auto scrollbar-thin',
+          darkMode ? 'border-white/10 bg-[#0a0f1a]' : 'border-slate-200 bg-slate-50'
+        )}>
+          <div className="flex gap-0 px-4 min-w-max">
             {TABS.map(t => (
               <button
                 key={t.id}
@@ -407,63 +326,158 @@ export default function App() {
                   else if (t.id === 'live') handleSourceChange('all')
                 }}
                 className={clsx(
-                  'px-5 py-2 rounded-lg text-[11px] font-bold tracking-wide transition-all uppercase',
+                  'px-6 py-3 text-[11px] font-bold tracking-wide transition-all uppercase whitespace-nowrap border-b-2',
                   activeTab === t.id
                     ? darkMode 
-                      ? 'bg-gradient-to-r from-cyan-500/20 to-blue-500/20 text-cyan-400 border border-cyan-500/30 shadow-lg shadow-cyan-500/10' 
-                      : 'bg-white text-blue-600 border border-blue-200 shadow-sm'
+                      ? 'text-cyan-400 border-cyan-400 bg-cyan-500/5' 
+                      : 'text-blue-600 border-blue-600 bg-blue-50'
                     : darkMode 
-                      ? 'text-gray-500 hover:text-gray-300 hover:bg-white/5' 
-                      : 'text-slate-500 hover:text-slate-700 hover:bg-white/50'
+                      ? 'text-gray-500 border-transparent hover:text-gray-300 hover:bg-white/5' 
+                      : 'text-slate-500 border-transparent hover:text-slate-700 hover:bg-white/50'
                 )}
               >
                 {t.label}
               </button>
             ))}
           </div>
+        </div>
+      </header>
 
-          {/* Tab content */}
-          {activeTab === 'live' && (
-            <LiveDashboard
-              tickers={tickers} wsStatus={wsStatus}
-              activeFilter={activeFilter} metrics={metrics}
-              source={source} sector={sector} darkMode={darkMode}
-              onSelectTicker={handleSelectTicker}
-            />
-          )}
-          {activeTab === 'earnings' && (
-            <LiveDashboard
-              tickers={tickers} wsStatus={wsStatus}
-              activeFilter={activeFilter} metrics={metrics}
-              source="earnings" sector={sector} darkMode={darkMode}
-              onSelectTicker={handleSelectTicker}
-            />
-          )}
-          {activeTab === 'portfolio' && (
-            <LiveDashboard
-              tickers={tickers} wsStatus={wsStatus}
-              activeFilter={activeFilter} metrics={metrics}
-              source="portfolio" sector={sector} darkMode={darkMode}
-              onSelectTicker={handleSelectTicker}
-            />
-          )}
-          {activeTab === 'search' && (
-            <SearchTab
-              tickers={tickers}
-              chartTicker={chartTicker}
-              setChartTicker={(sym) => {
-                setChartTicker(sym)
-                const url = new URL(window.location)
-                url.searchParams.set('symbol', sym)
-                window.history.pushState({}, '', url)
-              }}
-              chartInterval={chartInterval}
-              setChartInterval={setChartInterval}
-              darkMode={darkMode}
-            />
-          )}
-          {activeTab === 'signals' && <SignalFeed />}
+      {/* ── BODY ──────────────────────────────────────────────────────────── */}
+      <div className="flex">
 
+        {/* SIDEBAR - Only show for non-dashboard tabs */}
+        {activeTab !== 'home' && (
+          <Sidebar
+            darkMode={darkMode}
+            onDarkMode={setDarkMode}
+            metrics={metrics}
+            wsStatus={wsStatus}
+            source={source}
+            onSource={handleSourceChange}
+            sector={sector}
+            onSector={setSector}
+            tickers={tickers}
+          />
+        )}
+
+        {/* MAIN CONTENT */}
+        <main className={clsx('flex-1 min-w-0', activeTab !== 'home' && 'px-4 py-3')}>
+
+          {/* Dashboard - Full screen */}
+          {activeTab === 'home' && <NexRadarDashboard />}
+
+          {/* Other tabs - With filter cards and content */}
+          {activeTab !== 'home' && (
+            <>
+              {/* Filter cards */}
+              <div className="grid grid-cols-5 gap-2 mb-3">
+                {FILTER_CARDS.map(fc => {
+                  const active = activeFilter === fc.key
+                  const count  = m?.[fc.metricKey] ?? 0
+                  return (
+                    <button
+                      key={fc.key}
+                      onClick={() => setActiveFilter(f => f === fc.key ? null : fc.key)}
+                      className={clsx(
+                        'relative rounded-xl p-3 text-left border transition-all overflow-hidden bg-gradient-to-br cursor-pointer',
+                        active
+                          ? fc.color + ' ' + fc.border + ' ring-2 ring-inset ' + fc.border + ' shadow-lg'
+                          : darkMode
+                            ? 'from-white/3 to-white/0 border-white/8 hover:border-white/20 hover:from-white/5'
+                            : 'from-slate-50 to-white border-slate-200 hover:border-blue-300 hover:shadow-md'
+                      )}
+                      title={`Click to filter by ${fc.label}`}
+                    >
+                      <div className={clsx('text-[10px] font-bold uppercase tracking-wider mb-1',
+                        active ? fc.text : 'text-gray-500')}>
+                        {fc.icon} {fc.label}
+                      </div>
+                      <div className={clsx('text-2xl font-black tabular-nums',
+                        active ? fc.text : darkMode ? 'text-white' : 'text-slate-800')}>
+                        {count}
+                      </div>
+                      {active && (
+                        <div className="absolute top-1 right-1">
+                          <span className={clsx('text-xs', fc.text)}>✓</span>
+                        </div>
+                      )}
+                    </button>
+                  )
+                })}
+              </div>
+
+              {activeFilter && (
+                <div className="flex items-center justify-between gap-2 mb-3 p-3 rounded-lg border"
+                  style={{
+                    background: darkMode ? 'rgba(59, 130, 246, 0.1)' : 'rgba(59, 130, 246, 0.05)',
+                    borderColor: darkMode ? 'rgba(59, 130, 246, 0.3)' : 'rgba(59, 130, 246, 0.2)'
+                  }}>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-gray-500">Active Filter:</span>
+                    <span className="px-3 py-1 rounded-lg bg-blue-500/20 border border-blue-500/30 text-blue-400 font-bold text-xs">
+                      {FILTER_CARDS.find(f => f.key === activeFilter)?.icon} {FILTER_CARDS.find(f => f.key === activeFilter)?.label}
+                    </span>
+                    <span className="text-[11px] text-gray-400">
+                      Showing stocks with {activeFilter === 'gap_play' ? 'gap play signals' : 
+                                          activeFilter === 'volume_spike' ? 'volume spikes (2x+)' :
+                                          activeFilter === 'ah_momentum' ? 'after-hours momentum' :
+                                          activeFilter === 'earnings_gap' ? 'earnings gap plays' :
+                                          activeFilter === 'diamond' ? '5%+ change' : 'this filter'}
+                    </span>
+                  </div>
+                  <button 
+                    onClick={() => setActiveFilter(null)} 
+                    className="px-3 py-1 rounded-lg bg-red-500/20 border border-red-500/30 text-red-400 hover:bg-red-500/30 transition-all text-xs font-semibold"
+                  >
+                    ✕ Clear Filter
+                  </button>
+                </div>
+              )}
+
+              {/* Tab content */}
+              {activeTab === 'live' && (
+                <LiveDashboard
+                  tickers={tickers} wsStatus={wsStatus}
+                  activeFilter={activeFilter} metrics={metrics}
+                  source={source} sector={sector} darkMode={darkMode}
+                  onSelectTicker={handleSelectTicker}
+                />
+              )}
+              {activeTab === 'earnings' && (
+                <LiveDashboard
+                  tickers={tickers} wsStatus={wsStatus}
+                  activeFilter={activeFilter} metrics={metrics}
+                  source="earnings" sector={sector} darkMode={darkMode}
+                  onSelectTicker={handleSelectTicker}
+                />
+              )}
+              {activeTab === 'portfolio' && (
+                <LiveDashboard
+                  tickers={tickers} wsStatus={wsStatus}
+                  activeFilter={activeFilter} metrics={metrics}
+                  source="portfolio" sector={sector} darkMode={darkMode}
+                  onSelectTicker={handleSelectTicker}
+                />
+              )}
+              {activeTab === 'search' && (
+                <SearchTab
+                  tickers={tickers}
+                  chartTicker={chartTicker}
+                  setChartTicker={(sym) => {
+                    setChartTicker(sym)
+                    const url = new URL(window.location)
+                    url.searchParams.set('symbol', sym)
+                    window.history.pushState({}, '', url)
+                  }}
+                  chartInterval={chartInterval}
+                  setChartInterval={setChartInterval}
+                  darkMode={darkMode}
+                />
+              )}
+              {activeTab === 'signals' && <SignalFeed />}
+            </>
+          )}
         </main>
       </div>
 
@@ -506,7 +520,7 @@ export default function App() {
 
       {/* WebSocket Connection Status Banner */}
       {wsStatus !== 'Healthy' && wsStatus !== 'open' && (
-        <div className="fixed top-14 left-0 right-0 z-50 bg-gradient-to-r from-amber-900 to-orange-900 
+        <div className="fixed top-[104px] left-0 right-0 z-50 bg-gradient-to-r from-amber-900 to-orange-900 
                         backdrop-blur-sm border-b border-amber-700 px-4 py-3 shadow-lg animate-slideDown">
           <div className="max-w-7xl mx-auto flex items-center justify-between">
             <div className="flex items-center gap-3">

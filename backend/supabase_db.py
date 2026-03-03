@@ -98,7 +98,7 @@ class SupabaseDB:
                     except: r[f] = 0
             for f in BOOL_FIELDS:
                 if f in r and r[f] is not None:
-                    r[f] = bool(r[f])
+                    r[f] = int(bool(r[f]))
             cleaned.append(r)
         try:
             self.client.table("live_tickers").upsert(cleaned).execute()
