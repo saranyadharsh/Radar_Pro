@@ -1,20 +1,25 @@
 /**
- * NexRadarDashboard.jsx — v6.0 — LIVE SUPABASE DATA
+ * NexRadarDashboard.jsx — v7.0 — COMPLETE DATA SOURCE FIX
  *
- * FIXES v6:
- *  1. Sector filter: fetches /api/stocks (stock_list) → builds Map<ticker,{sector}>
- *     merges into every live_ticker row — works even if WS snapshot has no sector
- *  2. Tabs SIGNALS / EARNINGS / PORTFOLIO now render real full-page content
- *  3. live_price ALWAYS shown — never replaced by AH/session price
- *  4. PORTFOLIO tab fetches /api/portfolio and shows full holdings + P&L
+ * ALL DATA SOURCE SELECTIONS NOW WORK:
+ *  ALL        → v_live_enriched (live_tickers JOIN stock_list) — sector included
+ *  WATCHLIST  → filter allRows by monitorSet  (Set<ticker> from /api/monitor)
+ *  PORTFOLIO  → filter allRows by portfolioSet (Set<ticker> from /api/portfolio)
  *
- * Backend endpoints consumed:
- *   WS  /ws/live                    → snapshot + tick stream
- *   GET /api/stocks?limit=9999      → stock_list sector lookup
+ * SECTOR FILTER FIX:
+ *  Backend queries v_live_enriched view which JOINs stock_list.
+ *  Every ticker row now carries sector — no client-side merge needed.
+ *
+ * Backend endpoints required:
+ *   WS  /ws/live                    → snapshot + tick (rows must include sector)
+ *   GET /api/monitor                → [{ticker,...}] from monitor table
+ *   GET /api/portfolio              → [{ticker,shares,avg_cost,...,live_price}]
  *   GET /api/metrics                → engine alert counts
  *   GET /api/signals?limit=500      → scalping signals
  *   GET /api/earnings?start=&end=   → earnings calendar
- *   GET /api/portfolio              → portfolio holdings
+ *
+ * See fix_view.sql    → create v_live_enriched view in Supabase
+ * See fix_backend.py  → FastAPI endpoint fixes
  */
 
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
@@ -322,12 +327,13 @@ function PortfolioPage({portfolio,tickers,T,onSelect}){
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 export default function NexRadarDashboard(){
-  const[tickers,   setTickers]  =useState(new Map());
-  const[sectorMap, setSectorMap]=useState(new Map()); // ticker→{sector,sub_sector,market_cap}
-  const[signals,   setSignals]  =useState([]);
-  const[metrics,   setMetrics]  =useState(null);
-  const[earnings,  setEarnings] =useState([]);
-  const[portfolio, setPortfolio]=useState([]);
+  const[tickers,        setTickers]       =useState(new Map()); // Map<ticker, live_row> from WS
+  const[monitorSet,     setMonitorSet]    =useState(new Set()); // Set<ticker> from monitor table
+  const[portfolioSet,   setPortfolioSet]  =useState(new Set()); // Set<ticker> from portfolio table
+  const[signals,        setSignals]       =useState([]);
+  const[metrics,        setMetrics]       =useState(null);
+  const[earnings,       setEarnings]      =useState([]);
+  const[portfolio,      setPortfolio]     =useState([]);
 
   const[selectedTicker,setSelected]=useState(null);
   const[sortBy,  setSortBy] =useState("change_value");
@@ -391,19 +397,33 @@ export default function NexRadarDashboard(){
 
   useEffect(()=>{connectWS();return()=>{clearTimeout(retryTimer.current);wsRef.current?.close();};},[connectWS]);
 
-  // ── stock_list sector lookup (FIX: live_tickers has no sector column) ──────
+  // ── Fetch monitor + portfolio ticker sets for data source filtering ─────────
+  // Backend now JOINs stock_list so sector comes with every ticker row.
+  // We only need to know WHICH tickers are in monitor/portfolio to filter.
   useEffect(()=>{
-    fetch(`${API}/api/stocks?limit=9999`)
-      .then(r=>r.json())
-      .then(data=>{
-        const rows=Array.isArray(data)?data:(data.data??[]);
-        const m=new Map();
-        for(const row of rows)m.set(row.ticker,{sector:row.sector,sub_sector:row.sub_sector,market_cap:row.market_cap});
-        setSectorMap(m);
-      }).catch(()=>{});
+    const fetchSets=()=>{
+      // monitor tickers
+      fetch(`${API}/api/monitor`)
+        .then(r=>r.json())
+        .then(data=>{
+          const rows=Array.isArray(data)?data:(data.data??[]);
+          setMonitorSet(new Set(rows.map(r=>r.ticker)));
+        }).catch(()=>{});
+      // portfolio tickers (also stored for P&L page)
+      fetch(`${API}/api/portfolio`)
+        .then(r=>r.json())
+        .then(data=>{
+          const rows=Array.isArray(data)?data:(data.data??[]);
+          setPortfolioSet(new Set(rows.map(r=>r.ticker)));
+          setPortfolio(rows);
+        }).catch(()=>{});
+    };
+    fetchSets();
+    const id=setInterval(fetchSets,10000); // refresh every 10s (watchlist changes less often)
+    return()=>clearInterval(id);
   },[]);
 
-  // ── REST polls ─────────────────────────────────────────────────────────────
+  // ── REST polls (fast-changing data) ────────────────────────────────────────
   useEffect(()=>{
     const fetchAll=()=>{
       fetch(`${API}/api/metrics`).then(r=>r.json()).then(setMetrics).catch(()=>{});
@@ -411,7 +431,6 @@ export default function NexRadarDashboard(){
       const today=new Date().toISOString().slice(0,10);
       const next7=new Date(Date.now()+7*86400000).toISOString().slice(0,10);
       fetch(`${API}/api/earnings?start=${today}&end=${next7}`).then(r=>r.json()).then(d=>setEarnings(Array.isArray(d)?d:d.data??[])).catch(()=>{});
-      fetch(`${API}/api/portfolio`).then(r=>r.json()).then(d=>setPortfolio(Array.isArray(d)?d:d.data??[])).catch(()=>{});
     };
     fetchAll();
     const id=setInterval(fetchAll,5000);
@@ -419,35 +438,39 @@ export default function NexRadarDashboard(){
   },[]);
 
   // ── Derived ────────────────────────────────────────────────────────────────
-  // Merge sector from stock_list into every live row
-  const allRows=useMemo(()=>Array.from(tickers.values()).map(row=>{
-    const meta=sectorMap.get(row.ticker)||{};
-    return{
-      ...row,
-      live_price:row.live_price,  // always live_price, never AH override
-      sector:    row.sector||meta.sector||"",
-      sub_sector:row.sub_sector||meta.sub_sector||"",
-      market_cap:row.market_cap||meta.market_cap||0,
-    };
-  }),[tickers,sectorMap]);
+  // allRows: sector now comes directly from backend (v_live_enriched JOIN)
+  // No client-side merge needed — backend does the join.
+  const allRows=useMemo(()=>Array.from(tickers.values()),[tickers]);
 
+  // Sector heatmap — works because sector is now in every row
   const sectorData=useMemo(()=>SECTOR_LIST.map(name=>{
     const stocks=allRows.filter(r=>(r.sector||"").toUpperCase()===name.toUpperCase());
     const avg=stocks.length?stocks.reduce((a,s)=>a+(s.percent_change||0),0)/stocks.length:0;
     return{name,chgP:parseFloat(avg.toFixed(2)),count:stocks.length,
            gainers:stocks.filter(s=>(s.percent_change||0)>0).length,
-           losers:stocks.filter(s=>(s.percent_change||0)<=0).length};
+           losers: stocks.filter(s=>(s.percent_change||0)<=0).length};
   }),[allRows]);
 
   const filtered=useMemo(()=>{
     let rows=[...allRows];
-    if(dataSource==="monitor")   rows=rows.filter(r=>signals.some(s=>s.symbol===r.ticker));
-    if(dataSource==="portfolio") rows=rows.filter(r=>portfolio.some(p=>p.ticker===r.ticker));
-    if(activeSector!=="ALL")     rows=rows.filter(r=>(r.sector||"").toUpperCase()===activeSector.toUpperCase());
-    if(search){const q=search.toUpperCase();rows=rows.filter(r=>r.ticker?.includes(q)||r.company_name?.toUpperCase().includes(q));}
+
+    // Data source filter — uses Set for O(1) lookup
+    if(dataSource==="monitor")   rows=rows.filter(r=>monitorSet.has(r.ticker));
+    if(dataSource==="portfolio") rows=rows.filter(r=>portfolioSet.has(r.ticker));
+    // "all" → no filter
+
+    // Sector filter — works because backend sends sector with every row
+    if(activeSector!=="ALL") rows=rows.filter(r=>(r.sector||"").toUpperCase()===activeSector.toUpperCase());
+
+    // Search
+    if(search){
+      const q=search.toUpperCase();
+      rows=rows.filter(r=>r.ticker?.includes(q)||r.company_name?.toUpperCase().includes(q));
+    }
+
     rows.sort((a,b)=>sortDir*((a[sortBy]||0)-(b[sortBy]||0)));
     return rows;
-  },[allRows,dataSource,activeSector,search,sortBy,sortDir,signals,portfolio]);
+  },[allRows,dataSource,activeSector,search,sortBy,sortDir,monitorSet,portfolioSet]);
 
   const top10=useMemo(()=>[...filtered].sort((a,b)=>(b.change_value||0)-(a.change_value||0)).slice(0,10),[filtered]);
   const stock=selectedTicker?(allRows.find(r=>r.ticker===selectedTicker)||null):(top10[0]||null);
