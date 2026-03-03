@@ -28,8 +28,7 @@ from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from typing import Set, List
 
-import certifi
-os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+# SSL handled in supabase_db.py
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -108,7 +107,7 @@ app.add_middleware(
 )
 
 # ── Health ─────────────────────────────────────────────────────────────────────
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"status": "ok", "ts": int(time.time())}
 

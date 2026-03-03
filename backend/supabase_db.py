@@ -66,8 +66,23 @@ class SupabaseDB:
     def upsert_tickers(self, rows: List[Dict]) -> bool:
         if not rows:
             return True
+        # Cast types — Supabase rejects Python floats for BIGINT/BOOLEAN columns
+        INT_FIELDS  = ("volume", "last_update", "update_count")
+        BOOL_FIELDS = ("volume_spike", "is_gap_play", "ah_momentum",
+                       "went_positive", "is_positive")
+        cleaned = []
+        for row in rows:
+            r = dict(row)
+            for f in INT_FIELDS:
+                if f in r and r[f] is not None:
+                    try:    r[f] = int(float(r[f]))
+                    except: r[f] = 0
+            for f in BOOL_FIELDS:
+                if f in r and r[f] is not None:
+                    r[f] = bool(r[f])
+            cleaned.append(r)
         try:
-            self.client.table("live_tickers").upsert(rows).execute()
+            self.client.table("live_tickers").upsert(cleaned).execute()
             return True
         except Exception as e:
             logger.error(f"upsert_tickers: {e}")

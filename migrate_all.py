@@ -171,7 +171,7 @@ def build_portfolio(df):
 def build_earnings(df):
     ticker_col  = find_col(df, "TICKER", "SYMBOL", "CODE", "STOCK")
     company_col = find_col(df, "COMPANY", "COMPANY NAME", "NAME")
-    date_col    = find_col(df, "EARNINGS DATE", "DATE", "REPORT DATE", "EARNINGS_DATE")
+    date_col = find_col(df, "DATE", "EARNINGS DATE", "REPORT DATE", "EARNING_DATE")
     time_col    = find_col(df, "RESULT TIME", "TIME", "EARNINGS TIME", "REPORT TIME", "BMO/AMC")
     print(f"  Columns → ticker='{ticker_col}'  date='{date_col}'  time='{time_col}'")
 
@@ -183,10 +183,14 @@ def build_earnings(df):
         earnings_date = ""
         if date_col:
             try:
-                earnings_date = pd.to_datetime(r[date_col]).strftime("%Y-%m-%d")
+                # Attempt to parse the 'EARNING_DATE' column
+                val = r[date_col]
+                if pd.isna(val):
+                    continue
+                earnings_date = pd.to_datetime(val).strftime("%Y-%m-%d")
             except Exception:
-                earnings_date = safe_str(r[date_col])[:10]
-        if not earnings_date:
+                earnings_date = str(val)[:10]
+        if not earnings_date or earnings_date == "NaT":
             continue
         rows.append({
             "ticker":        ticker,
