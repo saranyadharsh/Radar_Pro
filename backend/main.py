@@ -20,6 +20,9 @@ Endpoints:
   POST /api/signal-vwap-reset  → reset VWAP for all signal symbols
   WS   /ws/live                → real-time tick broadcast to React
 """
+from dotenv import load_dotenv
+from pathlib import Path
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 import os
 import asyncio
@@ -34,6 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from supabase_db import SupabaseDB
 from ws_engine    import WSEngine
+
 
 import yfinance as _yf
 try:

@@ -14,6 +14,7 @@ import ChartPanel       from './components/ChartPanel'
 import Sidebar          from './components/Sidebar'
 import NexRadarDashboard from './components/NexRadarDashboard'
 import TickerDetailDrawer from './components/TickerDetailDrawer'
+import UserProfile from './components/UserProfile'
 
 const API = import.meta.env.VITE_API_BASE || ''
 
@@ -108,8 +109,10 @@ export default function App() {
   const [sector,        setSector]        = useState('all')
   const [showNotif,     setShowNotif]     = useState(false)
   const [showProfile,   setShowProfile]   = useState(false)
+  const [showUserProfile, setShowUserProfile] = useState(false)
   const [autoSession,   setAutoSession]   = useState(true)
   const [selectedTickerDetail, setSelectedTickerDetail] = useState(null)
+  const [user, setUser] = useState({ name: 'Saranya', role: 'Premium Trader' })
 
   const { tickers, wsStatus } = useWebSocket()
   const { notes, dismiss, clearAll } = useNotifications(metrics)
@@ -492,6 +495,16 @@ export default function App() {
 
       {(showNotif || showProfile) && (
         <div className="fixed inset-0 z-40" onClick={() => { setShowNotif(false); setShowProfile(false) }} />
+      )}
+
+      {/* User Profile Modal */}
+      {showUserProfile && (
+        <UserProfile
+          user={user}
+          darkMode={darkMode}
+          onDarkModeChange={setDarkMode}
+          onClose={() => setShowUserProfile(false)}
+        />
       )}
 
       {/* Toast Notifications */}
