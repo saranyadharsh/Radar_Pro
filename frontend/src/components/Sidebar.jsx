@@ -267,48 +267,6 @@ export default function Sidebar({
           </div>
         </Section>
 
-        {/* Bulk Sync */}
-        <Section title="Bulk Sync" icon="🚀" defaultOpen>
-          <div className="space-y-2">
-            <div>
-              <div className="flex justify-between text-[10px] text-gray-500 mb-0.5">
-                <span>Tickers to open</span>
-                <span className="text-gray-300 font-bold">{tvCount}</span>
-              </div>
-              <input type="range" min={1} max={20} value={tvCount}
-                onChange={e => setTvCount(+e.target.value)}
-                className="w-full accent-cyan-500 h-1" />
-            </div>
-
-            {/* Target selector */}
-            <div className="grid grid-cols-2 gap-1">
-              {[
-                { id: 'tradingview', label: '📊 TradingView' },
-                { id: 'yahoo',       label: '🟣 Yahoo Finance' },
-              ].map(t => (
-                <button
-                  key={t.id}
-                  onClick={() => setBulkTarget(t.id)}
-                  className={clsx(
-                    'py-1.5 rounded-lg border text-[10px] font-bold transition-all',
-                    bulkTarget === t.id
-                      ? 'border-cyan-500/50 bg-cyan-500/15 text-cyan-400'
-                      : 'border-white/10 bg-white/3 text-gray-500 hover:text-gray-300'
-                  )}
-                >
-                  {t.label}
-                </button>
-              ))}
-            </div>
-
-            <button onClick={openBulk}
-              className="w-full py-1.5 rounded-lg bg-gradient-to-r from-cyan-500/20 to-blue-500/20
-                         border border-cyan-500/30 text-cyan-400 text-[10px] font-bold hover:opacity-80 transition-all">
-              Open Top {tvCount} in {bulkTarget === 'tradingview' ? 'TradingView' : 'Yahoo'}
-            </button>
-          </div>
-        </Section>
-
         {/* Favorites */}
         <Section title="Favorites" icon="⭐" defaultOpen={false}>
           <div className="space-y-2">

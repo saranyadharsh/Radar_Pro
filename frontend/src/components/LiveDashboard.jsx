@@ -25,6 +25,7 @@ import { useState, useMemo, useEffect } from 'react'
 import clsx from 'clsx'
 import { NoDataEmptyState, NoResultsEmptyState, LoadingEmptyState } from './EmptyState'
 import { TableSkeleton } from './SkeletonLoader'
+import MiniSparkline, { generateSparklineData } from './MiniSparkline'
 
 const API = import.meta.env.VITE_API_BASE || ''
 const fmt   = (n, d = 2) => Number(n ?? 0).toFixed(d)
@@ -147,11 +148,11 @@ export default function LiveDashboard({
     return arr
   }, [tickers, showNegative, activeFilter, minChange, cfMinPct, cfVol, cfFlags, sortKey, sector, source, portfolioData, monitorData])
 
-  // Column config mirrors original
+  // Column config with sparkline
   const tableCols = isAH
-    ? [['ticker','Ticker'],['company_name','Company'],['prev_close','Prev Close'],['today_close','Today Close'],
+    ? [['ticker','Ticker'],['company_name','Company'],['sparkline','Trend'],['prev_close','Prev Close'],['today_close','Today Close'],
        ['live_price','Live Price'],['ah_dollar','AH ($)'],['ah_pct','AH (%)'],['alerts','Alerts']]
-    : [['ticker','Ticker'],['company_name','Company'],['open','Open'],['hwm','HWM (Peak)'],
+    : [['ticker','Ticker'],['company_name','Company'],['sparkline','Trend'],['open','Open'],['hwm','HWM (Peak)'],
        ['live_price','Price'],['change_value','Change ($)'],['percent_change','Change (%)'],['alerts','Alerts']]
 
   const cfActive = cfMinPct > 0 || cfVol !== 'Any' || cfFlags.length > 0
@@ -320,6 +321,13 @@ export default function LiveDashboard({
                   const rowStyle = isPos
                     ? 'bg-emerald-950/10 hover:bg-emerald-950/20'
                     : 'bg-red-950/10 hover:bg-red-950/20'
+                  
+                  // Generate sparkline data
+                  const sparklineData = generateSparklineData(
+                    row.live_price || 0,
+                    row.percent_change || 0,
+                    20
+                  )
 
                   return (
                     <tr key={row.ticker}
@@ -344,6 +352,19 @@ export default function LiveDashboard({
                         </div>
                       </td>
                       <td className="py-2 px-3 text-gray-400 max-w-[140px] truncate">{row.company_name}</td>
+                      
+                      {/* Sparkline */}
+                      <td className="py-2 px-3">
+                        <MiniSparkline
+                          data={sparklineData}
+                          width={70}
+                          height={28}
+                          color={isPos ? '#10b981' : '#ef4444'}
+                          isPositive={isPos}
+                          showTooltip={true}
+                          ticker={row.ticker}
+                        />
+                      </td>
 
                       {isAH ? (
                         <>
@@ -429,6 +450,11 @@ export default function LiveDashboard({
             {rows.slice(0, 50).map(row => {
               const isPos  = (row.change_value ?? 0) >= 0
               const stale  = isStale(row)
+              const sparklineData = generateSparklineData(
+                row.live_price || 0,
+                row.percent_change || 0,
+                15
+              )
               return (
                 <div
                   key={row.ticker}
@@ -448,7 +474,19 @@ export default function LiveDashboard({
                     </span>
                   </div>
                   <p className="text-[10px] text-gray-500 truncate mt-0.5">{row.company_name}</p>
-                  <p className={clsx('text-xs font-bold mt-1', isPos ? 'text-emerald-400' : 'text-red-400')}>
+                  
+                  {/* Mini Sparkline */}
+                  <div className="my-2 flex justify-center">
+                    <MiniSparkline
+                      data={sparklineData}
+                      width={80}
+                      height={20}
+                      color={isPos ? '#10b981' : '#ef4444'}
+                      isPositive={isPos}
+                    />
+                  </div>
+                  
+                  <p className={clsx('text-xs font-bold', isPos ? 'text-emerald-400' : 'text-red-400')}>
                     {isPos ? '▲' : '▼'} {fmtS(row.change_value)} ({fmtP(row.percent_change)})
                   </p>
                   <MatrixBadges row={row} />
