@@ -153,12 +153,14 @@ export default function App() {
   const bg = darkMode ? 'bg-[#080c14]' : 'bg-slate-100'
   const fg = darkMode ? 'text-white' : 'text-slate-900'
 
-  // ── Tab definition — 'home' inserted first ─────────────────────────────────
+  // ── Tab definition with EARNINGS and PORTFOLIO ────────────────────────────
   const TABS = [
-    { id: 'home',    label: '🏠 Dashboard' },   // ← NEW
-    { id: 'live',    label: '📊 Live Table' },
-    { id: 'search',  label: '🔍 Chart' },
-    { id: 'signals', label: '⚡ Signals' },
+    { id: 'home',      label: 'DASHBOARD' },
+    { id: 'live',      label: 'LIVE TABLE' },
+    { id: 'search',    label: 'CHART' },
+    { id: 'signals',   label: 'SIGNALS' },
+    { id: 'earnings',  label: 'EARNINGS' },
+    { id: 'portfolio', label: 'PORTFOLIO' },
   ]
 
   // ── When home tab is active, render NexRadarDashboard full-screen ──────────
@@ -392,16 +394,27 @@ export default function App() {
           )}
 
           {/* Tabs */}
-          <div className={clsx('flex gap-0 mb-3 rounded-xl p-1 w-fit', darkMode ? 'bg-white/5' : 'bg-slate-100')}>
+          <div className={clsx('flex gap-1 mb-3 rounded-xl p-1.5 w-fit border', 
+            darkMode ? 'bg-[#0a0f1a] border-white/10' : 'bg-slate-50 border-slate-200')}>
             {TABS.map(t => (
               <button
                 key={t.id}
-                onClick={() => setActiveTab(t.id)}
+                onClick={() => {
+                  setActiveTab(t.id)
+                  // Auto-set source when switching to earnings/portfolio tabs
+                  if (t.id === 'earnings') handleSourceChange('earnings')
+                  else if (t.id === 'portfolio') handleSourceChange('portfolio')
+                  else if (t.id === 'live') handleSourceChange('all')
+                }}
                 className={clsx(
-                  'px-4 py-1.5 rounded-lg text-xs font-bold transition-all',
+                  'px-5 py-2 rounded-lg text-[11px] font-bold tracking-wide transition-all uppercase',
                   activeTab === t.id
-                    ? darkMode ? 'bg-white/10 text-white shadow-sm' : 'bg-white text-slate-900 shadow-sm'
-                    : darkMode ? 'text-gray-500 hover:text-gray-300' : 'text-slate-500 hover:text-slate-700'
+                    ? darkMode 
+                      ? 'bg-gradient-to-r from-cyan-500/20 to-blue-500/20 text-cyan-400 border border-cyan-500/30 shadow-lg shadow-cyan-500/10' 
+                      : 'bg-white text-blue-600 border border-blue-200 shadow-sm'
+                    : darkMode 
+                      ? 'text-gray-500 hover:text-gray-300 hover:bg-white/5' 
+                      : 'text-slate-500 hover:text-slate-700 hover:bg-white/50'
                 )}
               >
                 {t.label}
@@ -415,6 +428,22 @@ export default function App() {
               tickers={tickers} wsStatus={wsStatus}
               activeFilter={activeFilter} metrics={metrics}
               source={source} sector={sector} darkMode={darkMode}
+              onSelectTicker={handleSelectTicker}
+            />
+          )}
+          {activeTab === 'earnings' && (
+            <LiveDashboard
+              tickers={tickers} wsStatus={wsStatus}
+              activeFilter={activeFilter} metrics={metrics}
+              source="earnings" sector={sector} darkMode={darkMode}
+              onSelectTicker={handleSelectTicker}
+            />
+          )}
+          {activeTab === 'portfolio' && (
+            <LiveDashboard
+              tickers={tickers} wsStatus={wsStatus}
+              activeFilter={activeFilter} metrics={metrics}
+              source="portfolio" sector={sector} darkMode={darkMode}
               onSelectTicker={handleSelectTicker}
             />
           )}

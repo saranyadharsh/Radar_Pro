@@ -202,14 +202,25 @@ export default function Sidebar({
             value={source}
             onChange={e => onSource(e.target.value)}
             className={clsx(
-              'w-full rounded-lg px-2 py-1.5 text-xs border outline-none',
+              'w-full rounded-lg px-2 py-1.5 text-xs border outline-none font-semibold cursor-pointer transition-all',
               darkMode
-                ? 'bg-white/5 border-white/10 text-white'
-                : 'bg-white border-slate-200 text-slate-900'
+                ? 'bg-white/5 border-white/10 text-white hover:bg-white/10 hover:border-cyan-500/30 focus:border-cyan-500/50 focus:bg-white/8'
+                : 'bg-white border-slate-200 text-slate-900 hover:border-blue-300 focus:border-blue-400'
             )}
+            style={{
+              color: darkMode ? '#ffffff' : '#0f172a',
+            }}
           >
             {['all','stock_list','monitor','portfolio','earnings','favorites'].map(s => (
-              <option key={s} value={s}>
+              <option 
+                key={s} 
+                value={s}
+                style={{
+                  backgroundColor: darkMode ? '#1f2937' : '#ffffff',
+                  color: darkMode ? '#ffffff' : '#0f172a',
+                  padding: '8px',
+                }}
+              >
                 {s === 'all'        ? 'All'
                 : s === 'stock_list' ? 'Stock List'
                 : s.charAt(0).toUpperCase() + s.slice(1)}

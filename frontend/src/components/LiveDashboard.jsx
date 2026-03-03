@@ -21,11 +21,12 @@
  *   Top 50 only
  */
 
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import clsx from 'clsx'
 import { NoDataEmptyState, NoResultsEmptyState, LoadingEmptyState } from './EmptyState'
 import { TableSkeleton } from './SkeletonLoader'
 
+const API = import.meta.env.VITE_API_BASE || ''
 const fmt   = (n, d = 2) => Number(n ?? 0).toFixed(d)
 const fmtS  = (n)        => (n >= 0 ? '+' : '') + fmt(n)
 const fmtP  = (n)        => (n >= 0 ? '+' : '') + fmt(n) + '%'
@@ -77,13 +78,44 @@ export default function LiveDashboard({
   const [cfFlags,      setCfFlags]      = useState([])
   const [filterOpen,   setFilterOpen]   = useState(false)
   const [loading,      setLoading]      = useState(false)
+  const [portfolioData, setPortfolioData] = useState([])
+  const [monitorData,   setMonitorData]   = useState([])
 
   const session = metrics?.session ?? 'MARKET_HOURS'
   const isAH    = session === 'AFTER_HOURS'
   const isClosed = session === 'OVERNIGHT_SLEEP' || session === 'CLOSED_WEEKEND'
 
+  // Fetch portfolio and monitor data when source changes
+  useEffect(() => {
+    if (source === 'portfolio') {
+      fetch(`${API}/api/portfolio`)
+        .then(r => r.json())
+        .then(data => setPortfolioData(data.tickers || []))
+        .catch(() => setPortfolioData([]))
+    } else if (source === 'monitor') {
+      fetch(`${API}/api/monitor`)
+        .then(r => r.json())
+        .then(data => setMonitorData(data.tickers || []))
+        .catch(() => setMonitorData([]))
+    }
+  }, [source])
+
   const rows = useMemo(() => {
     let arr = Array.from(tickers.values())
+
+    // Source-based filtering
+    if (source === 'portfolio' && portfolioData.length > 0) {
+      arr = arr.filter(r => portfolioData.includes(r.ticker))
+    } else if (source === 'monitor' && monitorData.length > 0) {
+      arr = arr.filter(r => monitorData.includes(r.ticker))
+    } else if (source === 'earnings') {
+      arr = arr.filter(r => r.is_earnings_gap_play || r.earnings_date)
+    } else if (source === 'favorites') {
+      // Favorites would need to be passed as prop or fetched from API
+      // For now, filter by diamond stocks as placeholder
+      arr = arr.filter(r => Math.abs(r.percent_change ?? 0) >= 5)
+    }
+    // 'all' and 'stock_list' show everything (stock_list filtered by sector below)
 
     if (!showNegative) arr = arr.filter(r => r.is_positive)
 
@@ -113,7 +145,7 @@ export default function LiveDashboard({
 
     arr.sort((a, b) => (b[sortKey] ?? 0) - (a[sortKey] ?? 0))
     return arr
-  }, [tickers, showNegative, activeFilter, minChange, cfMinPct, cfVol, cfFlags, sortKey, sector])
+  }, [tickers, showNegative, activeFilter, minChange, cfMinPct, cfVol, cfFlags, sortKey, sector, source, portfolioData, monitorData])
 
   // Column config mirrors original
   const tableCols = isAH
