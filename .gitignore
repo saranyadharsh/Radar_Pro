@@ -171,3 +171,16 @@ coverage.xml
 # Don't commit local config overrides
 local_config.py
 local_settings.py
+
+# Don't commit batch scripts (Windows-specific)
+*.bat
+
+# Don't commit extra documentation files
+STARTUP_GUIDE.md
+INTEGRATION_COMPLETE.md
+IMPROVEMENTS_ROADMAP.md
+IMPLEMENTATION_GUIDE.md
+GITHUB_PUSH_GUIDE.md
+WHAT_TO_PUSH.md
+PUSH_TO_GITHUB_NOW.md
+QUICK_FIX_SUMMARY.md
