@@ -34,8 +34,8 @@ os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from .supabase_db import SupabaseDB
-from .ws_engine    import WSEngine
+from supabase_db import SupabaseDB
+from ws_engine    import WSEngine
 
 logging.basicConfig(
     level=logging.INFO,
