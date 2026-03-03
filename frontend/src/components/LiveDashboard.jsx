@@ -23,6 +23,8 @@
 
 import { useState, useMemo } from 'react'
 import clsx from 'clsx'
+import { NoDataEmptyState, NoResultsEmptyState, LoadingEmptyState } from './EmptyState'
+import { TableSkeleton } from './SkeletonLoader'
 
 const fmt   = (n, d = 2) => Number(n ?? 0).toFixed(d)
 const fmtS  = (n)        => (n >= 0 ? '+' : '') + fmt(n)
@@ -74,6 +76,7 @@ export default function LiveDashboard({
   const [cfVol,        setCfVol]        = useState('Any')
   const [cfFlags,      setCfFlags]      = useState([])
   const [filterOpen,   setFilterOpen]   = useState(false)
+  const [loading,      setLoading]      = useState(false)
 
   const session = metrics?.session ?? 'MARKET_HOURS'
   const isAH    = session === 'AFTER_HOURS'
@@ -227,8 +230,34 @@ export default function LiveDashboard({
       {viewMode === 'table' && (
         <div>
           <h3 className="text-sm font-bold mb-2">📊 Live Stock Data</h3>
-          <div className="overflow-x-auto rounded-lg border border-white/10">
-            <table className="w-full text-left text-xs text-white">
+          
+          {/* Loading State */}
+          {loading && <TableSkeleton rows={15} cols={tableCols.length} />}
+          
+          {/* Empty States */}
+          {!loading && rows.length === 0 && (
+            wsStatus === 'connecting' ? (
+              <LoadingEmptyState />
+            ) : activeFilter || cfActive ? (
+              <NoResultsEmptyState 
+                onClear={() => {
+                  setActiveFilter?.(null)
+                  setCfMinPct(0)
+                  setCfVol('Any')
+                  setCfFlags([])
+                }}
+                filterName={activeFilter || 'custom filter'}
+              />
+            ) : (
+              <NoDataEmptyState onRetry={() => window.location.reload()} />
+            )
+          )}
+          
+          {/* Data Table */}
+          {!loading && rows.length > 0 && (
+            <>
+              <div className="overflow-x-auto rounded-lg border border-white/10">
+                <table className="w-full text-left text-xs text-white">
               <thead className="bg-gray-900/80 text-gray-400 text-[10px] uppercase tracking-wide">
                 <tr>
                   {tableCols.map(([key, label]) => (
@@ -321,6 +350,8 @@ export default function LiveDashboard({
             {activeFilter ? ` | 🔍 Filter: ${activeFilter}` : ''}
             {isAH && rows.some(r => isStale(r)) ? ` | ⏱️ ${rows.filter(r => isStale(r)).length} stale price(s)` : ''}
           </p>
+        </>
+          )}
         </div>
       )}
 
@@ -328,7 +359,28 @@ export default function LiveDashboard({
       {viewMode === 'matrix' && (
         <div>
           <h3 className="text-sm font-bold mb-2">⊞ Matrix View</h3>
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2">
+          
+          {/* Loading State */}
+          {loading && (
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2">
+              {Array.from({ length: 12 }).map((_, i) => (
+                <div key={i} className="rounded-xl p-3 border border-white/10 bg-gray-900/50 animate-pulse h-32" />
+              ))}
+            </div>
+          )}
+          
+          {/* Empty States */}
+          {!loading && rows.length === 0 && (
+            wsStatus === 'connecting' ? (
+              <LoadingEmptyState />
+            ) : (
+              <NoDataEmptyState onRetry={() => window.location.reload()} />
+            )
+          )}
+          
+          {/* Matrix Grid */}
+          {!loading && rows.length > 0 && (
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2">
             {rows.slice(0, 50).map(row => {
               const isPos  = (row.change_value ?? 0) >= 0
               const stale  = isStale(row)
@@ -359,15 +411,16 @@ export default function LiveDashboard({
                 </div>
               )
             })}
-            {rows.length === 0 && (
-              <p className="col-span-full text-center text-gray-600 py-12">No data…</p>
-            )}
           </div>
-          <p className="text-[10px] text-gray-600 mt-1">
-            Showing {Math.min(rows.length, 50)} stocks (top 50) | Matrix View
-            {sector && sector !== 'all' ? ` | 🔵 ${sector}` : ''}
-            {activeFilter ? ` | 🔍 ${activeFilter}` : ''}
-          </p>
+          )}
+          
+          {!loading && rows.length > 0 && (
+            <p className="text-[10px] text-gray-600 mt-1">
+              Showing {Math.min(rows.length, 50)} stocks (top 50) | Matrix View
+              {sector && sector !== 'all' ? ` | 🔵 ${sector}` : ''}
+              {activeFilter ? ` | 🔍 ${activeFilter}` : ''}
+            </p>
+          )}
         </div>
       )}
     </div>

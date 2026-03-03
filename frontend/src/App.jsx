@@ -6,12 +6,14 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import clsx from 'clsx'
+import { Toaster } from 'react-hot-toast'
 import { useWebSocket } from './hooks/useWebSocket'
 import LiveDashboard    from './components/LiveDashboard'
 import SignalFeed       from './components/SignalFeed'
 import ChartPanel       from './components/ChartPanel'
 import Sidebar          from './components/Sidebar'
-import NexRadarDashboard from './components/NexRadarDashboard'   // ← NEW
+import NexRadarDashboard from './components/NexRadarDashboard'
+import TickerDetailDrawer from './components/TickerDetailDrawer'
 
 const API = import.meta.env.VITE_API_BASE || ''
 
@@ -107,6 +109,7 @@ export default function App() {
   const [showNotif,     setShowNotif]     = useState(false)
   const [showProfile,   setShowProfile]   = useState(false)
   const [autoSession,   setAutoSession]   = useState(true)
+  const [selectedTickerDetail, setSelectedTickerDetail] = useState(null)
 
   const { tickers, wsStatus } = useWebSocket()
   const { notes, dismiss, clearAll } = useNotifications(metrics)
@@ -125,6 +128,10 @@ export default function App() {
   }, [])
 
   const handleSelectTicker = useCallback((sym) => {
+    setSelectedTickerDetail(sym)
+  }, [])
+  
+  const handleOpenChart = useCallback((sym) => {
     setChartTicker(sym)
     setActiveTab('search')
     const url = new URL(window.location)
@@ -442,6 +449,76 @@ export default function App() {
 
       {(showNotif || showProfile) && (
         <div className="fixed inset-0 z-40" onClick={() => { setShowNotif(false); setShowProfile(false) }} />
+      )}
+
+      {/* Toast Notifications */}
+      <Toaster
+        position="top-right"
+        toastOptions={{
+          style: {
+            background: darkMode ? '#1f2937' : '#fff',
+            color: darkMode ? '#fff' : '#000',
+            border: `1px solid ${darkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)'}`,
+          },
+          success: { duration: 3000, iconTheme: { primary: '#10b981', secondary: '#fff' } },
+          error: { duration: 4000, iconTheme: { primary: '#ef4444', secondary: '#fff' } },
+        }}
+      />
+
+      {/* Ticker Detail Drawer */}
+      {selectedTickerDetail && (
+        <TickerDetailDrawer
+          ticker={selectedTickerDetail}
+          onClose={() => setSelectedTickerDetail(null)}
+          onOpenChart={handleOpenChart}
+          darkMode={darkMode}
+        />
+      )}
+
+      {/* WebSocket Connection Status Banner */}
+      {wsStatus !== 'Healthy' && wsStatus !== 'open' && (
+        <div className="fixed top-14 left-0 right-0 z-50 bg-gradient-to-r from-amber-900 to-orange-900 
+                        backdrop-blur-sm border-b border-amber-700 px-4 py-3 shadow-lg animate-slideDown">
+          <div className="max-w-7xl mx-auto flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <span className="animate-pulse text-xl">
+                {wsStatus === 'connecting' && '⏳'}
+                {wsStatus === 'closed' && '🔌'}
+                {wsStatus === 'error' && '⚠️'}
+              </span>
+              <div>
+                <div className="text-sm font-bold text-amber-100">
+                  {wsStatus === 'connecting' && 'Connecting to Market Data'}
+                  {wsStatus === 'closed' && 'Connection Lost - Retrying...'}
+                  {wsStatus === 'error' && 'Backend Not Reachable'}
+                </div>
+                <div className="text-xs text-amber-200">
+                  {wsStatus === 'connecting' && 'Establishing WebSocket connection to ws://localhost:8000/ws/live'}
+                  {wsStatus === 'closed' && 'Attempting to reconnect automatically...'}
+                  {wsStatus === 'error' && 'Make sure backend is running: uvicorn backend.main:app --reload'}
+                </div>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <a
+                href="http://localhost:8000/health"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="px-3 py-1.5 bg-amber-800 hover:bg-amber-700 text-white rounded-lg 
+                           text-xs font-semibold transition-colors"
+              >
+                Check Backend
+              </a>
+              <button 
+                onClick={() => window.location.reload()}
+                className="px-4 py-1.5 bg-amber-700 hover:bg-amber-600 text-white rounded-lg 
+                           text-xs font-semibold transition-colors"
+              >
+                Retry Now
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )
