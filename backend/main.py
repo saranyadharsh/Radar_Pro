@@ -90,11 +90,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="NexRadar Pro API", version="4.2.0", lifespan=lifespan)
 
+# Ensure FRONTEND_ORIGIN is set to https://nexradar.info in Render Env Vars
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://nexradar.info")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "http://localhost:5173", "http://localhost:3000"],
+    allow_origins=[
+        FRONTEND_ORIGIN,
+        "https://nexradar.info",                        # Your custom domain
+        "https://radar-pro-frontend-bxtq.onrender.com",  # Your Render frontend URL
+        "http://localhost:5173",                         # Local Vite dev
+        "http://localhost:3000",                         # Local React dev
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
