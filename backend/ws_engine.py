@@ -38,7 +38,7 @@ _os.environ.pop("SSL_CERT_FILE", None)
 from massive import WebSocketClient, RESTClient
 from massive.websocket.models import WebSocketMessage, Market
 
-from .supabase_db import SupabaseDB
+from supabase_db import SupabaseDB
 
 # ── Scalping Signal Engine — identical to original ───────────────────────────
 from .Scalping_Signal import (
