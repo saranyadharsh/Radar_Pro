@@ -41,10 +41,11 @@ from massive.websocket.models import WebSocketMessage, Market
 from supabase_db import SupabaseDB
 
 # ── Scalping Signal Engine — identical to original ───────────────────────────
-from .Scalping_Signal import (
+from Scalping_Signal import (
     ScalpingSignalEngine,
     SignalWatchlistManager,
     OHLCVBar,
+    SignalPayload,
 )
 
 logger = logging.getLogger(__name__)
