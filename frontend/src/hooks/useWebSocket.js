@@ -29,11 +29,13 @@ export function useWebSocket() {
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return
 
+    console.log('[WS] Connecting to:', WS_URL)
     setStatus('connecting')
     const ws = new WebSocket(WS_URL)
     wsRef.current = ws
 
     ws.onopen = () => {
+      console.log('[WS] Connected successfully')
       setStatus('open')
       delay.current = BASE_DELAY   // reset backoff on success
     }
@@ -54,30 +56,39 @@ export function useWebSocket() {
             const msg = JSON.parse(reader.result)
             handleMessage(msg)
           } catch (e) {
-            console.warn('WS parse error', e)
+            console.warn('[WS] Parse error:', e)
           }
         }
         if (event.data instanceof Blob) reader.readAsText(event.data)
       }
     }
 
-    ws.onerror = () => setStatus('error')
+    ws.onerror = (err) => {
+      console.error('[WS] Error:', err)
+      setStatus('error')
+    }
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+      console.log('[WS] Closed:', event.code, event.reason)
       setStatus('closed')
       // Exponential backoff reconnect
       const jitter = Math.random() * 0.4 + 0.8
       const wait   = Math.min(delay.current * jitter, MAX_DELAY)
       delay.current = Math.min(delay.current * 2, MAX_DELAY)
+      console.log('[WS] Reconnecting in', Math.round(wait), 'ms')
       retryTimer.current = setTimeout(connect, wait)
     }
   }, []) // eslint-disable-line
 
   function handleMessage(msg) {
-    if (!msg?.type) return
+    if (!msg?.type) {
+      console.warn('[WS] Message missing type:', msg)
+      return
+    }
 
     if (msg.type === 'snapshot') {
       // Full initial load
+      console.log('[WS] Snapshot received:', msg.data?.length, 'tickers')
       setTickers(() => {
         const m = new Map()
         for (const row of msg.data ?? []) {
@@ -92,6 +103,8 @@ export function useWebSocket() {
         next.set(msg.ticker, { ...(prev.get(msg.ticker) ?? {}), ...msg.data })
         return next
       })
+    } else {
+      console.warn('[WS] Unknown message type:', msg.type)
     }
   }
 

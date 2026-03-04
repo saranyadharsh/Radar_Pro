@@ -25,15 +25,37 @@ export default function TickerDetailDrawer({ ticker, onClose, onOpenChart, darkM
     if (!ticker) return
     
     setLoading(true)
+    console.log('[TickerDetailDrawer] Fetching data for:', ticker)
+    
     Promise.all([
-      fetch(`${API}/api/tickers?symbol=${ticker}`).then(r => r.json()),
-      fetch(`${API}/api/signals?symbol=${ticker}&limit=10`).then(r => r.json()),
+      fetch(`${API}/api/tickers?symbol=${ticker}`)
+        .then(r => {
+          if (!r.ok) throw new Error(`Tickers API: HTTP ${r.status}`)
+          return r.json()
+        })
+        .catch(err => {
+          console.error('[TickerDetailDrawer] Tickers fetch error:', err)
+          return null
+        }),
+      fetch(`${API}/api/signals?symbol=${ticker}&limit=10`)
+        .then(r => {
+          if (!r.ok) throw new Error(`Signals API: HTTP ${r.status}`)
+          return r.json()
+        })
+        .catch(err => {
+          console.error('[TickerDetailDrawer] Signals fetch error:', err)
+          return []
+        }),
     ])
       .then(([tickerData, signalData]) => {
+        console.log('[TickerDetailDrawer] Ticker data:', tickerData)
+        console.log('[TickerDetailDrawer] Signal data:', signalData)
         setData(Array.isArray(tickerData) ? tickerData[0] : tickerData)
         setSignals(Array.isArray(signalData) ? signalData : [])
       })
-      .catch(console.error)
+      .catch(err => {
+        console.error('[TickerDetailDrawer] Error:', err)
+      })
       .finally(() => setLoading(false))
   }, [ticker])
 

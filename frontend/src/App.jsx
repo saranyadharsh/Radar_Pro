@@ -208,69 +208,113 @@ export default function App() {
 
       {/* ── TOP HEADER BAR WITH NAVIGATION ────────────────────────────────── */}
       <header className={clsx(
-        'sticky top-0 z-50 border-b',
+        'sticky top-0 z-50',
         darkMode
-          ? 'bg-[#080c14]/95 border-white/10 backdrop-blur-xl'
-          : 'bg-white/95 border-slate-200 backdrop-blur-xl shadow-sm'
+          ? 'bg-gradient-to-r from-[#0a0f1a] via-[#0d1219] to-[#0a0f1a] border-b border-white/5'
+          : 'bg-gradient-to-r from-slate-50 via-white to-slate-50 border-b border-slate-200 shadow-sm'
       )}>
         
         {/* Top row: Logo, Status, Controls */}
-        <div className="h-14 flex items-center justify-between px-4">
-          {/* LEFT: Logo */}
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2">
-              <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-400 to-blue-600
-                              flex items-center justify-center text-white font-black text-xs shadow-lg shadow-blue-500/30">
+        <div className="h-16 flex items-center justify-between px-6">
+          {/* LEFT: Logo & Status */}
+          <div className="flex items-center gap-6">
+            {/* Logo */}
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-cyan-400 via-blue-500 to-blue-600
+                              flex items-center justify-center text-white font-black text-sm shadow-xl shadow-blue-500/40
+                              ring-2 ring-blue-400/20">
                 N
               </div>
               <div className="leading-none">
-                <div className={clsx('text-[13px] font-black tracking-tight', darkMode ? 'text-white' : 'text-slate-900')}>
+                <div className={clsx('text-base font-black tracking-tight', darkMode ? 'text-white' : 'text-slate-900')}>
                   NEXRADAR
                 </div>
-                <div className="text-[9px] tracking-[0.2em] text-cyan-400 font-bold uppercase">
-                  Pro
+                <div className="text-[10px] tracking-[0.25em] text-cyan-400 font-bold uppercase">
+                  Professional
                 </div>
               </div>
             </div>
 
-            {/* WS status */}
-            <div className="hidden sm:flex items-center gap-1.5 ml-3 pl-3 border-l border-white/10">
-              <span className={clsx('w-1.5 h-1.5 rounded-full shadow-lg', wsDot)} />
-              <span className={clsx('text-[10px] font-bold', wsHealthColor)}>
-                {wsStatus === 'Healthy' || wsStatus === 'open' ? 'LIVE' : wsStatus.toUpperCase()}
-              </span>
-            </div>
+            {/* Divider */}
+            <div className={clsx('h-8 w-px', darkMode ? 'bg-white/10' : 'bg-slate-300')} />
 
-            {/* Live counts */}
-            {m && (
-              <div className="hidden md:flex items-center gap-3 ml-2 text-[10px] text-gray-500">
-                <span>📡 <b className="text-gray-300">{m.live_count ?? 0}</b> live</span>
-                <span>📊 <b className="text-gray-300">{m.total_tickers?.toLocaleString() ?? 0}</b> total</span>
-                <span>🟢 <b className="text-emerald-400">{m.pos_count ?? 0}</b> pos</span>
+            {/* Status Pills */}
+            <div className="flex items-center gap-3">
+              {/* WS Status */}
+              <div className={clsx(
+                'flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold',
+                darkMode ? 'bg-white/5' : 'bg-slate-100'
+              )}>
+                <span className={clsx('w-2 h-2 rounded-full shadow-lg animate-pulse', wsDot)} />
+                <span className={wsHealthColor}>
+                  {wsStatus === 'Healthy' || wsStatus === 'open' ? 'LIVE' : wsStatus.toUpperCase()}
+                </span>
               </div>
-            )}
+
+              {/* Session Status */}
+              {m && (
+                <div 
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold border transition-all"
+                  style={{ background: sc.bg, borderColor: sc.color + '40', color: sc.color }}
+                >
+                  <span className={clsx('w-2 h-2 rounded-full', sc.dot)} />
+                  <span>{sc.label.toUpperCase()}</span>
+                </div>
+              )}
+
+              {/* Live Metrics */}
+              {m && (
+                <div className={clsx(
+                  'hidden lg:flex items-center gap-4 px-4 py-1.5 rounded-lg text-xs',
+                  darkMode ? 'bg-white/5' : 'bg-slate-100'
+                )}>
+                  <div className="flex items-center gap-1.5">
+                    <span className={clsx(darkMode ? 'text-gray-500' : 'text-slate-500')}>Live</span>
+                    <span className={clsx('font-bold', darkMode ? 'text-cyan-400' : 'text-blue-600')}>
+                      {m.live_count ?? 0}
+                    </span>
+                  </div>
+                  <div className={clsx('w-px h-3', darkMode ? 'bg-white/10' : 'bg-slate-300')} />
+                  <div className="flex items-center gap-1.5">
+                    <span className={clsx(darkMode ? 'text-gray-500' : 'text-slate-500')}>Total</span>
+                    <span className={clsx('font-bold', darkMode ? 'text-white' : 'text-slate-900')}>
+                      {m.total_tickers?.toLocaleString() ?? 0}
+                    </span>
+                  </div>
+                  <div className={clsx('w-px h-3', darkMode ? 'bg-white/10' : 'bg-slate-300')} />
+                  <div className="flex items-center gap-1.5">
+                    <span className={clsx(darkMode ? 'text-gray-500' : 'text-slate-500')}>Gainers</span>
+                    <span className="font-bold text-emerald-400">
+                      {m.pos_count ?? 0}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
 
           {/* CENTER: Symbol search */}
-          <div className="hidden sm:flex items-center gap-2">
+          <div className="hidden md:flex items-center gap-2">
             <SymbolSearchBar onSelect={handleSelectTicker} darkMode={darkMode} />
           </div>
 
           {/* RIGHT: Controls */}
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-2">
 
             {/* SYS Indicator - Clickable */}
             {m && (
               <div className="relative group">
                 <button className={clsx(
-                  'flex items-center gap-2 px-3 py-1.5 rounded-lg border text-[10px] mr-1 transition-all',
-                  darkMode ? 'bg-white/5 border-white/10 hover:bg-white/10' : 'bg-slate-100 border-slate-200 hover:bg-slate-200'
+                  'flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-semibold transition-all',
+                  darkMode 
+                    ? 'bg-white/5 border-white/10 hover:bg-white/10 hover:border-white/20' 
+                    : 'bg-slate-100 border-slate-200 hover:bg-slate-200'
                 )}>
                   <span className={clsx('font-bold', wsHealthColor)}>
-                    {m.ws_health === 'Healthy' ? '🟢' : '🟡'} SYS
+                    {m.ws_health === 'Healthy' ? '●' : '●'} SYS
                   </span>
                   <span className={clsx('text-gray-500', darkMode ? '' : 'text-slate-600')}>|</span>
-                  <span className={clsx(darkMode ? 'text-gray-400' : 'text-slate-600')}>{m.live_count ?? 0} live</span>
+                  <span className={clsx(darkMode ? 'text-gray-400' : 'text-slate-600')}>{m.live_count ?? 0}</span>
                 </button>
                 
                 {/* SYS Dropdown */}
@@ -341,32 +385,22 @@ export default function App() {
               </div>
             )}
 
-            {/* Session toggle */}
-            <button
-              onClick={() => setAutoSession(a => !a)}
-              className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[10px] font-bold border transition-all tracking-wide mr-1"
-              style={{ background: sc.bg, borderColor: sc.color + '60', color: sc.color }}
-            >
-              <span className={clsx('w-1.5 h-1.5 rounded-full', sc.dot)} />
-              {sc.short} · {sc.label.toUpperCase()}
-            </button>
-
-            {/* Dark/Light Mode Toggle Switch */}
+            {/* Dark/Light Mode Toggle */}
             <button
               onClick={() => setDarkMode(d => !d)}
               className={clsx(
-                'relative w-14 h-7 rounded-full transition-all duration-300 border',
+                'relative w-16 h-8 rounded-full transition-all duration-300 border-2',
                 darkMode
-                  ? 'bg-slate-700 border-slate-600'
-                  : 'bg-amber-200 border-amber-300'
+                  ? 'bg-slate-800 border-slate-700'
+                  : 'bg-amber-100 border-amber-300'
               )}
               title={darkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
             >
               <span className={clsx(
-                'absolute top-0.5 w-6 h-6 rounded-full transition-all duration-300 flex items-center justify-center text-xs',
+                'absolute top-0.5 w-7 h-7 rounded-full transition-all duration-300 flex items-center justify-center text-sm shadow-lg',
                 darkMode
                   ? 'left-0.5 bg-slate-900 text-yellow-300'
-                  : 'left-7 bg-white text-amber-600'
+                  : 'left-8 bg-white text-amber-600'
               )}>
                 {darkMode ? '🌙' : '☀️'}
               </span>
@@ -377,7 +411,7 @@ export default function App() {
               <button
                 onClick={() => { setShowNotif(v => !v); setShowProfile(false) }}
                 className={clsx(
-                  'w-8 h-8 rounded-lg flex items-center justify-center text-sm transition-all relative',
+                  'w-10 h-10 rounded-xl flex items-center justify-center text-base transition-all relative',
                   darkMode
                     ? 'bg-white/5 hover:bg-white/10 border border-white/10'
                     : 'bg-slate-100 hover:bg-slate-200 border border-slate-200'
@@ -385,8 +419,8 @@ export default function App() {
               >
                 🔔
                 {notes.length > 0 && (
-                  <span className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-500 text-white
-                                   text-[9px] font-black flex items-center justify-center leading-none">
+                  <span className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-red-500 text-white
+                                   text-[10px] font-black flex items-center justify-center leading-none shadow-lg">
                     {notes.length > 9 ? '9+' : notes.length}
                   </span>
                 )}
@@ -401,13 +435,13 @@ export default function App() {
               <button
                 onClick={() => { setShowProfile(v => !v); setShowNotif(false) }}
                 className={clsx(
-                  'w-8 h-8 rounded-lg flex items-center justify-center transition-all text-[11px] font-black border',
+                  'w-10 h-10 rounded-xl flex items-center justify-center transition-all text-xs font-black border-2 shadow-lg',
                   darkMode
-                    ? 'bg-gradient-to-br from-cyan-500/20 to-blue-600/20 border-cyan-500/30 text-cyan-400 hover:border-cyan-400/50'
-                    : 'bg-gradient-to-br from-blue-50 to-cyan-50 border-blue-200 text-blue-600'
+                    ? 'bg-gradient-to-br from-cyan-500/20 to-blue-600/20 border-cyan-500/30 text-cyan-400 hover:border-cyan-400/50 hover:shadow-cyan-500/20'
+                    : 'bg-gradient-to-br from-blue-50 to-cyan-50 border-blue-300 text-blue-600 hover:border-blue-400'
                 )}
               >
-                NR
+                {user.name.charAt(0)}
               </button>
               {showProfile && (
                 <div className={clsx(
@@ -448,9 +482,9 @@ export default function App() {
         {/* Navigation Tabs Row - Scrollable */}
         <div className={clsx(
           'border-t overflow-x-auto scrollbar-thin',
-          darkMode ? 'border-white/10 bg-[#0a0f1a]' : 'border-slate-200 bg-slate-50'
+          darkMode ? 'border-white/5 bg-[#0a0f1a]/50' : 'border-slate-200 bg-slate-50/50'
         )}>
-          <div className="flex gap-0 px-4 min-w-max">
+          <div className="flex gap-1 px-6 min-w-max">
             {TABS.map(t => (
               <button
                 key={t.id}
@@ -462,17 +496,23 @@ export default function App() {
                   else if (t.id === 'live') handleSourceChange('all')
                 }}
                 className={clsx(
-                  'px-6 py-3 text-[11px] font-bold tracking-wide transition-all uppercase whitespace-nowrap border-b-2',
+                  'px-6 py-3 text-xs font-bold tracking-wider transition-all uppercase whitespace-nowrap rounded-t-lg relative',
                   activeTab === t.id
                     ? darkMode 
-                      ? 'text-cyan-400 border-cyan-400 bg-cyan-500/5' 
-                      : 'text-blue-600 border-blue-600 bg-blue-50'
+                      ? 'text-cyan-400 bg-gradient-to-b from-cyan-500/10 to-transparent' 
+                      : 'text-blue-600 bg-gradient-to-b from-blue-100 to-transparent'
                     : darkMode 
-                      ? 'text-gray-500 border-transparent hover:text-gray-300 hover:bg-white/5' 
-                      : 'text-slate-500 border-transparent hover:text-slate-700 hover:bg-white/50'
+                      ? 'text-gray-500 hover:text-gray-300 hover:bg-white/5' 
+                      : 'text-slate-500 hover:text-slate-700 hover:bg-white/50'
                 )}
               >
                 {t.label}
+                {activeTab === t.id && (
+                  <span className={clsx(
+                    'absolute bottom-0 left-0 right-0 h-0.5',
+                    darkMode ? 'bg-cyan-400' : 'bg-blue-600'
+                  )} />
+                )}
               </button>
             ))}
           </div>
@@ -751,26 +791,36 @@ function SymbolSearchBar({ onSelect, darkMode }) {
   const [val, setVal] = useState('')
   const submit = () => { const s = val.trim().toUpperCase(); if (s) { onSelect(s); setVal('') } }
   return (
-    <div className="flex items-center gap-1">
+    <div className={clsx(
+      'flex items-center gap-2 px-3 py-2 rounded-xl border transition-all',
+      darkMode
+        ? 'bg-white/5 border-white/10 hover:border-white/20'
+        : 'bg-slate-50 border-slate-200 hover:border-slate-300'
+    )}>
+      <span className="text-gray-500 text-sm">🔍</span>
       <input
         value={val}
         onChange={e => setVal(e.target.value.toUpperCase())}
         onKeyDown={e => e.key === 'Enter' && submit()}
-        placeholder="Symbol…"
+        placeholder="Search symbol..."
         className={clsx(
-          'w-28 px-2.5 py-1.5 rounded-lg text-[11px] border outline-none transition-all font-mono placeholder-gray-600',
-          darkMode
-            ? 'bg-white/5 border-white/10 text-white focus:border-cyan-500/50 focus:bg-white/8'
-            : 'bg-slate-50 border-slate-200 text-slate-900 focus:border-blue-300'
+          'w-36 bg-transparent text-sm border-none outline-none font-mono placeholder-gray-500',
+          darkMode ? 'text-white' : 'text-slate-900'
         )}
       />
-      <button
-        onClick={submit}
-        className="px-2.5 py-1.5 rounded-lg text-[11px] font-bold bg-cyan-500/20 border border-cyan-500/30
-                   text-cyan-400 hover:bg-cyan-500/30 transition-all"
-      >
-        Chart →
-      </button>
+      {val && (
+        <button
+          onClick={submit}
+          className={clsx(
+            'px-3 py-1 rounded-lg text-xs font-bold transition-all',
+            darkMode
+              ? 'bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 hover:bg-cyan-500/30'
+              : 'bg-blue-500 text-white hover:bg-blue-600'
+          )}
+        >
+          Go
+        </button>
+      )}
     </div>
   )
 }

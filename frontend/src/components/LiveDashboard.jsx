@@ -83,6 +83,7 @@ export default function LiveDashboard({
   const [earningsData,  setEarningsData]  = useState([])
   const [displayCount,  setDisplayCount]  = useState(50)
   const [isLoadingMore, setIsLoadingMore] = useState(false)
+  const [isLoadingSource, setIsLoadingSource] = useState(false)
 
   const session = metrics?.session ?? 'MARKET_HOURS'
   const isAH    = session === 'AFTER_HOURS'
@@ -94,36 +95,97 @@ export default function LiveDashboard({
 
   // Fetch portfolio, monitor, and earnings data when source changes
   useEffect(() => {
+    setIsLoadingSource(true)
+    
     if (source === 'portfolio') {
       fetch(`${API}/api/portfolio`)
-        .then(r => r.json())
-        .then(data => setPortfolioData(data.tickers || []))
-        .catch(() => setPortfolioData([]))
+        .then(r => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`)
+          return r.json()
+        })
+        .then(data => {
+          console.log('[LiveDashboard] Portfolio data:', data)
+          setPortfolioData(data.tickers || data || [])
+        })
+        .catch(err => {
+          console.error('[LiveDashboard] Portfolio fetch error:', err)
+          setPortfolioData([])
+        })
+        .finally(() => setIsLoadingSource(false))
     } else if (source === 'monitor') {
       fetch(`${API}/api/monitor`)
-        .then(r => r.json())
-        .then(data => setMonitorData(data.tickers || []))
-        .catch(() => setMonitorData([]))
+        .then(r => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`)
+          return r.json()
+        })
+        .then(data => {
+          console.log('[LiveDashboard] Monitor data:', data)
+          setMonitorData(data.tickers || data || [])
+        })
+        .catch(err => {
+          console.error('[LiveDashboard] Monitor fetch error:', err)
+          setMonitorData([])
+        })
+        .finally(() => setIsLoadingSource(false))
     } else if (source === 'earnings') {
       const start = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)
       const end   = new Date(Date.now() + 60 * 86400000).toISOString().slice(0, 10)
       fetch(`${API}/api/earnings?start=${start}&end=${end}`)
-        .then(r => r.json())
-        .then(data => setEarningsData((data || []).map(e => e.ticker)))
-        .catch(() => setEarningsData([]))
+        .then(r => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`)
+          return r.json()
+        })
+        .then(data => {
+          console.log('[LiveDashboard] Earnings data:', data)
+          const tickers = Array.isArray(data) ? data.map(e => e.ticker) : []
+          setEarningsData(tickers)
+        })
+        .catch(err => {
+          console.error('[LiveDashboard] Earnings fetch error:', err)
+          setEarningsData([])
+        })
+        .finally(() => setIsLoadingSource(false))
+    } else {
+      // Reset when switching to 'all' or other sources
+      setPortfolioData([])
+      setMonitorData([])
+      setEarningsData([])
+      setIsLoadingSource(false)
     }
   }, [source])
 
   const rows = useMemo(() => {
     let arr = Array.from(tickers.values())
+    
+    console.log('[LiveDashboard] Filtering - source:', source, 'tickers count:', arr.length)
 
     // Source-based filtering
-    if (source === 'portfolio' && portfolioData.length > 0) {
-      arr = arr.filter(r => portfolioData.includes(r.ticker))
-    } else if (source === 'monitor' && monitorData.length > 0) {
-      arr = arr.filter(r => monitorData.includes(r.ticker))
+    if (source === 'portfolio') {
+      console.log('[LiveDashboard] Portfolio filter - data:', portfolioData)
+      if (portfolioData.length > 0) {
+        arr = arr.filter(r => portfolioData.includes(r.ticker))
+        console.log('[LiveDashboard] After portfolio filter:', arr.length)
+      } else {
+        // Show empty state if no portfolio data loaded yet
+        arr = []
+      }
+    } else if (source === 'monitor') {
+      console.log('[LiveDashboard] Monitor filter - data:', monitorData)
+      if (monitorData.length > 0) {
+        arr = arr.filter(r => monitorData.includes(r.ticker))
+        console.log('[LiveDashboard] After monitor filter:', arr.length)
+      } else {
+        arr = []
+      }
     } else if (source === 'earnings') {
-      if (earningsData.length > 0) arr = arr.filter(r => earningsData.includes(r.ticker))
+      console.log('[LiveDashboard] Earnings filter - data:', earningsData)
+      if (earningsData.length > 0) {
+        arr = arr.filter(r => earningsData.includes(r.ticker))
+        console.log('[LiveDashboard] After earnings filter:', arr.length)
+      } else {
+        // Show empty state if no earnings data loaded yet
+        arr = []
+      }
     } else if (source === 'favorites') {
       // Favorites would need to be passed as prop or fetched from API
       // For now, filter by diamond stocks as placeholder
@@ -271,7 +333,17 @@ export default function LiveDashboard({
         </label>
 
         <div className={clsx('ml-auto text-xs', darkMode ? 'text-gray-500' : 'text-slate-600')}>
-          {rows.length} stocks shown
+          {isLoadingSource ? (
+            <span className="flex items-center gap-2">
+              <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+              </svg>
+              Loading {source}...
+            </span>
+          ) : (
+            <span>{rows.length} stocks shown</span>
+          )}
         </div>
       </div>
 
@@ -343,11 +415,29 @@ export default function LiveDashboard({
           <h3 className="text-sm font-bold mb-2">📊 Live Stock Data</h3>
           
           {/* Empty States */}
-          {rows.length === 0 && (
+          {isLoadingSource ? (
+            <LoadingEmptyState darkMode={darkMode} />
+          ) : rows.length === 0 && (
             wsStatus === 'connecting' ? (
               <LoadingEmptyState darkMode={darkMode} />
             ) : tickers.size === 0 ? (
               <NoDataEmptyState onRetry={() => window.location.reload()} darkMode={darkMode} />
+            ) : (source === 'portfolio' || source === 'monitor' || source === 'earnings') && 
+               (portfolioData.length === 0 && monitorData.length === 0 && earningsData.length === 0) ? (
+              <div className={clsx(
+                'text-center py-12 rounded-lg border',
+                darkMode ? 'bg-white/5 border-white/10' : 'bg-slate-50 border-slate-200'
+              )}>
+                <div className="text-5xl mb-4">📭</div>
+                <p className={clsx('text-sm font-semibold mb-2', darkMode ? 'text-white' : 'text-slate-900')}>
+                  No {source} data available
+                </p>
+                <p className={clsx('text-xs', darkMode ? 'text-gray-500' : 'text-slate-600')}>
+                  {source === 'portfolio' && 'Add stocks to your portfolio to see them here'}
+                  {source === 'monitor' && 'Add stocks to your monitor list to track them'}
+                  {source === 'earnings' && 'No upcoming earnings in the selected date range'}
+                </p>
+              </div>
             ) : (
               <NoResultsEmptyState
                 onClear={() => {
@@ -559,11 +649,29 @@ export default function LiveDashboard({
           <h3 className="text-sm font-bold mb-2">⊞ Matrix View</h3>
           
           {/* Empty States */}
-          {rows.length === 0 && (
+          {isLoadingSource ? (
+            <LoadingEmptyState darkMode={darkMode} />
+          ) : rows.length === 0 && (
             wsStatus === 'connecting' ? (
               <LoadingEmptyState darkMode={darkMode} />
             ) : tickers.size === 0 ? (
               <NoDataEmptyState onRetry={() => window.location.reload()} darkMode={darkMode} />
+            ) : (source === 'portfolio' || source === 'monitor' || source === 'earnings') && 
+               (portfolioData.length === 0 && monitorData.length === 0 && earningsData.length === 0) ? (
+              <div className={clsx(
+                'text-center py-12 rounded-lg border',
+                darkMode ? 'bg-white/5 border-white/10' : 'bg-slate-50 border-slate-200'
+              )}>
+                <div className="text-5xl mb-4">📭</div>
+                <p className={clsx('text-sm font-semibold mb-2', darkMode ? 'text-white' : 'text-slate-900')}>
+                  No {source} data available
+                </p>
+                <p className={clsx('text-xs', darkMode ? 'text-gray-500' : 'text-slate-600')}>
+                  {source === 'portfolio' && 'Add stocks to your portfolio to see them here'}
+                  {source === 'monitor' && 'Add stocks to your monitor list to track them'}
+                  {source === 'earnings' && 'No upcoming earnings in the selected date range'}
+                </p>
+              </div>
             ) : (
               <NoResultsEmptyState
                 onClear={() => {
