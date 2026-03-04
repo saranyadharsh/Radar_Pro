@@ -114,7 +114,7 @@ function HeatTile({s,T,active,onClick}){
   return(
     <div onClick={onClick}
       style={{background:bg,border:`1px solid ${brd}`,borderRadius:8,padding:"7px 10px",cursor:"pointer",
-              transition:"transform 0.12s",position:"relative",overflow:"hidden",
+              position:"relative",overflow:"hidden",
               boxShadow:active?`0 0 8px ${isPos?C.green:C.red}44`:""}}
       onMouseEnter={e=>e.currentTarget.style.transform="scale(1.04)"}
       onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}>
@@ -345,6 +345,8 @@ export default function NexRadarDashboard({
 }){
   const[tickers,        setTickers]       =useState(new Map()); // Map<ticker, live_row> from WS
   const[priceHistory,   setPriceHistory]  =useState(new Map()); // Map<ticker, price[]> for sparklines
+  const[stockListMap,   setStockListMap]  =useState(new Map()); // Map<ticker, staticRow> — ALL symbols+sectors from /api/stock-list
+  const[portfolioRows,  setPortfolioRows] =useState([]);        // Full rows from /api/portfolio (all 1039)
   const[monitorSet,     setMonitorSet]    =useState(new Set()); // Set<ticker> from monitor table
   const[portfolioSet,   setPortfolioSet]  =useState(new Set()); // Set<ticker> from portfolio table
   const[signals,        setSignals]       =useState([]);
@@ -365,7 +367,6 @@ export default function NexRadarDashboard({
   const[tvCount, setTvCount]=useState(5);
   const[bulkTarget,setBulkT]=useState("tradingview");
   const[heartbeat,setHB]   =useState(nowT());
-  const[flashMap, setFlash]=useState({});
   const[wsStatus, setWsStatus]=useState("connecting");
   const[activeTab,setTab]  =useState("DASHBOARD");
   const[activeAlertFilter,setAlertFilter]=useState(null); // For alert card filtering
@@ -429,8 +430,6 @@ export default function NexRadarDashboard({
               }
               return next;
             });
-            setFlash(f=>({...f,[msg.ticker]:(msg.data?.change_value??0)>=0?"up":"dn"}));
-            setTimeout(()=>setFlash(f=>{const n={...f};delete n[msg.ticker];return n;}),400);
             setHB(nowT());
           }
         }catch{}
@@ -449,9 +448,31 @@ export default function NexRadarDashboard({
 
   useEffect(()=>{connectWS();return()=>{clearTimeout(retryTimer.current);wsRef.current?.close();};},[connectWS]);
 
-  // ── Fetch monitor + portfolio ticker sets for data source filtering ─────────
-  // Backend now JOINs stock_list so sector comes with every ticker row.
-  // We only need to know WHICH tickers are in monitor/portfolio to filter.
+  // ── Fetch ALL symbols + sectors from stock_list (once on mount, refresh every 5min) ──
+  // This guarantees sector column is populated for EVERY ticker, even those
+  // not yet streaming via WS. Used as the base for allRows merge.
+  useEffect(()=>{
+    const fetchStockList=()=>{
+      fetch(`${API_BASE}/api/stock-list`)
+        .then(r=>r.json())
+        .then(data=>{
+          const rows=Array.isArray(data)?data:(data.data??data.tickers??[]);
+          const m=new Map();
+          for(const row of rows) if(row.ticker) m.set(row.ticker,row);
+          logger.log('[NexRadar] stock-list loaded:', m.size, 'symbols');
+          setStockListMap(m);
+          setSelected(s=>s||rows[0]?.ticker||null);
+        })
+        .catch(err=>logger.error('[NexRadar] stock-list fetch error:',err));
+    };
+    fetchStockList();
+    const id=setInterval(fetchStockList,5*60*1000);
+    return()=>clearInterval(id);
+  },[]);
+
+  // ── Fetch monitor + portfolio ─────────────────────────────────────────────
+  // Portfolio: fetch FULL rows (not just ticker strings) so all 1039 are
+  // visible regardless of WS feed state. WS enriches live prices on top.
   useEffect(()=>{
     const fetchSets=()=>{
       logger.log('[NexRadar] Fetching monitor and portfolio data...');
@@ -461,28 +482,32 @@ export default function NexRadarDashboard({
         .then(data=>{
           logger.log('[NexRadar] Monitor API response:', data);
           const rows=Array.isArray(data)?data:(data.tickers??data.data??[]);
-          const tickers = Array.isArray(rows) ? rows.map(r => typeof r === 'string' ? r : r.ticker) : [];
-          logger.log('[NexRadar] Monitor tickers:', tickers);
-          setMonitorSet(new Set(tickers));
-        }).catch(err => {
+          const tkrs=rows.map(r=>typeof r==='string'?r:r.ticker).filter(Boolean);
+          logger.log('[NexRadar] Monitor tickers:', tkrs.length);
+          setMonitorSet(new Set(tkrs));
+        }).catch(err=>{
           logger.error('[NexRadar] Monitor fetch error:', err);
         });
-      // portfolio tickers (also stored for P&L page)
+      // portfolio — store FULL rows for all 1039, also build Set for fast lookup
       fetch(`${API_BASE}/api/portfolio`)
         .then(r=>r.json())
         .then(data=>{
-          logger.log('[NexRadar] Portfolio API response:', data);
-          const rows=Array.isArray(data)?data:(data.tickers??data.data??[]);
-          const tickers = Array.isArray(rows) ? rows.map(r => typeof r === 'string' ? r : r.ticker) : [];
-          logger.log('[NexRadar] Portfolio tickers:', tickers);
-          setPortfolioSet(new Set(tickers));
+          logger.log('[NexRadar] Portfolio API response keys:', Object.keys(data||{}));
+          // Handle both shapes:
+          // OLD: {"tickers":["AAPL",...]}  →  wrap strings as {ticker}
+          // NEW: [{ticker, shares, avg_cost, sector, ...}]
+          let rows=Array.isArray(data)?data:(data.tickers??data.data??[]);
+          if(rows.length>0 && typeof rows[0]==='string') rows=rows.map(t=>({ticker:t}));
+          logger.log('[NexRadar] Portfolio rows:', rows.length);
+          setPortfolioRows(rows);           // full rows for the portfolio table
+          setPortfolioSet(new Set(rows.map(r=>r.ticker).filter(Boolean)));
           setPortfolio(rows);
-        }).catch(err => {
+        }).catch(err=>{
           logger.error('[NexRadar] Portfolio fetch error:', err);
         });
     };
     fetchSets();
-    const id=setInterval(fetchSets, REFRESH_INTERVALS.PORTFOLIO); // refresh every 30s
+    const id=setInterval(fetchSets, REFRESH_INTERVALS.PORTFOLIO);
     return()=>clearInterval(id);
   },[]);
 
@@ -501,9 +526,38 @@ export default function NexRadarDashboard({
   },[]);
 
   // ── Derived ────────────────────────────────────────────────────────────────
-  // allRows: sector now comes directly from backend (v_live_enriched JOIN)
-  // No client-side merge needed — backend does the join.
-  const allRows=useMemo(()=>Array.from(tickers.values()),[tickers]);
+  // allRows: merge stock_list (all symbols + sectors) with WS live data.
+  // - stock_list is the authoritative source for sector + company_name
+  // - WS provides live_price, change_value, percent_change, flags
+  // - Tickers only in stock_list (not yet in WS) → shown dimmed with no price
+  // - Tickers only in WS (not in stock_list) → included as-is (edge case)
+  const allRows=useMemo(()=>{
+    // If stock-list not loaded yet, fall back to WS-only (old behaviour)
+    if(stockListMap.size===0) return Array.from(tickers.values());
+    const result=[];
+    stockListMap.forEach((staticRow,ticker)=>{
+      const live=tickers.get(ticker);
+      if(live){
+        result.push({
+          ...staticRow,
+          ...live,
+          sector:       live.sector||staticRow.sector||"—",
+          company_name: live.company_name||staticRow.company_name||"—",
+        });
+      } else {
+        result.push({
+          ...staticRow,
+          live_price:0, change_value:0, percent_change:0,
+          is_positive:false, volume:0,
+        });
+      }
+    });
+    // Include any WS tickers not in stock_list
+    tickers.forEach((live,ticker)=>{
+      if(!stockListMap.has(ticker)) result.push(live);
+    });
+    return result;
+  },[tickers,stockListMap]);
 
   // Sector heatmap — works because sector is now in every row
   const sectorData=useMemo(()=>SECTOR_LIST.map(name=>{
@@ -515,8 +569,36 @@ export default function NexRadarDashboard({
   }),[allRows]);
 
   const filtered=useMemo(()=>{
-    logger.log('[NexRadar] Filtering - dataSource:', dataSource, 'portfolioSet size:', portfolioSet.size, 'monitorSet size:', monitorSet.size);
-    let rows=[...allRows];
+    logger.log('[NexRadar] Filtering - dataSource:', dataSource, 'portfolioRows:', portfolioRows.length, 'monitorSet size:', monitorSet.size);
+    let rows;
+
+    if(dataSource==="portfolio"){
+      // ── PORTFOLIO: ALL REST rows enriched with WS live price ────────────────
+      // Guarantees all 1039 show regardless of WS feed state.
+      rows=portfolioRows.map(p=>{
+        const live=tickers.get(p.ticker);
+        return{
+          ...p,
+          sector:       live?.sector||p.sector||stockListMap.get(p.ticker)?.sector||"—",
+          company_name: live?.company_name||p.company_name||stockListMap.get(p.ticker)?.company_name||"—",
+          live_price:   live?.live_price||p.live_price||p.current_price||0,
+          change_value: live?.change_value||p.change_value||0,
+          percent_change: live?.percent_change||p.percent_change||0,
+          is_positive:  (live?.change_value||p.change_value||0)>=0,
+          volume:       live?.volume||p.volume||0,
+          volume_spike: live?.volume_spike||false,
+          gap_percent:  live?.gap_percent||p.gap_percent||0,
+          ah_momentum:  live?.ah_momentum||false,
+        };
+      });
+    } else if(dataSource==="monitor"){
+      // WATCHLIST: filter allRows (stock_list merged) by monitorSet
+      rows=allRows.filter(r=>monitorSet.has(r.ticker));
+      logger.log('[NexRadar] Filtering by MONITOR - after:', rows.length);
+    } else {
+      // ALL: full stock_list merged with WS
+      rows=[...allRows];
+    }
 
     // Alert filter (from alert cards)
     if(activeAlertFilter==="volume_spike") rows=rows.filter(r=>r.volume_spike);
@@ -526,18 +608,7 @@ export default function NexRadarDashboard({
     if(activeAlertFilter==="gainers") rows=rows.filter(r=>(r.change_value||0)>0);
     if(activeAlertFilter==="earnings_gap") rows=rows.filter(r=>r.is_earnings_gap_play);
 
-    // Data source filter — uses Set for O(1) lookup
-    if(dataSource==="monitor") {
-      logger.log('[NexRadar] Filtering by MONITOR - before:', rows.length);
-      rows=rows.filter(r=>monitorSet.has(r.ticker));
-      logger.log('[NexRadar] Filtering by MONITOR - after:', rows.length, 'tickers:', Array.from(monitorSet).slice(0, 5));
-    }
-    if(dataSource==="portfolio") {
-      logger.log('[NexRadar] Filtering by PORTFOLIO - before:', rows.length);
-      rows=rows.filter(r=>portfolioSet.has(r.ticker));
-      logger.log('[NexRadar] Filtering by PORTFOLIO - after:', rows.length, 'tickers:', Array.from(portfolioSet).slice(0, 5));
-    }
-    // "all" → no filter
+    // "all" → no filter (handled above)
 
     // Sector filter — works because backend sends sector with every row
     if(activeSector!=="ALL") rows=rows.filter(r=>(r.sector||"").toUpperCase()===activeSector.toUpperCase());
@@ -551,7 +622,7 @@ export default function NexRadarDashboard({
     rows.sort((a,b)=>sortDir*((a[sortBy]||0)-(b[sortBy]||0)));
     logger.log('[NexRadar] Final filtered count:', rows.length);
     return rows;
-  },[allRows,dataSource,activeSector,search,sortBy,sortDir,monitorSet,portfolioSet,activeAlertFilter]);
+  },[allRows,portfolioRows,tickers,stockListMap,dataSource,activeSector,search,sortBy,sortDir,monitorSet,activeAlertFilter]);
 
   const top10=useMemo(()=>[...filtered].sort((a,b)=>(b.change_value||0)-(a.change_value||0)).slice(0,10),[filtered]);
   const stock=selectedTicker?(allRows.find(r=>r.ticker===selectedTicker)||null):(top10[0]||null);
@@ -595,9 +666,6 @@ export default function NexRadarDashboard({
         ::-webkit-scrollbar{width:4px;height:4px}
         ::-webkit-scrollbar-track{background:transparent}
         ::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.1);border-radius:2px}
-        @keyframes flashUp{0%,100%{background:transparent}50%{background:rgba(52,211,153,0.18)}}
-        @keyframes flashDn{0%,100%{background:transparent}50%{background:rgba(248,113,113,0.18)}}
-        .fup{animation:flashUp 0.4s ease}.fdn{animation:flashDn 0.4s ease}
       `}</style>
 
       {/* ── ALERT STRIP ── */}
@@ -615,7 +683,7 @@ export default function NexRadarDashboard({
           }} style={{display:"flex",alignItems:"center",gap:5,
             background:T.panel,border:`1px solid ${activeAlertFilter===filter?color:T.line2}`,borderRadius:5,
             padding:"3px 10px",whiteSpace:"nowrap",cursor:"pointer",
-            transition:"all 0.15s",outline:"none",
+            outline:"none",
             boxShadow:activeAlertFilter===filter?`0 0 8px ${color}44`:"none"}}
             onMouseEnter={e=>{e.currentTarget.style.background=T.panel2;e.currentTarget.style.borderColor=color;}}
             onMouseLeave={e=>{e.currentTarget.style.background=T.panel;e.currentTarget.style.borderColor=activeAlertFilter===filter?color:T.line2;}}>
@@ -815,10 +883,8 @@ export default function NexRadarDashboard({
                   </thead>
                   <tbody>
                     {filtered.map(r=>{
-                      const flash=flashMap[r.ticker];
                       return(
                         <tr key={r.ticker}
-                          className={flash==="up"?"fup":flash==="dn"?"fdn":""}
                           onClick={()=>setSelected(r.ticker)}
                           style={{cursor:"pointer",
                             background:selectedTicker===r.ticker?`rgba(245,158,11,0.06)`:"transparent",
@@ -873,7 +939,11 @@ export default function NexRadarDashboard({
             {/* Status bar */}
             <div style={{padding:"4px 12px",borderTop:`1px solid ${T.line}`,display:"flex",
                          justifyContent:"space-between",fontSize:8,color:T.muted,background:T.panel}}>
-              <span>Showing {filtered.length.toLocaleString()} of {allRows.length.toLocaleString()} stocks</span>
+              <span>Showing {filtered.length.toLocaleString()} of {
+                dataSource==="portfolio"?portfolioRows.length:
+                dataSource==="monitor"?monitorSet.size:
+                (stockListMap.size||allRows.length)
+              } stocks</span>
               <span>{activeSector!=="ALL"?`Sector: ${activeSector} · `:""}{dataSource.toUpperCase()} · {heartbeat}</span>
             </div>
           </div>

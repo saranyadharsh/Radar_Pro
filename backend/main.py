@@ -190,14 +190,51 @@ async def post_signal(payload: dict):
 # ── Portfolio / Monitor ────────────────────────────────────────────────────────
 @app.get("/api/portfolio")
 async def get_portfolio():
+    """
+    Returns FULL portfolio rows [{ticker, shares, avg_cost, notes, ...}].
+    Frontend needs full rows (not just ticker strings) so ALL 1039 portfolio
+    symbols are visible even when not currently in the live WS feed.
+    Live prices are enriched client-side from the WS tickers map.
+    """
     rows = db.get_portfolio()
-    return {"tickers": [r.get("ticker") for r in rows if r.get("ticker")]}
+    return rows  # full list of dicts — no stripping to ticker-only
 
 
 @app.get("/api/monitor")
 async def get_monitor():
+    """
+    Returns FULL monitor rows [{ticker, ...}].
+    """
     rows = db.get_monitor()
-    return {"tickers": [r.get("ticker") for r in rows if r.get("ticker")]}
+    return rows  # full list of dicts
+
+
+# ── Stock List ─────────────────────────────────────────────────────────────────
+@app.get("/api/stock-list")
+async def get_stock_list():
+    """
+    Returns ALL symbols from stock_list with sector, company_name, etc.
+    Used by the Dashboard 'ALL' source so sector column is always populated
+    for every symbol, even those not yet streaming via WebSocket.
+    """
+    try:
+        tickers = db.get_all_tickers()          # returns list of ticker strings
+        company_map = db.get_company_map()       # returns {ticker: {company_name, sector, ...}}
+        result = []
+        for t in tickers:
+            meta = company_map.get(t, {})
+            result.append({
+                "ticker":       t,
+                "company_name": meta.get("company_name") or meta.get("name") or "—",
+                "sector":       meta.get("sector") or "—",
+            })
+        return result
+    except Exception as e:
+        logger.error(f"stock-list error: {e}")
+        # Fallback: return WS snapshot which includes sector from v_live_enriched
+        if engine:
+            return engine.get_live_snapshot(limit=5000, only_positive=False)
+        return []
 
 
 # ── Signal Watchlist ───────────────────────────────────────────────────────────

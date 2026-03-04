@@ -1,18 +1,22 @@
-# NexRadar Pro - Issues Fixed ✅
+# NexRadar Pro - Issues Fixed
 
-**Last Updated**: March 4, 2026  
-**Status**: Production Ready
+## Overview
+This document tracks all bugs and issues that have been identified and fixed in the NexRadar Pro dashboard application.
 
 ---
 
-## 🎯 Critical Issues Fixed
+## ✅ Critical Issues Fixed
 
-### 1. ✅ Dark Mode Doesn't Persist on Refresh
-**Priority**: High | **Impact**: High | **Status**: FIXED
+### 1. Dark Mode Doesn't Persist on Refresh
+**Priority**: High | **Status**: ✅ Fixed | **Date**: 2026-03-04
 
-**Problem**: Every time the page refreshed, dark mode reset to default (dark), losing user preference.
+**Problem**: 
+- Dark mode setting reset to default (dark) on every page refresh
+- User preference not saved
 
-**Root Cause**: Dark mode state wasn't being saved to localStorage.
+**Root Cause**:
+- Dark mode state wasn't being saved to localStorage
+- No persistence mechanism
 
 **Solution**:
 ```javascript
@@ -30,20 +34,25 @@ useEffect(() => {
 
 **Files Modified**: `frontend/src/App.jsx`
 
-**Testing**: Toggle dark/light mode, refresh page - preference persists ✅
+**Testing**: Toggle dark/light mode → refresh page → preference persists
 
 ---
 
-### 2. ✅ Portfolio/Earnings Data Source Switching Shows Wrong Data
-**Priority**: Critical | **Impact**: High | **Status**: FIXED
+### 2. Portfolio/Earnings Data Source Switching Shows Wrong Data
+**Priority**: Critical | **Status**: ✅ Fixed | **Date**: 2026-03-04
 
-**Problem**: After switching from Portfolio to Earnings, still showed portfolio stocks instead of earnings stocks.
+**Problem**:
+- Switching from Portfolio to Earnings showed portfolio stocks
+- Old data arrays not cleared when switching sources
+- Confusing user experience
 
-**Root Cause**: When switching data sources, old data arrays weren't being cleared, causing filter logic to use stale data.
+**Root Cause**:
+- When switching data sources, old data arrays remained populated
+- Filter logic checked `portfolioData.length > 0` even after switching
 
 **Solution**:
 ```javascript
-// Clear old arrays when switching sources
+// Clear all data arrays when switching to 'all' or other sources
 else {
   logger.log('[LiveDashboard] Switching to source:', source, '- clearing all data arrays')
   setPortfolioData([])
@@ -55,21 +64,27 @@ else {
 
 **Files Modified**: `frontend/src/components/LiveDashboard.jsx`
 
-**Testing**: Switch Portfolio → Earnings → ALL, verify correct data shows ✅
+**Testing**: Portfolio → Earnings → should show only earnings stocks
 
 ---
 
-### 3. ✅ Sector Filter "BM & ENERGY" Shows No Results
-**Priority**: High | **Impact**: Medium | **Status**: FIXED
+### 3. Sector Filter "BM & ENERGY" Shows No Results
+**Priority**: High | **Status**: ✅ Fixed | **Date**: 2026-03-04
 
-**Problem**: Selecting "BM & Energy" sector from dropdown showed "No Results Found".
+**Problem**:
+- Selecting "BM & Energy" sector showed "No Results Found"
+- Database had different sector name variations
 
-**Root Cause**: Frontend expects `"BM & UENE"` but database might have `"BM & ENERGY"`, `"MATERIALS"`, `"ENERGY"`, etc.
+**Root Cause**:
+- Frontend expected: `"BM & UENE"`
+- Database had: `"BM & ENERGY"`, `"MATERIALS"`, `"ENERGY"`, etc.
+- Exact string match failed
 
-**Solution**: Added sector name normalization function:
+**Solution**:
 ```javascript
+// Sector name normalization function
 const normalizeSector = (sector) => {
-  const normalized = sector.trim().toUpperCase();
+  const normalized = (sector ?? '').trim().toUpperCase();
   const sectorMap = {
     'BM & ENERGY': 'BM & UENE',
     'MATERIALS': 'BM & UENE',
@@ -85,172 +100,176 @@ const normalizeSector = (sector) => {
 
 **Files Modified**: `frontend/src/components/LiveDashboard.jsx`
 
-**Testing**: Select any sector, verify stocks appear ✅
+**Testing**: Select "BM & Energy" → should show stocks regardless of database format
 
 ---
 
-### 4. ✅ Fake Chart Animations in Dashboard
-**Priority**: High | **Impact**: High | **Status**: FIXED
+### 4. Fake Chart Animations in Dashboard
+**Priority**: High | **Status**: ✅ Fixed | **Date**: 2026-03-04
 
-**Problem**: Dashboard showed fake candle animations using `Math.random()` instead of real market data.
+**Problem**:
+- Dashboard showed fake candle charts using `Math.random()`
+- Misleading users with fake data
+- Not professional
 
-**Root Cause**: `CandleChart` component generated fake data for demonstration.
+**Root Cause**:
+- `CandleChart` component generated random OHLCV data
+- No real historical data being fetched
 
-**Solution**: Replaced with real TradingView widget:
-```javascript
-function TradingViewChart({ symbol, darkMode }) {
-  useEffect(() => {
-    const script = document.createElement('script');
-    script.src = 'https://s3.tradingview.com/tv.js';
-    script.onload = () => {
-      new window.TradingView.widget({
-        symbol: `NASDAQ:${symbol}`,
-        interval: '5',
-        theme: darkMode ? 'dark' : 'light',
-        // ... real chart configuration
-      });
-    };
-    document.head.appendChild(script);
-  }, [symbol, darkMode]);
-}
-```
+**Solution**:
+- Removed fake `CandleChart` component
+- Replaced with real TradingView widget
+- Shows actual market data with volume
 
 **Files Modified**: `frontend/src/components/NexRadarDashboard.jsx`
 
-**Testing**: Select stock, verify real TradingView chart loads ✅
+**Testing**: Select stock → chart loads with real TradingView data
 
 ---
 
-### 5. ✅ Portfolio Button Selection Doesn't Filter Data
-**Priority**: Critical | **Impact**: High | **Status**: FIXED
+### 5. Portfolio Button Selection Doesn't Filter Data
+**Priority**: Critical | **Status**: ✅ Fixed | **Date**: 2026-03-04
 
-**Problem**: Clicking "PORTFOLIO" button in Dashboard didn't filter data - still showed all stocks.
+**Problem**:
+- Clicking "PORTFOLIO" button in Dashboard showed all stocks
+- Data source selection not working
 
-**Root Cause**: 
-- Props weren't syncing properly to internal state
-- API response format wasn't being parsed correctly
+**Root Cause**:
+- Props not syncing properly to internal state
+- API response format not parsed correctly
 
 **Solution**:
 ```javascript
 // Enhanced prop synchronization
 useEffect(() => {
-  logger.log('[NexRadar] source prop changed:', sourceProp);
-  setDS(sourceProp);
-}, [sourceProp]);
+  logger.log('[NexRadar] source prop changed:', sourceProp)
+  setDS(sourceProp)
+}, [sourceProp])
 
 // Fixed API response parsing
-const rows = Array.isArray(data) ? data : (data.tickers ?? data.data ?? []);
-const tickers = rows.map(r => typeof r === 'string' ? r : r.ticker);
+const rows = Array.isArray(data) ? data : (data.tickers ?? data.data ?? [])
+const tickers = rows.map(r => typeof r === 'string' ? r : r.ticker)
 ```
 
 **Files Modified**: `frontend/src/components/NexRadarDashboard.jsx`
 
-**Testing**: Click PORTFOLIO, verify only portfolio stocks show ✅
+**Testing**: Click "PORTFOLIO" → should filter to portfolio stocks only
 
 ---
 
-### 6. ✅ Refresh Intervals Too Fast - Can't Read Numbers
-**Priority**: High | **Impact**: High | **Status**: FIXED
+### 6. Refresh Intervals Too Fast (Can't Read Numbers)
+**Priority**: High | **Status**: ✅ Fixed | **Date**: 2026-03-04
 
-**Problem**: Dashboard and Live Table refreshed every 3 seconds, making numbers hard to read.
+**Problem**:
+- Dashboard refreshed every 3 seconds
+- Numbers changed too fast to read
+- Excessive API calls
 
-**Root Cause**: Refresh intervals set too aggressively for better UX.
+**Root Cause**:
+- Refresh intervals set to 3 seconds for everything
+- Too aggressive for portfolio/monitor data
 
-**Solution**: Changed intervals to more reasonable values:
+**Solution**:
 ```javascript
-// Before (Too Fast)
-PORTFOLIO: 3000,    // 3 seconds
-
-// After (Readable)
-PORTFOLIO: 30000,   // 30 seconds
-MONITOR: 30000,     // 30 seconds
-METRICS: 5000,      // 5 seconds
-SIGNALS: 10000,     // 10 seconds
+// Changed intervals in config.js
+REFRESH_INTERVALS = {
+  METRICS: 5000,      // 5s (was 3s)
+  PORTFOLIO: 30000,   // 30s (was 3s) ✅
+  MONITOR: 30000,     // 30s (was 3s) ✅
+  SIGNALS: 10000,     // 10s (was 5s)
+  EARNINGS: 30000,    // 30s (was 10s)
+}
 ```
 
-**Files Modified**: `frontend/src/config.js`, `LiveDashboard.jsx`, `NexRadarDashboard.jsx`
+**Files Modified**: 
+- `frontend/src/config.js`
+- `frontend/src/components/LiveDashboard.jsx`
+- `frontend/src/components/NexRadarDashboard.jsx`
 
-**Impact**: 90% fewer API calls, much easier to read ✅
+**Impact**: 90% fewer API calls, readable numbers
 
----
-
-## 🛠️ Infrastructure Improvements
-
-### 7. ✅ Created Conditional Logger Utility
-**Priority**: Medium | **Impact**: High | **Status**: COMPLETE
-
-**Problem**: Console logs polluted production environment, making it look unprofessional.
-
-**Solution**: Created `frontend/src/utils/logger.js`
-- Only logs in development mode
-- Always logs errors (even in production)
-- Provides: `log`, `warn`, `error`, `info`, `debug`, `table`
-
-**Usage**:
-```javascript
-import logger from '../utils/logger'
-
-logger.log('[Component] Debug info')  // Dev only
-logger.error('[Component] Error:', err)  // Always logged
-```
-
-**Files Created**: `frontend/src/utils/logger.js`
-
-**Impact**: Clean production console, easy debugging in dev ✅
+**Testing**: Watch dashboard → numbers update every 30s (readable)
 
 ---
 
-### 8. ✅ Created Centralized Config File
-**Priority**: Medium | **Impact**: High | **Status**: COMPLETE
+## 🔧 Infrastructure Improvements
 
-**Problem**: Magic numbers and URLs scattered across multiple files, hard to maintain.
+### 7. Console Logs Pollute Production
+**Priority**: Medium | **Status**: ✅ Fixed | **Date**: 2026-03-04
 
-**Solution**: Created `frontend/src/config.js` with:
-- API_BASE (auto-detects prod/dev)
-- WS_URL (auto-detects prod/dev)
-- REFRESH_INTERVALS
-- DISPLAY_SETTINGS
-- THRESHOLDS
-- STORAGE_KEYS
+**Problem**:
+- ~50+ console.log statements per minute in production
+- Unprofessional, cluttered console
 
-**Usage**:
-```javascript
-import { API_BASE, REFRESH_INTERVALS, THRESHOLDS } from './config'
+**Solution**:
+- Created `frontend/src/utils/logger.js`
+- Conditional logging (dev only)
+- Replaced all console.log with logger.log
 
-fetch(`${API_BASE}/api/metrics`)
-setInterval(poll, REFRESH_INTERVALS.METRICS)
-if (change >= THRESHOLDS.DIAMOND_PERCENT)
-```
+**Files Modified**:
+- `frontend/src/components/LiveDashboard.jsx` (~20 replacements)
+- `frontend/src/components/NexRadarDashboard.jsx` (~10 replacements)
 
-**Files Created**: `frontend/src/config.js`
-
-**Impact**: Single source of truth, easy to maintain ✅
+**Impact**: Clean production console, easy debugging in dev
 
 ---
 
-### 9. ✅ Added ARIA Labels for Accessibility
-**Priority**: High | **Impact**: High | **Status**: COMPLETE
+### 8. Magic Numbers and Hardcoded Values
+**Priority**: Medium | **Status**: ✅ Fixed | **Date**: 2026-03-04
 
-**Problem**: No accessibility labels on interactive elements, failing WCAG compliance.
+**Problem**:
+- Hardcoded values scattered across 10+ locations
+- Difficult to maintain and change
 
-**Solution**: Added comprehensive ARIA labels:
-- Dark/Light mode toggle: `aria-label`, `aria-pressed`
-- Notification button: `aria-label`, `aria-expanded`, `aria-haspopup`
-- Profile button: `aria-label`, `aria-expanded`, `aria-haspopup`
-- Tab navigation: `role="tablist"`, `role="tab"`, `aria-selected`
-- Filter cards: `role="group"`, `aria-label`, `aria-pressed`
+**Solution**:
+- Created `frontend/src/config.js`
+- Centralized all configuration
+- Auto-detects production vs development
+
+**Configuration Includes**:
+- API URLs (API_BASE, WS_URL)
+- Refresh intervals
+- Display settings (row counts, scroll threshold)
+- Thresholds (stale price, diamond %, volume ratios)
+- Storage keys
+
+**Files Modified**:
+- `frontend/src/App.jsx`
+- `frontend/src/components/LiveDashboard.jsx`
+- `frontend/src/components/NexRadarDashboard.jsx`
+
+**Impact**: Single source of truth, easy to maintain
+
+---
+
+### 9. Missing ARIA Labels (Accessibility)
+**Priority**: High | **Status**: ✅ Fixed | **Date**: 2026-03-04
+
+**Problem**:
+- No accessibility labels on interactive elements
+- Not screen reader compatible
+- WCAG compliance issues
+
+**Solution**:
+Added ARIA labels to:
+- Dark/Light mode toggle (`aria-label`, `aria-pressed`)
+- Notification button (`aria-label`, `aria-expanded`, `aria-haspopup`)
+- Profile button (`aria-label`, `aria-expanded`, `aria-haspopup`)
+- Tab navigation (`role="tablist"`, `role="tab"`, `aria-selected`)
+- Filter cards (`role="group"`, `aria-label`, `aria-pressed`)
 
 **Files Modified**: `frontend/src/App.jsx`
 
-**Impact**: Screen reader compatible, WCAG 2.1 Level AA compliance ✅
+**Impact**: Screen reader compatible, better keyboard navigation
 
 ---
 
 ## 📊 Summary Statistics
 
 ### Issues Fixed
-- **Critical**: 3 issues
-- **High Priority**: 6 issues
+- **Critical**: 3 (Portfolio selection, data source switching, refresh intervals)
+- **High**: 4 (Dark mode, sector filter, fake charts, accessibility)
+- **Medium**: 2 (Console logs, magic numbers)
 - **Total**: 9 issues fixed
 
 ### Files Modified
@@ -260,20 +279,18 @@ if (change >= THRESHOLDS.DIAMOND_PERCENT)
 - `frontend/src/config.js` (created)
 - `frontend/src/utils/logger.js` (created)
 
-### Performance Improvements
+### Performance Impact
 - **API Calls**: Reduced by 90% (30s vs 3s refresh)
-- **Console Logs**: 0 in production (was 50+/min)
-- **Code Maintainability**: Centralized config
-- **Accessibility**: Full ARIA label coverage
+- **Console Logs**: Reduced by 100% in production
+- **Code Maintainability**: Improved significantly
 
-### User Experience Improvements
-- ✅ Dark mode preference persists
+### User Experience Impact
+- ✅ Dark mode preference saved
 - ✅ Data source switching works correctly
-- ✅ Sector filtering works with name variations
-- ✅ Real TradingView charts instead of fake animations
-- ✅ Portfolio filtering works in Dashboard
-- ✅ Numbers are readable (30s refresh)
-- ✅ Screen reader compatible
+- ✅ Sector filtering works with any database format
+- ✅ Real charts instead of fake animations
+- ✅ Numbers readable (30s refresh)
+- ✅ Better accessibility
 
 ---
 
@@ -281,52 +298,52 @@ if (change >= THRESHOLDS.DIAMOND_PERCENT)
 
 ### Functional Testing
 - [x] Dark mode persists on refresh
-- [x] Portfolio/Earnings switching works
-- [x] Sector filtering works for all sectors
-- [x] TradingView chart loads and shows real data
+- [x] Portfolio/Earnings switching clears old data
+- [x] Sector filter works with database variations
+- [x] TradingView chart loads real data
 - [x] Portfolio button filters correctly
-- [x] Refresh intervals are reasonable
+- [x] Refresh intervals are 30s (readable)
 
 ### Accessibility Testing
-- [x] ARIA labels present on all interactive elements
-- [x] Keyboard navigation works
-- [x] Screen reader announces labels correctly
+- [x] Screen reader announces button labels
+- [x] Keyboard navigation works (Tab, Enter, Space)
 - [x] Focus indicators visible
+- [x] ARIA attributes correct
 
 ### Performance Testing
+- [x] Production console is clean
 - [x] API calls reduced by 90%
-- [x] Console clean in production
-- [x] No memory leaks
-- [x] Smooth scrolling and interactions
+- [x] No unnecessary re-renders
 
 ---
 
 ## 📝 Known Limitations
 
-### TradingView Widget
-- Free tier shows TradingView branding
+### 1. Sector Name Mapping
+- Requires manual mapping for new sector variations
+- Consider standardizing database sector names
+
+### 2. TradingView Free Tier
 - Limited to 1 chart per page
+- Shows TradingView branding
 - Consider TradingView Pro for commercial use
 
-### Sector Normalization
-- Only handles common variations
-- Add new mappings as needed in `normalizeSector()` function
-
-### Refresh Intervals
-- Current settings optimized for day trading
-- Adjust in `config.js` for different use cases
+### 3. WebSocket Reconnection
+- Uses exponential backoff (max 30s)
+- Could be optimized further
 
 ---
 
-## 🔗 Related Documentation
+## 🔄 Related Issues (Not Yet Fixed)
 
-- `2_IMPLEMENTATION_SUMMARY.md` - Overall dashboard implementation
-- `3_FUTURE_FIXES_PLAN.md` - Remaining tasks and roadmap
-- `frontend/src/config.js` - Configuration values
-- `frontend/src/utils/logger.js` - Logging utility
+See `3_FUTURE_FIXES.md` for:
+- Performance optimizations (memoization)
+- Backend improvements (rate limiting)
+- Mobile responsiveness
+- Additional testing
 
 ---
 
-**Status**: ✅ All Critical Issues Resolved  
-**Production Ready**: Yes  
-**Next Steps**: See `3_FUTURE_FIXES_PLAN.md`
+**Last Updated**: 2026-03-04
+**Status**: All critical and high priority issues fixed
+**Next**: Performance optimizations and backend improvements
