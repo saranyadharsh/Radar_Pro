@@ -1547,6 +1547,7 @@ function PageEarnings({ T }) {
   const [selectedDay, setSelectedDay] = useState(null);
   const [earningsData, setEarningsData] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
   const weekDates = useMemo(() => getWeekDates(weekOffset), [weekOffset]);
 
@@ -1554,16 +1555,31 @@ function PageEarnings({ T }) {
   useEffect(() => {
     const fetchEarnings = async () => {
       try {
+        setLoading(true);
+        setError(null);
         const startDate = weekDates[0]?.isoDate;
         const endDate = weekDates[weekDates.length - 1]?.isoDate;
         
+        console.log('[Earnings] Fetching data:', { startDate, endDate, url: `${API_BASE}/api/earnings?start=${startDate}&end=${endDate}` });
+        
         const res = await fetch(`${API_BASE}/api/earnings?start=${startDate}&end=${endDate}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        console.log('[Earnings] Response status:', res.status, res.statusText);
+        
+        if (!res.ok) {
+          const errorText = await res.text();
+          console.error('[Earnings] HTTP error:', res.status, errorText);
+          throw new Error(`HTTP ${res.status}: ${errorText}`);
+        }
+        
         const data = await res.json();
+        console.log('[Earnings] Data received:', { count: data?.length || 0, sample: data?.[0] });
+        
         setEarningsData(data || []);
         setLoading(false);
       } catch (err) {
         console.error('[Earnings] Fetch error:', err);
+        setError(err.message);
+        setEarningsData([]);
         setLoading(false);
       }
     };
@@ -1623,7 +1639,9 @@ function PageEarnings({ T }) {
             
             {/* Scrollable container */}
             <div style={{ maxHeight:"calc(100vh - 450px)", minHeight:"300px", overflowY:"auto", position:"relative" }}>
-              {loading ? (
+              {error ? (
+                <EmptyState icon="⚠" label="ERROR LOADING EARNINGS" sub={error} h={200} T={T}/>
+              ) : loading ? (
                 // Show shimmer
                 Array(10).fill(0).map((_,i)=>(
                   <div key={i} className="tr-hover" style={{ display:"grid", gridTemplateColumns:"repeat(8,1fr)", borderBottom:`1px solid #080f1a` }}>
