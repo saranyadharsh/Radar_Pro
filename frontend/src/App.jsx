@@ -143,10 +143,7 @@ export default function App() {
   const [chartInterval, setChartInterval] = useState('D')
   const [source,        setSource]        = useState('all')
   const [sector,        setSector]        = useState('all')
-  const [showNotif,     setShowNotif]     = useState(false)
-  const [showProfile,   setShowProfile]   = useState(false)
   const [showUserProfile, setShowUserProfile] = useState(false)
-  const [autoSession,   setAutoSession]   = useState(true)
   const [selectedTickerDetail, setSelectedTickerDetail] = useState(null)
   const [user, setUser] = useState({ name: 'Saranya', role: 'Premium Trader' })
 
@@ -186,8 +183,23 @@ export default function App() {
   const sc = SESSION_CONFIG[session] || SESSION_CONFIG.CLOSED
   const m = metrics
 
-  const wsHealthColor = { Healthy: 'text-emerald-400', connecting: 'text-amber-400', Degraded: 'text-amber-400', error: 'text-red-400', closed: 'text-red-400' }[wsStatus] ?? 'text-gray-400'
-  const wsDot = { Healthy: 'bg-emerald-400 shadow-emerald-400/50', connecting: 'bg-amber-400', Degraded: 'bg-amber-400', error: 'bg-red-500', closed: 'bg-red-500' }[wsStatus] ?? 'bg-gray-500'
+  const wsHealthColor = { 
+    Healthy: 'text-emerald-400', 
+    open: 'text-emerald-400',  // Backend sends 'open' when connected
+    connecting: 'text-amber-400', 
+    Degraded: 'text-amber-400', 
+    error: 'text-red-400', 
+    closed: 'text-red-400' 
+  }[wsStatus] ?? 'text-gray-400'
+  
+  const wsDot = { 
+    Healthy: 'bg-emerald-400 shadow-emerald-400/50', 
+    open: 'bg-emerald-400 shadow-emerald-400/50',  // Backend sends 'open' when connected
+    connecting: 'bg-amber-400', 
+    Degraded: 'bg-amber-400', 
+    error: 'bg-red-500', 
+    closed: 'bg-red-500' 
+  }[wsStatus] ?? 'bg-gray-500'
 
   const bg = darkMode ? 'bg-[#080c14]' : 'bg-slate-100'
   const fg = darkMode ? 'text-white' : 'text-slate-900'

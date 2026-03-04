@@ -25,6 +25,7 @@ from pathlib import Path
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 import os
+import sys
 import asyncio
 import logging
 import time
@@ -32,11 +33,19 @@ from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from typing import Set, List
 
+# Add parent directory to path for imports to work in both dev and production
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.supabase_db import SupabaseDB
-from backend.ws_engine    import WSEngine
+# Try both import styles for compatibility
+try:
+    from backend.supabase_db import SupabaseDB
+    from backend.ws_engine    import WSEngine
+except ModuleNotFoundError:
+    from supabase_db import SupabaseDB
+    from ws_engine    import WSEngine
 
 
 import yfinance as _yf
@@ -181,12 +190,14 @@ async def post_signal(payload: dict):
 # ── Portfolio / Monitor ────────────────────────────────────────────────────────
 @app.get("/api/portfolio")
 async def get_portfolio():
-    return db.get_portfolio()
+    rows = db.get_portfolio()
+    return {"tickers": [r.get("ticker") for r in rows if r.get("ticker")]}
 
 
 @app.get("/api/monitor")
 async def get_monitor():
-    return db.get_monitor()
+    rows = db.get_monitor()
+    return {"tickers": [r.get("ticker") for r in rows if r.get("ticker")]}
 
 
 # ── Signal Watchlist ───────────────────────────────────────────────────────────

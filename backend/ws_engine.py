@@ -11,6 +11,7 @@ SECTOR CHANGES (marked with # ← SECTOR):
 """
 
 import os
+import sys
 import time
 import asyncio
 import threading
@@ -20,6 +21,10 @@ import random
 from datetime import datetime, time as dt_time
 from typing import Dict, List, Optional, Set, Callable
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytz
 import yfinance as yf
@@ -32,14 +37,23 @@ _os.environ.pop("SSL_CERT_FILE", None)
 from massive import WebSocketClient, RESTClient
 from massive.websocket.models import WebSocketMessage, Market
 
-from backend.supabase_db import SupabaseDB
-
-from backend.Scalping_Signal import (
-    ScalpingSignalEngine,
-    SignalWatchlistManager,
-    OHLCVBar,
-    TradeSignal,
-)
+# Try both import styles for compatibility
+try:
+    from backend.supabase_db import SupabaseDB
+    from backend.Scalping_Signal import (
+        ScalpingSignalEngine,
+        SignalWatchlistManager,
+        OHLCVBar,
+        TradeSignal,
+    )
+except ModuleNotFoundError:
+    from supabase_db import SupabaseDB
+    from Scalping_Signal import (
+        ScalpingSignalEngine,
+        SignalWatchlistManager,
+        OHLCVBar,
+        TradeSignal,
+    )
 
 logger = logging.getLogger(__name__)
 
