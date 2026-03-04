@@ -146,6 +146,8 @@ export default function App() {
   const [showUserProfile, setShowUserProfile] = useState(false)
   const [selectedTickerDetail, setSelectedTickerDetail] = useState(null)
   const [user, setUser] = useState({ name: 'Saranya', role: 'Premium Trader' })
+  const [showNotif, setShowNotif] = useState(false)
+  const [showProfile, setShowProfile] = useState(false)
 
   const { tickers, wsStatus } = useWebSocket()
   const { notes, dismiss, clearAll } = useNotifications(metrics)
