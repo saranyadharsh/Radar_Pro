@@ -1,251 +1,602 @@
-/**
- * NexRadarDashboard.jsx — v7.0 — COMPLETE DATA SOURCE FIX
- *
- * ALL DATA SOURCE SELECTIONS NOW WORK:
- *  ALL        → v_live_enriched (live_tickers JOIN stock_list) — sector included
- *  WATCHLIST  → filter allRows by monitorSet  (Set<ticker> from /api/monitor)
- *  PORTFOLIO  → filter allRows by portfolioSet (Set<ticker> from /api/portfolio)
- *
- * SECTOR FILTER FIX:
- *  Backend queries v_live_enriched view which JOINs stock_list.
- *  Every ticker row now carries sector — no client-side merge needed.
- *
- * Backend endpoints required:
- *   WS  /ws/live                    → snapshot + tick (rows must include sector)
- *   GET /api/monitor                → [{ticker,...}] from monitor table
- *   GET /api/portfolio              → [{ticker,shares,avg_cost,...,live_price}]
- *   GET /api/metrics                → engine alert counts
- *   GET /api/signals?limit=500      → scalping signals
- *   GET /api/earnings?start=&end=   → earnings calendar
- *
- * See fix_view.sql    → create v_live_enriched view in Supabase
- * See fix_backend.py  → FastAPI endpoint fixes
- */
+import { useState, useEffect, useMemo, useRef } from "react";
+import { API_BASE } from "../config.js";
 
-import { useState, useEffect, useRef, useMemo, useCallback } from "react";
-import MiniSparkline from './MiniSparkline';
-import { API_BASE, WS_URL, REFRESH_INTERVALS } from '../config';
-import logger from '../utils/logger';
-
-// ─── TOKENS ──────────────────────────────────────────────────────────────────
-const DARK = {
-  bg:"#030912",bg2:"#060f1e",panel:"#08111f",panel2:"#0c1828",panel3:"#0f1e30",
-  line:"rgba(255,255,255,0.06)",line2:"rgba(255,255,255,0.11)",
-  text:"#f1f5f9",muted:"#4a6080",muted2:"#2d4a6a",
-};
-const LIGHT = {
-  bg:"#f8fafc",bg2:"#f1f5f9",panel:"#ffffff",panel2:"#f8fafc",panel3:"#f1f5f9",
-  line:"rgba(0,0,0,0.10)",line2:"rgba(0,0,0,0.15)",
-  text:"#0f172a",muted:"#475569",muted2:"#64748b",
-};
-const C = {
-  amber:"#f59e0b",amber2:"#fbbf24",
-  cyan:"#22d3ee",cyan2:"#67e8f9",
-  green:"#10b981",green2:"#34d399",
-  red:"#ef4444",red2:"#f87171",
-  violet:"#8b5cf6",blue:"#3b82f6",
+// ─── Market Session Detection (ET, client-side) ─────────────────────────────
+function getMarketSession() {
+  const et  = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const day = et.getDay();
+  const hm  = et.getHours() * 60 + et.getMinutes();
+  if (day === 0 || day === 6)            return "closed";
+  if (hm >= 20 * 60 || hm < 4 * 60)    return "closed";
+  if (hm < 9 * 60 + 30)                 return "pre";
+  if (hm < 16 * 60)                     return "market";
+  if (hm < 20 * 60)                     return "after";
+  return "closed";
+}
+const SESSION_META = {
+  market: { chipLabel: "● MARKET OPEN",  chipColorKey: "green",  subMode: "MH" },
+  pre:    { chipLabel: "● PRE-MARKET",   chipColorKey: "gold",   subMode: "AH" },
+  after:  { chipLabel: "● AFTER HOURS",  chipColorKey: "purple", subMode: "AH" },
+  closed: { chipLabel: "● OVERNIGHT",    chipColorKey: "text2",  subMode: "AH" },
 };
 
-const clr  = n => n >= 0 ? C.green2 : C.red2;
-const pct  = n => `${n>=0?"+":""}${Number(n||0).toFixed(2)}%`;
-const nowT = () => new Date().toLocaleTimeString("en-US",{hour12:false});
-const fmt2 = n => Number(n||0).toFixed(2);
-const fmtK = n => n>=1e9?`$${(n/1e9).toFixed(1)}B`:n>=1e6?`$${(n/1e6).toFixed(0)}M`:n?`$${n}`:"—";
-
-const SECTOR_LIST = ["TECHNOLOGY","CONSUMER","BANKING","BIO","BM & UENE","REALCOM","INDUSTRIALS"];
-
-// ─── TRADINGVIEW CHART WIDGET ────────────────────────────────────────────────
-function TradingViewChart({ symbol, darkMode }) {
-  const containerRef = useRef(null);
+// ─── Design Tokens (Theme-aware) ───────────────────────────────────────────
+const getThemeTokens = (darkMode = true) => ({
+  // Backgrounds - Dark: deep blues, Light: clean grays
+  bg0: darkMode ? "#02060d" : "#f8fafc",        // Deepest bg / Lightest bg
+  bg1: darkMode ? "#060d18" : "#ffffff",        // Main bg / White cards
+  bg2: darkMode ? "#0a1421" : "#f1f5f9",        // Card bg / Light gray
+  bg3: darkMode ? "#0f1c2e" : "#e2e8f0",        // Hover bg / Medium gray
+  bg4: darkMode ? "#142038" : "#cbd5e1",        // Active bg / Border gray
   
+  // Borders - Dark: subtle blues, Light: medium grays
+  border: darkMode ? "#172438" : "#d1d5db",     // Default border
+  borderHi: darkMode ? "#1f3655" : "#9ca3af",   // Highlighted border
+  
+  // Primary (Cyan) - Dark: bright cyan, Light: teal
+  cyan: darkMode ? "#00d4ff" : "#0891b2",
+  cyanDim: darkMode ? "#00d4ff12" : "#0891b218",
+  cyanMid: darkMode ? "#00d4ff35" : "#0891b240",
+  
+  // Success (Green) - Dark: bright green, Light: forest green
+  green: darkMode ? "#00e676" : "#059669",
+  greenDim: darkMode ? "#00e67614" : "#05966918",
+  
+  // Danger (Red) - Dark: bright red, Light: crimson
+  red: darkMode ? "#ff3d5a" : "#dc2626",
+  redDim: darkMode ? "#ff3d5a14" : "#dc262618",
+  
+  // Warning (Gold) - Dark: bright gold, Light: amber
+  gold: darkMode ? "#ffc400" : "#d97706",
+  goldDim: darkMode ? "#ffc40014" : "#d9770618",
+  
+  // Info (Purple) - Dark: bright purple, Light: violet
+  purple: darkMode ? "#b388ff" : "#7c3aed",
+  purpleDim: darkMode ? "#b388ff14" : "#7c3aed18",
+  
+  // Alert (Orange) - Dark: bright orange, Light: orange
+  orange: darkMode ? "#ff6d00" : "#ea580c",
+  orangeDim: darkMode ? "#ff6d0014" : "#ea580c18",
+  
+  // Text - Dark: light blues, Light: dark grays
+  text0: darkMode ? "#e2f1f8" : "#0f172a",      // Primary text (highest contrast)
+  text1: darkMode ? "#8ba3b8" : "#1e293b",      // Secondary text (medium contrast)
+  text2: darkMode ? "#4a6278" : "#475569",      // Tertiary text (lower contrast)
+  text3: darkMode ? "#2e4a62" : "#64748b",      // Muted text (lowest contrast)
+  
+  // Typography - Comfortable, readable fonts
+  font: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+  fontMono: "'JetBrains Mono', 'Fira Code', 'Consolas', monospace",
+  fontDisplay: "'Inter', -apple-system, BlinkMacSystemFont, sans-serif",
+  fontSans: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",  // FIX #11
+});
+
+// ─── Sector definitions + ticker counts (from Supabase) ─────────────────────
+// Counts from stock_list table (is_active=1, ordered by sector for diverse loading)
+// Backend streams first 1500 tickers ordered by sector
+const SECTORS = [
+  { id: "ALL",         label: "ALL",          color: "#00d4ff",    count: 6027 },
+  { id: "TECHNOLOGY",  label: "TECHNOLOGY",   color: "#00d4ff",    count: 775  },
+  { id: "CONSUMER",    label: "CONSUMER",     color: "#ffc400",    count: 823  },
+  { id: "BANKING",     label: "BANKING",      color: "#00e676",    count: 1002 },
+  { id: "BIO",         label: "BIO",          color: "#b388ff",    count: 1150 },
+  { id: "BM & UENE",   label: "BM & UENE",    color: "#ff6d00",    count: 659  },
+  { id: "REALCOM",     label: "REALCOM",      color: "#00bcd4",    count: 639  },
+  { id: "INDUSTRIALS", label: "INDUSTRIALS",  color: "#78909c",    count: 979  },
+  { id: "EARNINGS",    label: "EARNINGS",     color: "#ffc400",    count: null }, // dynamic, ~550/week
+];
+const MAX_TICKERS = 1500;
+
+// ─── Sector Normalization Helper ──────────────────────────────────────────────
+// Maps various sector name formats to standard SECTORS IDs
+function normalizeSector(sectorName) {
+  if (!sectorName) return null;
+  const s = sectorName.toUpperCase().trim();
+  
+  // Direct matches
+  if (s === "TECHNOLOGY" || s === "TECH") return "TECHNOLOGY";
+  if (s === "CONSUMER" || s === "CONSUMER DISCRETIONARY" || s === "CONSUMER STAPLES") return "CONSUMER";
+  if (s === "BANKING" || s === "FINANCIALS" || s === "FINANCIAL SERVICES") return "BANKING";
+  if (s === "BIO" || s === "BIOTECHNOLOGY" || s === "HEALTHCARE" || s === "HEALTH CARE") return "BIO";
+  if (s === "BM & UENE" || s === "BM&ENERGY" || s === "BASIC MATERIALS" || s === "ENERGY" || s === "UTILITIES") return "BM & UENE";
+  if (s === "REALCOM" || s === "REAL ESTATE" || s === "COMMUNICATION SERVICES" || s === "TELECOMMUNICATIONS") return "REALCOM";
+  if (s === "INDUSTRIALS" || s === "INDUSTRIAL") return "INDUSTRIALS";
+  
+  // Partial matches
+  if (s.includes("TECH")) return "TECHNOLOGY";
+  if (s.includes("CONSUMER")) return "CONSUMER";
+  if (s.includes("BANK") || s.includes("FINANC")) return "BANKING";
+  if (s.includes("BIO") || s.includes("HEALTH")) return "BIO";
+  if (s.includes("ENERGY") || s.includes("MATERIAL") || s.includes("UTILIT")) return "BM & UENE";
+  if (s.includes("REAL") || s.includes("COMM")) return "REALCOM";
+  if (s.includes("INDUSTR")) return "INDUSTRIALS";
+  
+  return null;
+}
+
+// ─── Nav ────────────────────────────────────────────────────────────────────
+const NAV = [
+  { id: "dashboard", label: "Dashboard",  icon: "⬡" },
+  { id: "live",      label: "Live Table", icon: "◈" },
+  { id: "chart",     label: "Chart",      icon: "◇" },
+  { id: "signals",   label: "Signals",    icon: "◉" },
+  { id: "earnings",  label: "Earnings",   icon: "◎" },
+  { id: "portfolio", label: "Portfolio",  icon: "◆" },
+];
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+const fmt2 = n => Number(n || 0).toFixed(2);
+const pct  = n => `${n >= 0 ? "+" : ""}${Number(n || 0).toFixed(2)}%`;
+const fmtK = n => n >= 1e9 ? `$${(n/1e9).toFixed(1)}B` : n >= 1e6 ? `$${(n/1e6).toFixed(0)}M` : n ? `$${n}` : "—";
+const fmtVol = n => n >= 1e9 ? `${(n/1e9).toFixed(1)}B` : n >= 1e6 ? `${(n/1e6).toFixed(1)}M` : n >= 1e3 ? `${(n/1e3).toFixed(0)}K` : n ? `${n}` : "—";
+// clr helper removed - use T.green/T.red directly in components where T is available
+
+function getWeekDates(offsetWeeks = 0) {
+  const today = new Date();
+  const dow = today.getDay();
+  const monday = new Date(today);
+  monday.setDate(today.getDate() - (dow === 0 ? 6 : dow - 1) + offsetWeeks * 7);
+  return ["MON","TUE","WED","THU","FRI"].map((d, i) => {
+    const dt = new Date(monday);
+    dt.setDate(monday.getDate() + i);
+    return {
+      day: d,
+      date: dt.toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+      isoDate: dt.toISOString().slice(0, 10),
+      isToday: dt.toDateString() === today.toDateString(),
+    };
+  });
+}
+
+// Compute total tickers for a set of selected sectors, capped at MAX_TICKERS
+function computeSectorTotal(selectedIds) {
+  if (selectedIds.includes("ALL") || selectedIds.length === 0) return MAX_TICKERS;
+  const total = selectedIds.reduce((sum, id) => {
+    const s = SECTORS.find(x => x.id === id);
+    return sum + (s?.count || 0);
+  }, 0);
+  return Math.min(total, MAX_TICKERS);
+}
+
+// ─── CSS (Theme-aware) ────────────────────────────────────────────────────────
+const getCSS = (T) => `
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+  
+  *, *::before, *::after { 
+    box-sizing: border-box; 
+    margin: 0; 
+    padding: 0; 
+  }
+  
+  body { 
+    background: ${T.bg0}; 
+    font-family: ${T.font};
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: ${T.border}; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: ${T.borderHi}; }
+
+  @keyframes fadeUp   { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+  @keyframes shimmer  { 0%{background-position:-400px 0} 100%{background-position:400px 0} }
+  @keyframes dotblink { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.25;transform:scale(0.5)} }
+
+  .page-enter { animation: fadeUp 0.3s ease forwards; }
+
+  .shimmer-box {
+    background: linear-gradient(90deg, ${T.bg2} 25%, ${T.bg3} 50%, ${T.bg2} 75%);
+    background-size: 400px 100%; animation: shimmer 1.6s infinite; border-radius: 4px;
+  }
+  
+  .nav-btn {
+    background: none; border: 1px solid transparent; cursor: pointer;
+    display: flex; align-items: center; gap: 10px;
+    padding: 11px 16px; width: 100%; border-radius: 8px;
+    transition: all 0.2s ease;
+    font-family: ${T.font};
+    font-size: 13px; 
+    font-weight: 500;
+    letter-spacing: 0.3px; 
+    text-transform: uppercase; 
+    color: ${T.text2};
+  }
+  .nav-btn:hover  { background: ${T.bg2}; color: ${T.text0}; }
+  .nav-btn.active { 
+    background: ${T.cyanDim}; 
+    color: ${T.cyan}; 
+    border-color: ${T.cyanMid}; 
+    font-weight: 600;
+  }
+  .nav-btn .icon  { font-size: 16px; min-width: 18px; text-align: center; }
+
+  .card { 
+    background: ${T.bg1}; 
+    border: 1px solid ${T.border}; 
+    border-radius: 12px; 
+    overflow: hidden; 
+    position: relative;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+  }
+  .card-glow { 
+    border-color: ${T.borderHi}; 
+    box-shadow: 0 0 0 1px ${T.cyanDim} inset, 0 2px 8px rgba(0,0,0,0.15); 
+  }
+
+  .btn-ghost {
+    background: none; 
+    border: 1px solid ${T.border}; 
+    color: ${T.text1};
+    border-radius: 6px; 
+    padding: 7px 14px; 
+    cursor: pointer;
+    font-family: ${T.font}; 
+    font-size: 12px; 
+    font-weight: 500;
+    letter-spacing: 0.3px; 
+    transition: all 0.2s ease;
+  }
+  .btn-ghost:hover:not(:disabled)  { 
+    border-color: ${T.cyanMid}; 
+    color: ${T.cyan}; 
+    background: ${T.cyanDim}; 
+  }
+  .btn-ghost.active { 
+    background: ${T.cyanDim}; 
+    border-color: ${T.cyanMid}; 
+    color: ${T.cyan}; 
+    font-weight: 600;
+  }
+  .btn-ghost:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .btn-primary {
+    background: ${T.cyanDim}; 
+    border: 1px solid ${T.cyanMid}; 
+    color: ${T.cyan};
+    border-radius: 6px; 
+    padding: 8px 16px; 
+    cursor: pointer;
+    font-family: ${T.font}; 
+    font-size: 12px; 
+    font-weight: 600;
+    letter-spacing: 0.3px; 
+    transition: all 0.2s ease;
+  }
+  .btn-primary:hover { background: ${T.cyanMid}; }
+
+  .tr-hover { transition: background 0.15s ease; cursor: pointer; }
+  .tr-hover:hover td { background: ${T.bg2} !important; }
+
+  .live-dot {
+    width: 8px; height: 8px; border-radius: 50%; background: ${T.green};
+    animation: dotblink 1.4s ease-in-out infinite; display: inline-block; flex-shrink: 0;
+  }
+  
+  input, select, textarea {
+    font-family: ${T.font};
+    font-size: 14px;
+  }
+  
+  input:focus, select:focus, textarea:focus { 
+    outline: none !important; 
+    border-color: ${T.cyanMid} !important; 
+    box-shadow: 0 0 0 3px ${T.cyanDim};
+  }
+  
+  /* Theme selector dropdown */
+  .theme-selector-group:hover .theme-dropdown {
+    opacity: 1 !important;
+    visibility: visible !important;
+  }
+`;
+
+// ─── Primitives (accept T as prop or use default colors) ────────────────────
+function Chip({ children, color = "#00d4ff", T }) {
+  const font = T?.font || "'Inter', sans-serif";
+  return (
+    <span style={{ 
+      background: color+"18", 
+      color, 
+      border:`1px solid ${color}28`,
+      borderRadius:5, 
+      padding:"4px 10px", 
+      fontSize:11,
+      fontFamily:font, 
+      letterSpacing:0.3, 
+      fontWeight:600, 
+      whiteSpace:"nowrap" 
+    }}>{children}</span>
+  );
+}
+
+function SectionHeader({ title, children, T }) {
+  const border = T?.border || "#172438";
+  const text0 = T?.text0 || "#e2f1f8";
+  const font = T?.font || "'Inter', sans-serif";
+  return (
+    <div style={{ 
+      display:"flex", 
+      justifyContent:"space-between", 
+      alignItems:"center", 
+      padding:"14px 18px", 
+      borderBottom:`1px solid ${border}` 
+    }}>
+      <span style={{ 
+        color:text0, 
+        fontSize:13, 
+        letterSpacing:0.5, 
+        fontFamily:font, 
+        textTransform:"uppercase",
+        fontWeight:700
+      }}>{title}</span>
+      <div style={{ display:"flex", gap:8, alignItems:"center" }}>{children}</div>
+    </div>
+  );
+}
+
+function Shimmer({ w, h=14, opacity=1 }) {
+  return <div className="shimmer-box" style={{ height:h, width:w, opacity }} />;
+}
+
+function EmptyState({ icon="◇", label="Awaiting data", sub, h=180, T }) {
+  const text1 = T?.text1 || "#8ba3b8";
+  const text2 = T?.text2 || "#4a6278";
+  const font = T?.font || "'Inter', sans-serif";
+  return (
+    <div style={{ 
+      display:"flex", 
+      flexDirection:"column", 
+      alignItems:"center", 
+      justifyContent:"center", 
+      gap:12, 
+      height:h, 
+      padding:24 
+    }}>
+      <div style={{ color:text2, fontSize:36, opacity:0.4 }}>{icon}</div>
+      <div style={{ 
+        color:text1, 
+        fontSize:13, 
+        letterSpacing:0.5, 
+        fontFamily:font,
+        fontWeight:600
+      }}>{label}</div>
+      {sub && <div style={{ 
+        color:text2, 
+        fontSize:13, 
+        fontFamily:font, 
+        textAlign:"center", 
+        maxWidth:280, 
+        lineHeight:1.6 
+      }}>{sub}</div>}
+    </div>
+  );
+}
+
+function EmptyChart({ height=180, label="Awaiting live data feed", T }) {
+  const W=400, H=height;
+  const bg2 = T?.bg2 || "#0a1421";
+  const border = T?.border || "#172438";
+  const cyan = T?.cyan || "#00d4ff";
+  const text2 = T?.text2 || "#4a6278";
+  const font = T?.font || "'Inter', sans-serif";
+  const path=`M0,${H*0.6} C60,${H*0.55} 90,${H*0.35} 140,${H*0.4} S210,${H*0.65} 260,${H*0.5} S340,${H*0.3} ${W},${H*0.45}`;
+  return (
+    <div style={{ position:"relative", background:bg2, borderRadius:8, overflow:"hidden" }}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height, display:"block", opacity:0.14 }}>
+        <defs><linearGradient id="eg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={cyan} stopOpacity="0.3"/><stop offset="100%" stopColor={cyan} stopOpacity="0"/></linearGradient></defs>
+        {[...Array(7)].map((_,i)=><line key={i} x1="0" y1={H*i/6} x2={W} y2={H*i/6} stroke={border} strokeWidth="1"/>)}
+        {[...Array(9)].map((_,i)=><line key={i} x1={W*i/8} y1="0" x2={W*i/8} y2={H} stroke={border} strokeWidth="1"/>)}
+        <path d={path} fill="none" stroke={cyan} strokeWidth="1.5" strokeDasharray="4 3"/>
+        <path d={`${path} L${W},${H} L0,${H} Z`} fill="url(#eg)"/>
+      </svg>
+      {label && (
+        <div style={{ position:"absolute", inset:0, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:10 }}>
+          <div style={{ color:text2, fontSize:24, opacity:0.5 }}>◇</div>
+          <div style={{ color:text2, fontSize:13, letterSpacing:0.5, fontFamily:font, fontWeight:500 }}>{label}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── TradingView Embed (no indicators — clean price chart only) ───────────────
+function TVChart({ symbol, height=220, T }) {
+  const bg1 = T?.bg1 || "#060d18";
+  const border = T?.border || "#172438";
+  const ref = useRef(null);
   useEffect(() => {
-    if (!symbol || !containerRef.current) return;
-    
-    // Clear previous widget
-    containerRef.current.innerHTML = '';
-    
-    const script = document.createElement('script');
-    script.src = 'https://s3.tradingview.com/tv.js';
-    script.async = true;
-    script.onload = () => {
-      if (window.TradingView) {
+    if (!symbol || !ref.current) return;
+    ref.current.innerHTML = "";
+    const s = document.createElement("script");
+    s.src = "https://s3.tradingview.com/tv.js";
+    s.async = true;
+    s.onload = () => {
+      if (window.TradingView && ref.current) {
         new window.TradingView.widget({
           autosize: true,
           symbol: `NASDAQ:${symbol}`,
-          interval: '5',
-          timezone: 'America/New_York',
-          theme: darkMode ? 'dark' : 'light',
-          style: '1',
-          locale: 'en',
-          toolbar_bg: darkMode ? '#0c1828' : '#f1f5f9',
+          interval: "5",
+          timezone: "America/New_York",
+          theme: "dark",
+          style: "1",
+          locale: "en",
           enable_publishing: false,
-          hide_top_toolbar: false,
+          hide_top_toolbar: true,
           hide_legend: true,
+          hide_side_toolbar: true,
+          allow_symbol_change: false,
           save_image: false,
-          container_id: containerRef.current.id,
-          studies: ['MASimple@tv-basicstudies', 'Volume@tv-basicstudies'],
+          studies: [], // NO indicators — clean chart
+          container_id: ref.current.id,
+          backgroundColor: bg1,
+          gridColor: border,
         });
       }
     };
-    document.head.appendChild(script);
-    
-    return () => {
-      if (script.parentNode) {
-        script.parentNode.removeChild(script);
-      }
-    };
-  }, [symbol, darkMode]);
-  
+    document.head.appendChild(s);
+    return () => { try { document.head.removeChild(s); } catch {} };
+  }, [symbol, bg1, border]);
   return (
-    <div 
-      ref={containerRef} 
-      id={`tradingview_${symbol}`}
-      style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
-    />
+    <div ref={ref} id={`tv_${symbol}_${Math.random().toString(36).slice(2,7)}`}
+      style={{ width:"100%", height, position:"relative" }} />
   );
 }
 
-// ─── SECTOR HEATMAP TILE ─────────────────────────────────────────────────────
-function HeatTile({s,T,active,onClick}){
-  const intensity=Math.min(Math.abs(s.chgP)/4,1);
-  const isPos=s.chgP>=0;
-  const bg=active?(isPos?`rgba(16,185,129,0.2)`:`rgba(239,68,68,0.2)`):(isPos?`rgba(16,185,129,${0.04+intensity*0.14})`:`rgba(239,68,68,${0.04+intensity*0.14})`);
-  const brd=active?(isPos?C.green2:C.red2):(isPos?`rgba(16,185,129,${0.15+intensity*0.3})`:`rgba(239,68,68,${0.15+intensity*0.3})`);
-  return(
-    <div onClick={onClick}
-      style={{background:bg,border:`1px solid ${brd}`,borderRadius:8,padding:"7px 10px",cursor:"pointer",
-              position:"relative",overflow:"hidden",
-              boxShadow:active?`0 0 8px ${isPos?C.green:C.red}44`:""}}
-      onMouseEnter={e=>e.currentTarget.style.transform="scale(1.04)"}
-      onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}>
-      <div style={{fontSize:8,color:T.muted,letterSpacing:".1em",textTransform:"uppercase",marginBottom:1}}>{s.name}</div>
-      <div style={{fontFamily:"'Rajdhani',sans-serif",fontSize:19,fontWeight:700,color:clr(s.chgP),lineHeight:1}}>{pct(s.chgP)}</div>
-      <div style={{marginTop:4,height:2,background:T.panel3,borderRadius:2,overflow:"hidden"}}>
-        <div style={{height:"100%",width:`${Math.min(Math.abs(s.chgP)/5*100,100)}%`,background:isPos?C.green:C.red,borderRadius:2}}/>
-      </div>
-      <div style={{display:"flex",justifyContent:"space-between",marginTop:3,fontSize:7,color:T.muted}}>
-        <span>{s.count} stks</span>
-        <span><span style={{color:C.green2}}>{s.gainers}↑</span> <span style={{color:C.red2}}>{s.losers}↓</span></span>
-      </div>
-      <div style={{position:"absolute",bottom:0,left:0,right:0,height:2,background:isPos?C.green:C.red,opacity:0.5}}/>
-    </div>
-  );
-}
+// ─── Sector Multi-Select Pills with count + cap logic ────────────────────────
+// Supports multi-select. If combined count > 1500, snaps to 1500 and ignores rest.
+function SectorPills({ selectedSectors, onChange, showCounts=false, T }) {
+  const handleClick = (id) => {
+    if (id === "ALL") { onChange(["ALL"]); return; }
+    // Remove ALL if it was there
+    let next = selectedSectors.filter(x => x !== "ALL");
+    if (next.includes(id)) {
+      next = next.filter(x => x !== id);
+      if (next.length === 0) next = ["ALL"];
+    } else {
+      next = [...next, id];
+    }
+    // Check if combined count would exceed MAX_TICKERS
+    const total = next.reduce((s, sid) => {
+      const sec = SECTORS.find(x => x.id === sid);
+      return s + (sec?.count || 0);
+    }, 0);
+    if (total > MAX_TICKERS) {
+      // find the sector that pushed it over — exclude it
+      // i.e. we accept the click but cap display to 1500
+    }
+    onChange(next);
+  };
 
-// ─── SIGNALS PAGE ─────────────────────────────────────────────────────────────
-function SignalsPage({signals,T,onSelect}){
-  const[filter,setFilter]=useState("ALL");
-  const[search,setSearch]=useState("");
-  const rows=useMemo(()=>{
-    let s=filter==="ALL"?signals:signals.filter(x=>x.direction===filter);
-    if(search)s=s.filter(x=>x.symbol?.toUpperCase().includes(search.toUpperCase()));
-    return s;
-  },[signals,filter,search]);
-  const Btn=({active,label,onClick})=>(
-    <button onClick={onClick} style={{background:active?C.amber:"transparent",color:active?"#000":T.muted,
-      border:`1px solid ${active?C.amber:T.line2}`,borderRadius:4,padding:"3px 10px",fontSize:9,
-      fontFamily:"'Rajdhani',sans-serif",fontWeight:700,cursor:"pointer",letterSpacing:".08em"}}>
-      {label}</button>
-  );
-  return(
-    <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
-      <div style={{padding:"10px 14px",borderBottom:`1px solid ${T.line2}`,display:"flex",gap:8,alignItems:"center"}}>
-        <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search symbol…"
-          style={{background:T.panel2,border:`1px solid ${T.line2}`,borderRadius:5,padding:"4px 8px",
-                  color:T.text,fontSize:10,outline:"none",width:150,fontFamily:"inherit"}}/>
-        <div style={{display:"flex",gap:4}}>
-          {["ALL","LONG","SHORT"].map(f=><Btn key={f} active={filter===f} label={f} onClick={()=>setFilter(f)}/>)}
+  const combinedCount = computeSectorTotal(selectedSectors);
+  const isAll = selectedSectors.includes("ALL") || selectedSectors.length === 0;
+
+  return (
+    <div style={{ display:"flex", flexWrap:"wrap", gap:6, alignItems:"center" }}>
+      {SECTORS.map(s => {
+        const active = isAll ? s.id === "ALL" : selectedSectors.includes(s.id);
+        return (
+          <button key={s.id} onClick={() => handleClick(s.id)}
+            style={{
+              background: active ? s.color+"14" : "transparent",
+              border: `1px solid ${active ? s.color+"45" : T.border}`,
+              color: active ? s.color : T.text1,
+              borderRadius:6, 
+              padding: showCounts ? "6px 12px" : "6px 12px",
+              cursor:"pointer", 
+              fontFamily:T.font,
+              fontSize:12, 
+              fontWeight: active ? 600 : 500,
+              letterSpacing:0.3, 
+              whiteSpace:"nowrap",
+              transition:"all 0.2s ease",
+              display:"flex", 
+              flexDirection:"column", 
+              alignItems:"center", 
+              gap:2,
+            }}>
+            <span>{s.label}</span>
+            {showCounts && s.count && (
+              <span style={{ fontSize:10, opacity:0.75, color: active ? s.color : T.text2, fontWeight:500 }}>
+                {s.count?.toLocaleString()}
+              </span>
+            )}
+          </button>
+        );
+      })}
+      {!isAll && (
+        <div style={{ display:"flex", alignItems:"center", gap:8, marginLeft:6 }}>
+          <span style={{ 
+            color: combinedCount >= MAX_TICKERS ? T.gold : T.cyan, 
+            fontSize:12, 
+            fontFamily:T.font,
+            fontWeight:600
+          }}>
+            {combinedCount >= MAX_TICKERS ? `⚠ CAPPED AT ${MAX_TICKERS.toLocaleString()}` : `${combinedCount.toLocaleString()} tickers`}
+          </span>
+          <button className="btn-ghost" style={{ fontSize:11, padding:"4px 10px" }} onClick={() => onChange(["ALL"])}>✕ CLEAR</button>
         </div>
-        <span style={{fontSize:9,color:T.muted,marginLeft:"auto"}}>{rows.length} signals</span>
-      </div>
-      <div style={{flex:1,overflowY:"auto"}}>
-        {rows.length===0?(
-          <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:200,color:T.muted,fontSize:11}}>
-            No signals{filter!=="ALL"?` for ${filter}`:""}</div>
-        ):(
-          <table style={{width:"100%",borderCollapse:"collapse"}}>
-            <thead style={{position:"sticky",top:0,background:T.panel2,zIndex:2}}>
-              <tr>{["SYMBOL","DIR","ENTRY","STOP","TARGET","R:R","SCORE","CONF","STRENGTH","TIME"].map(h=>(
-                <th key={h} style={{padding:"6px 10px",textAlign:"left",fontSize:9,color:T.muted,
-                  letterSpacing:".08em",textTransform:"uppercase",borderBottom:`1px solid ${T.line}`,fontWeight:600,whiteSpace:"nowrap"}}>{h}</th>
-              ))}</tr>
-            </thead>
-            <tbody>
-              {rows.map((s,i)=>(
-                <tr key={i} onClick={()=>onSelect(s.symbol)}
-                  style={{cursor:"pointer",borderBottom:`1px solid ${T.line}`}}
-                  onMouseEnter={e=>e.currentTarget.style.background=T.panel2}
-                  onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                  <td style={{padding:"6px 10px"}}>
-                    <span style={{fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:13}}>{s.symbol}</span>
-                  </td>
-                  <td style={{padding:"6px 10px"}}>
-                    <span style={{background:s.direction==="LONG"?`rgba(16,185,129,0.15)`:`rgba(239,68,68,0.15)`,
-                      color:s.direction==="LONG"?C.green2:C.red2,padding:"2px 7px",borderRadius:3,fontSize:9,fontWeight:700}}>
-                      {s.direction}</span>
-                  </td>
-                  <td style={{padding:"6px 10px",color:T.text,fontSize:11}}>${fmt2(s.entry_price)}</td>
-                  <td style={{padding:"6px 10px",color:C.red2,fontSize:11}}>${fmt2(s.stop_loss)}</td>
-                  <td style={{padding:"6px 10px",color:C.green2,fontSize:11}}>${fmt2(s.take_profit)}</td>
-                  <td style={{padding:"6px 10px",color:C.amber,fontSize:11}}>{fmt2(s.risk_reward)}x</td>
-                  <td style={{padding:"6px 10px",color:C.amber2,fontSize:11,fontWeight:700}}>{s.score}</td>
-                  <td style={{padding:"6px 10px",color:C.violet,fontSize:11}}>{s.confidence}%</td>
-                  <td style={{padding:"6px 10px",fontSize:9,color:s.strength==="STRONG"?C.green2:s.strength==="MODERATE"?C.amber:T.muted,fontWeight:600}}>
-                    {s.strength||"—"}</td>
-                  <td style={{padding:"6px 10px",color:T.muted,fontSize:9}}>
-                    {s.created_at?new Date(s.created_at).toLocaleTimeString("en-US",{hour12:false,hour:"2-digit",minute:"2-digit"}):"—"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
+      )}
     </div>
   );
 }
 
-// ─── EARNINGS PAGE ────────────────────────────────────────────────────────────
-function EarningsPage({earnings,tickers,T,onSelect}){
-  const grouped=useMemo(()=>{
-    const map={};
-    for(const e of earnings){const d=e.earnings_date;if(!map[d])map[d]=[];map[d].push(e);}
-    return Object.entries(map).sort(([a],[b])=>a.localeCompare(b));
-  },[earnings]);
-  return(
-    <div style={{flex:1,overflowY:"auto",padding:"12px 16px"}}>
-      {grouped.length===0?(
-        <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:200,color:T.muted,fontSize:11}}>
-          No upcoming earnings in next 7 days</div>
-      ):grouped.map(([date,rows])=>(
-        <div key={date} style={{marginBottom:20}}>
-          <div style={{fontSize:10,color:C.amber,letterSpacing:".12em",textTransform:"uppercase",
-            fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
-            borderBottom:`1px solid ${T.line2}`,paddingBottom:4,marginBottom:8}}>
-            {new Date(date+"T12:00:00").toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric"})}
-            <span style={{marginLeft:8,color:T.muted,fontSize:9}}>{rows.length} companies</span>
-          </div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))",gap:6}}>
-            {rows.map((e,i)=>{
-              const live=tickers.get(e.ticker);
-              return(
-                <div key={i} onClick={()=>onSelect(e.ticker)}
-                  style={{background:T.panel2,border:`1px solid ${T.line2}`,borderRadius:8,padding:"8px 12px",cursor:"pointer"}}
-                  onMouseEnter={ev=>ev.currentTarget.style.borderColor=C.amber}
-                  onMouseLeave={ev=>ev.currentTarget.style.borderColor=T.line2}>
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                    <span style={{fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:15}}>{e.ticker}</span>
-                    <span style={{fontSize:8,padding:"1px 6px",borderRadius:3,fontWeight:700,
-                      background:e.earnings_time==="BMO"?`rgba(34,211,238,0.15)`:`rgba(245,158,11,0.15)`,
-                      color:e.earnings_time==="BMO"?C.cyan:C.amber}}>
-                      {e.earnings_time==="BMO"?"PRE-MKT":"AFTER"}</span>
+// ─── PAGE: Dashboard ──────────────────────────────────────────────────────────
+// Market Breadth now includes EARNINGS tile with real-time sector performance
+function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerformance = {}, tickers, T }) {
+  const sectorTiles = SECTORS.filter(s => s.id !== "ALL");
+
+  return (
+    <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:18 }}>
+      {/* Market Breadth (includes Earnings) + Scalp Signals */}
+      <div style={{ display:"flex", gap:18, flexWrap:"wrap" }}>
+        <div className="card card-glow" style={{ flex:2, minWidth:340 }}>
+          <SectionHeader title="Market Breadth" T={T}>
+            <button className="btn-ghost" style={{ fontSize:9 }}>1D</button>
+            <button className="btn-ghost" style={{ fontSize:9 }}>1W</button>
+          </SectionHeader>
+          <div style={{ padding:14, display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(115px,1fr))", gap:8 }}>
+            {sectorTiles.map(s => {
+              const active = selectedSectors.includes(s.id);
+              const perf = sectorPerformance[s.id] || { avgReturn: 0, count: 0, gainers: 0, losers: 0 };
+              const isPositive = perf.avgReturn >= 0;
+              const hasData = perf.count > 0;
+
+              return (
+                <div key={s.id} onClick={() => { onSectorChange([s.id]); onNavigate("live"); }}
+                  style={{ background: active ? s.color+"12" : T.bg2, border:`1px solid ${active ? s.color+"40" : T.border}`,
+                    borderRadius:10, padding:"14px 16px", cursor:"pointer", transition:"all 0.2s ease",
+                    borderTop: s.id === "EARNINGS" ? `2px solid ${T.gold}50` : undefined }}
+                  onMouseEnter={e=>{ e.currentTarget.style.borderColor=s.color+"50"; e.currentTarget.style.background=s.color+"0e"; }}
+                  onMouseLeave={e=>{ e.currentTarget.style.borderColor=active?s.color+"40":T.border; e.currentTarget.style.background=active?s.color+"12":T.bg2; }}>
+                  <div style={{ color:s.color, fontSize:11, letterSpacing:0.8, fontFamily:T.font, marginBottom:10, opacity:0.9, fontWeight:700 }}>
+                    {s.id === "EARNINGS" ? "◎ " : ""}{s.label}
                   </div>
-                  <div style={{fontSize:8,color:T.muted,marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                    {e.company_name||"—"}</div>
-                  {live&&(
-                    <div style={{marginTop:6,display:"flex",justifyContent:"space-between"}}>
-                      <span style={{fontFamily:"'Rajdhani',sans-serif",fontSize:14,fontWeight:700,color:T.text}}>
-                        ${fmt2(live.live_price)}</span>
-                      <span style={{fontSize:10,color:clr(live.percent_change)}}>{pct(live.percent_change)}</span>
+                  
+                  {/* Real-time sector performance */}
+                  {s.id !== "EARNINGS" && hasData ? (
+                    <div style={{ 
+                      fontFamily:T.font, 
+                      fontSize:24, 
+                      fontWeight:800, 
+                      color: isPositive ? T.green : T.red,
+                      letterSpacing:0.5,
+                      marginBottom:8
+                    }}>
+                      {pct(perf.avgReturn)}
+                    </div>
+                  ) : s.id === "EARNINGS" ? (
+                    <Shimmer w="75%" h={20} />
+                  ) : (
+                    <div style={{ 
+                      fontFamily:T.font, 
+                      fontSize:24, 
+                      fontWeight:800, 
+                      color: T.text2,
+                      letterSpacing:0.5,
+                      marginBottom:8
+                    }}>
+                      —%
+                    </div>
+                  )}
+
+                  {/* Stock count and gainers/losers */}
+                  {s.id !== "EARNINGS" && hasData ? (
+                    <div style={{ color:T.text2, fontSize:11, marginTop:6, fontFamily:T.font, display:"flex", justifyContent:"space-between", alignItems:"center", fontWeight:500 }}>
+                      <span>{perf.count} stocks</span>
+                      <span>
+                        <span style={{ color:T.green, fontWeight:600 }}>{perf.gainers}↑</span>
+                        {" "}
+                        <span style={{ color:T.red, fontWeight:600 }}>{perf.losers}↓</span>
+                      </span>
+                    </div>
+                  ) : (
+                    <div style={{ color:T.text2, fontSize:11, marginTop:6, fontFamily:T.font, fontWeight:500 }}>
+                      {s.count ? `${s.count.toLocaleString()} stocks` : "— stocks"}
                     </div>
                   )}
                 </div>
@@ -253,773 +604,2200 @@ function EarningsPage({earnings,tickers,T,onSelect}){
             })}
           </div>
         </div>
-      ))}
-    </div>
-  );
-}
 
-// ─── PORTFOLIO PAGE ───────────────────────────────────────────────────────────
-function PortfolioPage({portfolio,tickers,T,onSelect}){
-  const rows=useMemo(()=>portfolio.map(p=>{
-    const live=tickers.get(p.ticker);
-    const lp=live?.live_price||0;
-    const cost=(p.avg_cost||0)*(p.shares||0);
-    const value=lp*(p.shares||0);
-    const pnl=value-cost;
-    const pnlPct=cost>0?pnl/cost*100:0;
-    return{...p,livePrice:lp,cost,value,pnl,pnlPct,live};
-  }),[portfolio,tickers]);
-
-  const totalCost=rows.reduce((a,r)=>a+r.cost,0);
-  const totalValue=rows.reduce((a,r)=>a+r.value,0);
-  const totalPnl=totalValue-totalCost;
-  const totalPnlPct=totalCost>0?totalPnl/totalCost*100:0;
-
-  return(
-    <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
-      <div style={{display:"flex",gap:20,padding:"10px 16px",borderBottom:`1px solid ${T.line2}`,
-                   background:T.panel2,flexWrap:"wrap"}}>
-        {[["POSITIONS",rows.length,""],["TOTAL COST",`$${totalCost.toFixed(2)}`,""],
-          ["MARKET VALUE",`$${totalValue.toFixed(2)}`,clr(totalPnl)],
-          ["UNREALIZED P&L",`${totalPnl>=0?"+":""}$${totalPnl.toFixed(2)}`,clr(totalPnl)],
-          ["TOTAL RETURN",pct(totalPnlPct),clr(totalPnlPct)]].map(([k,v,c])=>(
-          <div key={k}>
-            <div style={{fontSize:8,color:T.muted,letterSpacing:".1em"}}>{k}</div>
-            <div style={{fontFamily:"'Rajdhani',sans-serif",fontSize:17,fontWeight:700,color:c||T.text}}>{v}</div>
-          </div>
-        ))}
-      </div>
-      {rows.length===0?(
-        <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",color:T.muted,fontSize:11}}>
-          No portfolio holdings — add via /api/portfolio</div>
-      ):(
-        <div style={{flex:1,overflowY:"auto"}}>
-          <table style={{width:"100%",borderCollapse:"collapse"}}>
-            <thead style={{position:"sticky",top:0,background:T.panel2,zIndex:2}}>
-              <tr>{["TICKER","SHARES","AVG COST","LIVE PRICE","MKT VALUE","P&L $","P&L %","NOTES"].map(h=>(
-                <th key={h} style={{padding:"6px 10px",textAlign:"left",fontSize:9,color:T.muted,
-                  letterSpacing:".08em",textTransform:"uppercase",borderBottom:`1px solid ${T.line}`,
-                  fontWeight:600,whiteSpace:"nowrap"}}>{h}</th>
-              ))}</tr>
-            </thead>
-            <tbody>
-              {rows.map((r,i)=>(
-                <tr key={i} onClick={()=>onSelect(r.ticker)}
-                  style={{cursor:"pointer",borderBottom:`1px solid ${T.line}`}}
-                  onMouseEnter={e=>e.currentTarget.style.background=T.panel2}
-                  onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                  <td style={{padding:"7px 10px"}}>
-                    <div style={{fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:13}}>{r.ticker}</div>
-                    <div style={{fontSize:8,color:T.muted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:120}}>
-                      {r.company_name||"—"}</div>
-                  </td>
-                  <td style={{padding:"7px 10px",color:T.text,fontSize:11}}>{r.shares}</td>
-                  <td style={{padding:"7px 10px",color:T.muted,fontSize:11}}>${fmt2(r.avg_cost)}</td>
-                  <td style={{padding:"7px 10px",fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:13,
-                              color:r.live?clr(r.live.change_value):T.muted}}>
-                    {r.livePrice?`$${fmt2(r.livePrice)}`:"—"}</td>
-                  <td style={{padding:"7px 10px",color:T.text,fontSize:11}}>${fmt2(r.value)}</td>
-                  <td style={{padding:"7px 10px",color:clr(r.pnl),fontWeight:700,fontSize:11}}>
-                    {r.pnl>=0?"+":""}${fmt2(r.pnl)}</td>
-                  <td style={{padding:"7px 10px",color:clr(r.pnlPct),fontWeight:700,fontSize:11}}>{pct(r.pnlPct)}</td>
-                  <td style={{padding:"7px 10px",color:T.muted,fontSize:9,maxWidth:160,
-                              overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                    {r.notes||"—"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        {/* Scalp Signals */}
+        <div className="card" style={{ flex:1, minWidth:200 }}>
+          <SectionHeader title="Scalp Signals" T={T}>
+            <Chip color={T.cyan}>ALL</Chip>
+            <Chip color={T.green}>LONG</Chip>
+            <Chip color={T.red}>SHORT</Chip>
+          </SectionHeader>
+          <EmptyState icon="◉" label="NO SIGNALS" sub="Connect backend to receive live signal feed" h={200} T={T} />
         </div>
-      )}
-    </div>
-  );
-}
+      </div>
 
-// ─── MAIN ────────────────────────────────────────────────────────────────────
-export default function NexRadarDashboard({
-  darkMode:darkModeProp=true,
-  source:sourceProp='all',
-  sector:sectorProp='ALL',
-  onSourceChange,
-  onSectorChange
-}){
-  const[tickers,        setTickers]       =useState(new Map()); // Map<ticker, live_row> from WS
-  const[priceHistory,   setPriceHistory]  =useState(new Map()); // Map<ticker, price[]> for sparklines
-  const[stockListMap,   setStockListMap]  =useState(new Map()); // Map<ticker, staticRow> — ALL symbols+sectors from /api/stock-list
-  const[portfolioRows,  setPortfolioRows] =useState([]);        // Full rows from /api/portfolio (all 1039)
-  const[monitorSet,     setMonitorSet]    =useState(new Set()); // Set<ticker> from monitor table
-  const[portfolioSet,   setPortfolioSet]  =useState(new Set()); // Set<ticker> from portfolio table
-  const[signals,        setSignals]       =useState([]);
-  const[metrics,        setMetrics]       =useState(null);
-  const[earnings,       setEarnings]      =useState([]);
-  const[portfolio,      setPortfolio]     =useState([]);
-
-  const[selectedTicker,setSelected]=useState(null);
-  const[sortBy,  setSortBy] =useState("change_value");
-  const[sortDir, setSortDir]=useState(-1);
-  const[timeframe,setTf]   =useState("1");
-  const[sigFilter,setSigF] =useState("ALL");
-  const[dataSource,setDS]  =useState(sourceProp); // Use prop as initial value
-  const[activeSector,setSector]=useState(sectorProp); // Use prop as initial value
-  const[viewMode,setView]  =useState("TABLE");
-  const[search,  setSearch]=useState("");
-  const[darkMode,setDark]  =useState(darkModeProp); // Use prop as initial value
-  const[tvCount, setTvCount]=useState(5);
-  const[bulkTarget,setBulkT]=useState("tradingview");
-  const[heartbeat,setHB]   =useState(nowT());
-  const[wsStatus, setWsStatus]=useState("connecting");
-  const[activeTab,setTab]  =useState("DASHBOARD");
-  const[activeAlertFilter,setAlertFilter]=useState(null); // For alert card filtering
-
-  // Sync with parent props - FIXED: Ensure data source changes are reflected
-  useEffect(()=>{
-    logger.log('[NexRadar] darkMode prop changed:', darkModeProp);
-    setDark(darkModeProp);
-  },[darkModeProp]);
-  
-  useEffect(()=>{
-    logger.log('[NexRadar] source prop changed:', sourceProp, '-> setting dataSource');
-    setDS(sourceProp);
-  },[sourceProp]);
-  
-  useEffect(()=>{
-    logger.log('[NexRadar] sector prop changed:', sectorProp);
-    setSector(sectorProp);
-  },[sectorProp]);
-
-  const T=darkMode?DARK:LIGHT;
-  const wsRef=useRef(null),retryTimer=useRef(null),retryDelay=useRef(1000);
-
-  // ── WebSocket ──────────────────────────────────────────────────────────────
-  const connectWS=useCallback(()=>{
-    setWsStatus("connecting");
-    const ws=new WebSocket(WS_URL);
-    wsRef.current=ws;
-    ws.onopen=()=>{setWsStatus("Healthy");retryDelay.current=1000;};
-    ws.onmessage=event=>{
-      const parse=text=>{
-        try{
-          const msg=JSON.parse(text);
-          if(msg.type==="snapshot"){
-            const m=new Map();
-            const hist=new Map();
-            for(const row of msg.data??[]){
-              m.set(row.ticker,row);
-              // Initialize price history with current price (20 points)
-              const price=row.live_price||0;
-              hist.set(row.ticker,Array(20).fill(price));
-            }
-            setTickers(m);
-            setPriceHistory(hist);
-            const first=msg.data?.find(r=>r.is_positive);
-            if(first)setSelected(s=>s||first.ticker);
-          }else if(msg.type==="tick"){
-            setTickers(prev=>{
-              const next=new Map(prev);
-              next.set(msg.ticker,{...(prev.get(msg.ticker)??{}),...msg.data});
-              return next;
-            });
-            // Update price history - keep last 20 prices
-            setPriceHistory(prev=>{
-              const next=new Map(prev);
-              const history=next.get(msg.ticker)||[];
-              const newPrice=msg.data?.live_price;
-              if(newPrice!=null){
-                const updated=[...history.slice(-19),newPrice]; // Keep last 19 + new = 20
-                next.set(msg.ticker,updated);
+      {/* Gainers / Losers / Earnings Today */}
+      <div style={{ display:"flex", gap:18, flexWrap:"wrap" }}>
+        {/* Top Gainers */}
+        <div className="card" style={{ flex:1, minWidth:200 }}>
+          <SectionHeader title="Top Gainers" T={T}>
+            <button className="btn-ghost" style={{ fontSize:8 }} onClick={() => onNavigate("live")}>VIEW ALL</button>
+          </SectionHeader>
+          <div style={{ padding:"8px 14px" }}>
+            {(() => {
+              const tickerArray = Array.from(tickers.values());
+              const topGainers = tickerArray
+                .filter(t => (t.percent_change || 0) > 0)
+                .sort((a, b) => (b.percent_change || 0) - (a.percent_change || 0))
+                .slice(0, 5);
+              
+              if (topGainers.length === 0) {
+                return Array(5).fill(0).map((_,i)=>(
+                  <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                    <Shimmer w={44} h={11} />
+                    <Shimmer w={55} h={11} opacity={0.5} />
+                  </div>
+                ));
               }
-              return next;
-            });
-            setHB(nowT());
-          }
-        }catch{}
-      };
-      if(event.data instanceof Blob){const r=new FileReader();r.onload=()=>parse(r.result);r.readAsText(event.data);}
-      else parse(event.data);
-    };
-    ws.onerror=()=>setWsStatus("Degraded");
-    ws.onclose=()=>{
-      setWsStatus("closed");
-      const wait=Math.min(retryDelay.current*(0.8+Math.random()*0.4),30000);
-      retryDelay.current=Math.min(retryDelay.current*2,30000);
-      retryTimer.current=setTimeout(connectWS,wait);
-    };
-  },[]);
+              
+              return topGainers.map((ticker, i) => (
+                <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                  <span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{ticker.ticker}</span>
+                  <span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{pct(ticker.percent_change)}</span>
+                </div>
+              ));
+            })()}
+          </div>
+        </div>
 
-  useEffect(()=>{connectWS();return()=>{clearTimeout(retryTimer.current);wsRef.current?.close();};},[connectWS]);
+        {/* Top Losers */}
+        <div className="card" style={{ flex:1, minWidth:200 }}>
+          <SectionHeader title="Top Losers" T={T}>
+            <button className="btn-ghost" style={{ fontSize:8 }} onClick={() => onNavigate("live")}>VIEW ALL</button>
+          </SectionHeader>
+          <div style={{ padding:"8px 14px" }}>
+            {(() => {
+              const tickerArray = Array.from(tickers.values());
+              const topLosers = tickerArray
+                .filter(t => (t.percent_change || 0) < 0)
+                .sort((a, b) => (a.percent_change || 0) - (b.percent_change || 0))
+                .slice(0, 5);
+              
+              if (topLosers.length === 0) {
+                return Array(5).fill(0).map((_,i)=>(
+                  <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                    <Shimmer w={44} h={11} />
+                    <Shimmer w={55} h={11} opacity={0.5} />
+                  </div>
+                ));
+              }
+              
+              return topLosers.map((ticker, i) => (
+                <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                  <span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{ticker.ticker}</span>
+                  <span style={{ color:T.red, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{pct(ticker.percent_change)}</span>
+                </div>
+              ));
+            })()}
+          </div>
+        </div>
 
-  // ── Fetch ALL symbols + sectors from stock_list (once on mount, refresh every 5min) ──
-  // This guarantees sector column is populated for EVERY ticker, even those
-  // not yet streaming via WS. Used as the base for allRows merge.
-  useEffect(()=>{
-    const fetchStockList=()=>{
-      fetch(`${API_BASE}/api/stock-list`)
-        .then(r=>r.json())
-        .then(data=>{
-          const rows=Array.isArray(data)?data:(data.data??data.tickers??[]);
-          const m=new Map();
-          for(const row of rows) if(row.ticker) m.set(row.ticker,row);
-          logger.log('[NexRadar] stock-list loaded:', m.size, 'symbols');
-          setStockListMap(m);
-          setSelected(s=>s||rows[0]?.ticker||null);
-        })
-        .catch(err=>logger.error('[NexRadar] stock-list fetch error:',err));
-    };
-    fetchStockList();
-    const id=setInterval(fetchStockList,5*60*1000);
-    return()=>clearInterval(id);
-  },[]);
+        {/* Earnings Today */}
+        <div className="card" style={{ flex:1, minWidth:200 }}>
+          <SectionHeader title="Earnings Today" T={T}>
+            <button className="btn-ghost" style={{ fontSize:8 }} onClick={() => onNavigate("earnings")}>VIEW ALL</button>
+          </SectionHeader>
+          <div style={{ padding:"8px 14px" }}>
+            {Array(5).fill(0).map((_,i)=>(
+              <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                <Shimmer w={44} h={11} />
+                <Shimmer w={55} h={11} opacity={0.5} />
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
-  // ── Fetch monitor + portfolio ─────────────────────────────────────────────
-  // Portfolio: fetch FULL rows (not just ticker strings) so all 1039 are
-  // visible regardless of WS feed state. WS enriches live prices on top.
-  useEffect(()=>{
-    const fetchSets=()=>{
-      logger.log('[NexRadar] Fetching monitor and portfolio data...');
-      // monitor tickers
-      fetch(`${API_BASE}/api/monitor`)
-        .then(r=>r.json())
-        .then(data=>{
-          logger.log('[NexRadar] Monitor API response:', data);
-          const rows=Array.isArray(data)?data:(data.tickers??data.data??[]);
-          const tkrs=rows.map(r=>typeof r==='string'?r:r.ticker).filter(Boolean);
-          logger.log('[NexRadar] Monitor tickers:', tkrs.length);
-          setMonitorSet(new Set(tkrs));
-        }).catch(err=>{
-          logger.error('[NexRadar] Monitor fetch error:', err);
-        });
-      // portfolio — store FULL rows for all 1039, also build Set for fast lookup
-      fetch(`${API_BASE}/api/portfolio`)
-        .then(r=>r.json())
-        .then(data=>{
-          logger.log('[NexRadar] Portfolio API response keys:', Object.keys(data||{}));
-          // Handle both shapes:
-          // OLD: {"tickers":["AAPL",...]}  →  wrap strings as {ticker}
-          // NEW: [{ticker, shares, avg_cost, sector, ...}]
-          let rows=Array.isArray(data)?data:(data.tickers??data.data??[]);
-          if(rows.length>0 && typeof rows[0]==='string') rows=rows.map(t=>({ticker:t}));
-          logger.log('[NexRadar] Portfolio rows:', rows.length);
-          setPortfolioRows(rows);           // full rows for the portfolio table
-          setPortfolioSet(new Set(rows.map(r=>r.ticker).filter(Boolean)));
-          setPortfolio(rows);
-        }).catch(err=>{
-          logger.error('[NexRadar] Portfolio fetch error:', err);
-        });
-    };
-    fetchSets();
-    const id=setInterval(fetchSets, REFRESH_INTERVALS.PORTFOLIO);
-    return()=>clearInterval(id);
-  },[]);
+// ─── PAGE: Live Table ─────────────────────────────────────────────────────────
+// • Sector filter bar with multi-select + counts + cap warning
+// • Sub-mode tabs: MH (Market Hours) / AH (After Hours)
+// • MH cols: SYMBOL+name+open | PRICE | CHANGE | %CHG | VOLUME | VWAP | RSI | SIGNAL
+// • AH cols: SYMBOL+name | PREV CLOSE | TODAY CLOSE | LIVE PRICE | CHANGE | %CHG
+// • Source: ALL / WATCHLIST / (Yahoo Finance | TradingView) replaces PORTFOLIO
+// • Matrix view: top 50 clean TradingView charts
+function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", T }) {
+  const [viewMode,   setViewMode]   = useState("TABLE");
+  const autoSubMode = SESSION_META[marketSession]?.subMode ?? "MH";
+  const [subModeOverride, setSubModeOverride] = useState(null);
+  const subMode    = subModeOverride ?? autoSubMode;
+  const setSubMode = (id) => setSubModeOverride(id === autoSubMode ? null : id);
+  // Reset override when session boundary is crossed
+  useEffect(() => { setSubModeOverride(null); }, [autoSubMode]);
+  const [source,     setSource]     = useState("ALL");
+  const [minDelta,   setMinDelta]   = useState(0);
+  const [extLink,    setExtLink]    = useState("Yahoo Finance"); // Yahoo Finance | TradingView
+  const [matrixCount,setMatrixCount]= useState(50);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [selectedSymbol, setSelectedSymbol] = useState(null); // For chart panel
+  const [chartOpenCount, setChartOpenCount] = useState(5); // How many charts to open
+  const [watchlist, setWatchlist] = useState(new Set()); // User's watchlist
+  const tableScrollRef = useRef(null); // Ref for scroll-to-top on page change
+  const ITEMS_PER_PAGE = 50;
 
-  // ── REST polls (fast-changing data) ────────────────────────────────────────
-  useEffect(()=>{
-    const fetchAll=()=>{
-      fetch(`${API_BASE}/api/metrics`).then(r=>r.json()).then(setMetrics).catch(()=>{});
-      fetch(`${API_BASE}/api/signals?limit=500`).then(r=>r.json()).then(d=>setSignals(Array.isArray(d)?d:d.data??[])).catch(()=>{});
-      const today=new Date().toISOString().slice(0,10);
-      const next7=new Date(Date.now()+7*86400000).toISOString().slice(0,10);
-      fetch(`${API_BASE}/api/earnings?start=${today}&end=${next7}`).then(r=>r.json()).then(d=>setEarnings(Array.isArray(d)?d:d.data??[])).catch(()=>{});
-    };
-    fetchAll();
-    const id=setInterval(fetchAll, REFRESH_INTERVALS.SIGNALS); // Poll every 10s
-    return()=>clearInterval(id);
-  },[]);
-
-  // ── Derived ────────────────────────────────────────────────────────────────
-  // allRows: merge stock_list (all symbols + sectors) with WS live data.
-  // - stock_list is the authoritative source for sector + company_name
-  // - WS provides live_price, change_value, percent_change, flags
-  // - Tickers only in stock_list (not yet in WS) → shown dimmed with no price
-  // - Tickers only in WS (not in stock_list) → included as-is (edge case)
-  const allRows=useMemo(()=>{
-    // If stock-list not loaded yet, fall back to WS-only (old behaviour)
-    if(stockListMap.size===0) return Array.from(tickers.values());
-    const result=[];
-    stockListMap.forEach((staticRow,ticker)=>{
-      const live=tickers.get(ticker);
-      if(live){
-        result.push({
-          ...staticRow,
-          ...live,
-          sector:       live.sector||staticRow.sector||"—",
-          company_name: live.company_name||staticRow.company_name||"—",
-        });
+  // Toggle watchlist
+  const toggleWatchlist = (symbol) => {
+    setWatchlist(prev => {
+      const next = new Set(prev);
+      if (next.has(symbol)) {
+        next.delete(symbol);
       } else {
-        result.push({
-          ...staticRow,
-          live_price:0, change_value:0, percent_change:0,
-          is_positive:false, volume:0,
-        });
+        next.add(symbol);
       }
+      return next;
     });
-    // Include any WS tickers not in stock_list
-    tickers.forEach((live,ticker)=>{
-      if(!stockListMap.has(ticker)) result.push(live);
-    });
-    return result;
-  },[tickers,stockListMap]);
+  };
 
-  // Sector heatmap — works because sector is now in every row
-  const sectorData=useMemo(()=>SECTOR_LIST.map(name=>{
-    const stocks=allRows.filter(r=>(r.sector||"").toUpperCase()===name.toUpperCase());
-    const avg=stocks.length?stocks.reduce((a,s)=>a+(s.percent_change||0),0)/stocks.length:0;
-    return{name,chgP:parseFloat(avg.toFixed(2)),count:stocks.length,
-           gainers:stocks.filter(s=>(s.percent_change||0)>0).length,
-           losers: stocks.filter(s=>(s.percent_change||0)<=0).length};
-  }),[allRows]);
+  // Convert tickers Map to array and filter by sector
+  const tickerArray = useMemo(() => {
+    const arr = Array.from(tickers.values());
 
-  const filtered=useMemo(()=>{
-    logger.log('[NexRadar] Filtering - dataSource:', dataSource, 'portfolioRows:', portfolioRows.length, 'monitorSet size:', monitorSet.size);
-    let rows;
+    // Filter by source (ALL or WATCHLIST)
+    let filtered = arr;
+    if (source === "WATCHLIST") {
+      filtered = arr.filter(ticker => watchlist.has(ticker.ticker));
+    }
 
-    if(dataSource==="portfolio"){
-      // ── PORTFOLIO: ALL REST rows enriched with WS live price ────────────────
-      // Guarantees all 1039 show regardless of WS feed state.
-      rows=portfolioRows.map(p=>{
-        const live=tickers.get(p.ticker);
-        return{
-          ...p,
-          sector:       live?.sector||p.sector||stockListMap.get(p.ticker)?.sector||"—",
-          company_name: live?.company_name||p.company_name||stockListMap.get(p.ticker)?.company_name||"—",
-          live_price:   live?.live_price||p.live_price||p.current_price||0,
-          change_value: live?.change_value||p.change_value||0,
-          percent_change: live?.percent_change||p.percent_change||0,
-          is_positive:  (live?.change_value||p.change_value||0)>=0,
-          volume:       live?.volume||p.volume||0,
-          volume_spike: live?.volume_spike||false,
-          gap_percent:  live?.gap_percent||p.gap_percent||0,
-          ah_momentum:  live?.ah_momentum||false,
-        };
+    // Filter by selected sectors
+    if (!selectedSectors.includes("ALL")) {
+      filtered = filtered.filter(ticker => {
+        // EARNINGS is a special pseudo-sector — matches is_earnings_gap_play flag
+        if (selectedSectors.includes("EARNINGS")) {
+          if (ticker.is_earnings_gap_play) return true;
+        }
+        const tickerSector = normalizeSector(ticker.sector);
+        return tickerSector && selectedSectors.some(s => tickerSector === s && s !== "EARNINGS");
       });
-    } else if(dataSource==="monitor"){
-      // WATCHLIST: filter allRows (stock_list merged) by monitorSet
-      rows=allRows.filter(r=>monitorSet.has(r.ticker));
-      logger.log('[NexRadar] Filtering by MONITOR - after:', rows.length);
-    } else {
-      // ALL: full stock_list merged with WS
-      rows=[...allRows];
     }
 
-    // Alert filter (from alert cards)
-    if(activeAlertFilter==="volume_spike") rows=rows.filter(r=>r.volume_spike);
-    if(activeAlertFilter==="gap_play") rows=rows.filter(r=>(r.gap_percent||0)>2);
-    if(activeAlertFilter==="diamond") rows=rows.filter(r=>Math.abs(r.percent_change||0)>=5);
-    if(activeAlertFilter==="ah_momentum") rows=rows.filter(r=>r.ah_momentum);
-    if(activeAlertFilter==="gainers") rows=rows.filter(r=>(r.change_value||0)>0);
-    if(activeAlertFilter==="earnings_gap") rows=rows.filter(r=>r.is_earnings_gap_play);
+    return filtered;
+  }, [tickers, selectedSectors, source, watchlist]);
 
-    // "all" → no filter (handled above)
+  // Filter by minimum delta
+  const filteredTickers = useMemo(() => {
+    return tickerArray
+      .filter(t => Math.abs(t.change_value || 0) >= minDelta)
+      .sort((a, b) => (b.change_value || 0) - (a.change_value || 0));
+  }, [tickerArray, minDelta]);
 
-    // Sector filter — works because backend sends sector with every row
-    if(activeSector!=="ALL") rows=rows.filter(r=>(r.sector||"").toUpperCase()===activeSector.toUpperCase());
+  // Reset to page 1 when filters change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [selectedSectors, minDelta]);
 
-    // Search
-    if(search){
-      const q=search.toUpperCase();
-      rows=rows.filter(r=>r.ticker?.includes(q)||r.company_name?.toUpperCase().includes(q));
-    }
+  // Pagination calculations
+  const totalPages = Math.ceil(filteredTickers.length / ITEMS_PER_PAGE);
+  const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
+  const endIndex = startIndex + ITEMS_PER_PAGE;
+  const paginatedTickers = filteredTickers.slice(startIndex, endIndex);
 
-    rows.sort((a,b)=>sortDir*((a[sortBy]||0)-(b[sortBy]||0)));
-    logger.log('[NexRadar] Final filtered count:', rows.length);
-    return rows;
-  },[allRows,portfolioRows,tickers,stockListMap,dataSource,activeSector,search,sortBy,sortDir,monitorSet,activeAlertFilter]);
+  const handlePrevPage = () => {
+    setCurrentPage(prev => Math.max(1, prev - 1));
+    if (tableScrollRef.current) tableScrollRef.current.scrollTop = 0;
+  };
 
-  const top10=useMemo(()=>[...filtered].sort((a,b)=>(b.change_value||0)-(a.change_value||0)).slice(0,10),[filtered]);
-  const stock=selectedTicker?(allRows.find(r=>r.ticker===selectedTicker)||null):(top10[0]||null);
-  const handleSort=col=>{if(sortBy===col)setSortDir(d=>-d);else{setSortBy(col);setSortDir(-1);}};
+  const handleNextPage = () => {
+    setCurrentPage(prev => Math.min(totalPages, prev + 1));
+    if (tableScrollRef.current) tableScrollRef.current.scrollTop = 0;
+  };
 
-  const m=metrics;
-  const volSpikes=m?.volume_spikes??0,gapPlays=m?.gap_plays??0,diamonds=m?.diamond??0;
-  const ahMomt=m?.ah_momentum??0,posCount=m?.pos_count??0,earningsGaps=m?.earnings_gap_plays??0;
-  const liveCount=m?.live_count??allRows.length,totalCount=m?.total_tickers??allRows.length;
+  const activeLabel = selectedSectors.includes("ALL") ? "ALL" : selectedSectors.join(" + ");
+  const tickerCount = filteredTickers.length;
 
-  const aiConf=stock?Math.min(99,Math.max(55,Math.round(72+(stock.percent_change>0?stock.percent_change*2:0)))):72;
-  const atr=stock?(stock.live_price*0.012).toFixed(2):"0.00";
-  const sl=stock?(stock.live_price-parseFloat(atr)*1.5).toFixed(2):"0.00";
+  // Placeholders for top 50 symbols for matrix
+  const matrixSymbols = useMemo(() => {
+    const syms = ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","JPM","V",
+      "MA","UNH","LLY","JNJ","XOM","PG","HD","BAC","ABBV","MRK","COST","NFLX","AMD",
+      "TMO","CVX","ORCL","KO","CRM","QCOM","MCD","ACN","PFE","TXN","ABT","LIN",
+      "CSCO","WFC","AXP","DHR","AMGN","INTU","IBM","SPGI","UPS","BKNG","GS","BLK",
+      "DE","CAT","HON"].slice(0, matrixCount);
+    return syms;
+  }, [matrixCount]);
 
-  const wsColor=wsStatus==="Healthy"?C.green:wsStatus==="connecting"?C.amber:C.red;
-  const wsIcon=wsStatus==="Healthy"?"🟢":wsStatus==="connecting"?"🟡":"🔴";
+  const openExternalCharts = () => {
+    const topSymbols = filteredTickers.slice(0, chartOpenCount).map(t => t.ticker);
+    topSymbols.forEach(sym => {
+      const url = extLink === "TradingView"
+        ? `https://www.tradingview.com/chart/?symbol=NASDAQ:${sym}`
+        : `https://finance.yahoo.com/quote/${sym}/chart`;
+      window.open(url, "_blank");
+    });
+  };
 
-  const openBulk=()=>top10.slice(0,tvCount).forEach(r=>window.open(
-    bulkTarget==="tradingview"?`https://www.tradingview.com/chart/?symbol=${r.ticker}`:`https://finance.yahoo.com/quote/${r.ticker}/`,"_blank"
-  ));
+  // MH column definitions - SYMBOL column includes star + symbol + company name stacked
+  const MH_COLS = [
+    { key:"symbol",   label:"SYMBOL",      w:"minmax(220px, 2fr)" },
+    { key:"open",     label:"OPEN",        w:"90px" },
+    { key:"price",    label:"PRICE",       w:"90px" },
+    { key:"change",   label:"$ CHG",       w:"90px" },
+    { key:"pct",      label:"% CHG",       w:"90px" },
+    { key:"volume",   label:"VOLUME",      w:"110px"   },
+    { key:"vwap",     label:"VWAP",        w:"90px" },
+    { key:"rsi",      label:"RSI",         w:"70px" },
+    { key:"signal",   label:"SIGNAL",      w:"100px" },
+  ];
 
-  const Btn=({active,label,onClick,sx={}})=>(
-    <button onClick={onClick} style={{background:active?C.amber:T.panel2,color:active?"#000":T.muted,
-      border:`1px solid ${active?C.amber:T.line2}`,borderRadius:5,padding:"3px 9px",fontSize:10,
-      fontFamily:"'Rajdhani',sans-serif",fontWeight:700,cursor:"pointer",letterSpacing:".05em",...sx}}>{label}</button>
-  );
+  // AH column definitions
+  const AH_COLS = [
+    { key:"symbol",     label:"SYMBOL",        w:"minmax(220px, 2fr)" },
+    { key:"prev_close", label:"PREV CLOSE",    w:"100px"  },
+    { key:"today_close",label:"TODAY CLOSE",   w:"110px"  },
+    { key:"live_price", label:"LIVE PRICE",    w:"100px"  },
+    { key:"change",     label:"$ CHG",         w:"90px"  },
+    { key:"pct",        label:"% CHG",         w:"90px"},
+  ];
 
-  const Th=({label,col})=>(
-    <th onClick={()=>handleSort(col)} style={{padding:"6px 8px",textAlign:"left",fontSize:9,
-      color:sortBy===col?C.amber:T.muted,letterSpacing:".08em",textTransform:"uppercase",
-      cursor:"pointer",whiteSpace:"nowrap",fontWeight:600,borderBottom:`1px solid ${T.line}`}}>
-      {label}{sortBy===col?(sortDir===-1?" ▼":" ▲"):""}
-    </th>
-  );
+  const cols = subMode === "MH" ? MH_COLS : AH_COLS;
+  const gridCols = cols.map(c => c.w).join(" ");
 
-  // ── RENDER ─────────────────────────────────────────────────────────────────
-  return(
-    <div style={{fontFamily:"'IBM Plex Mono','Fira Code',monospace",background:T.bg,color:T.text,minHeight:"100vh",fontSize:11,userSelect:"none"}}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap');
-        ::-webkit-scrollbar{width:4px;height:4px}
-        ::-webkit-scrollbar-track{background:transparent}
-        ::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.1);border-radius:2px}
-      `}</style>
+  return (
+    <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:12 }}>
 
-      {/* ── ALERT STRIP ── */}
-      <div style={{display:"flex",gap:6,padding:"5px 16px",background:T.bg2,
-                   borderBottom:`1px solid ${T.line}`,overflowX:"auto"}}>
-        {[{label:"VOL SPIKES",val:volSpikes,color:C.amber,filter:"volume_spike"},
-          {label:"GAP PLAYS",val:gapPlays,color:C.cyan,filter:"gap_play"},
-          {label:"DIAMONDS 💎",val:diamonds,color:C.violet,filter:"diamond"},
-          {label:"AH MOMENTUM",val:ahMomt,color:C.green2,filter:"ah_momentum"},
-          {label:"GAINERS",val:posCount,color:C.green2,filter:"gainers"},
-          {label:"EARNINGS GAPS",val:earningsGaps,color:C.amber2,filter:"earnings_gap"}].map(({label,val,color,filter})=>(
-          <button key={label} onClick={()=>{
-            // Toggle filter on/off
-            setAlertFilter(f=>f===filter?null:filter);
-          }} style={{display:"flex",alignItems:"center",gap:5,
-            background:T.panel,border:`1px solid ${activeAlertFilter===filter?color:T.line2}`,borderRadius:5,
-            padding:"3px 10px",whiteSpace:"nowrap",cursor:"pointer",
-            outline:"none",
-            boxShadow:activeAlertFilter===filter?`0 0 8px ${color}44`:"none"}}
-            onMouseEnter={e=>{e.currentTarget.style.background=T.panel2;e.currentTarget.style.borderColor=color;}}
-            onMouseLeave={e=>{e.currentTarget.style.background=T.panel;e.currentTarget.style.borderColor=activeAlertFilter===filter?color:T.line2;}}>
-            <span style={{fontSize:8,color:T.muted,letterSpacing:".1em"}}>{label}</span>
-            <span style={{fontFamily:"'Rajdhani',sans-serif",fontSize:16,fontWeight:700,color}}>{val}</span>
-            {activeAlertFilter===filter&&<span style={{fontSize:10,color}}>✓</span>}
-          </button>
-        ))}
+      {/* ── SECTOR FILTER ── */}
+      <div className="card" style={{ padding:"12px 16px" }}>
+        <div style={{ display:"flex", alignItems:"flex-start", gap:12, flexWrap:"wrap" }}>
+          <span style={{ color:T.text0, fontSize:13, letterSpacing:0.5, fontFamily:T.font, whiteSpace:"nowrap", marginTop:6, fontWeight:700 }}>
+            SECTOR FILTER
+          </span>
+          <SectorPills selectedSectors={selectedSectors} onChange={onSectorChange} showCounts={false} T={T} />
+        </div>
       </div>
 
-      {/* ── TAB ROUTING ── */}
-      {activeTab==="SIGNALS"&&(
-        <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 88px)"}}>
-          <SignalsPage signals={signals} T={T} onSelect={t=>{setSelected(t);setTab("DASHBOARD");}}/>
-        </div>
-      )}
-      {activeTab==="EARNINGS"&&(
-        <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 88px)"}}>
-          <EarningsPage earnings={earnings} tickers={tickers} T={T} onSelect={t=>{setSelected(t);setTab("DASHBOARD");}}/>
-        </div>
-      )}
-      {activeTab==="PORTFOLIO"&&(
-        <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 88px)"}}>
-          <PortfolioPage portfolio={portfolio} tickers={tickers} T={T} onSelect={t=>{setSelected(t);setTab("DASHBOARD");}}/>
-        </div>
-      )}
+      {/* ── Controls row ── */}
+      <div style={{ display:"flex", gap:9, alignItems:"center", flexWrap:"wrap" }}>
+        {/* View mode */}
+        <button className={`btn-ghost${viewMode==="TABLE"?" active":""}`}    onClick={()=>setViewMode("TABLE")}>≡ TABLE</button>
+        <button className={`btn-ghost${viewMode==="MATRIX"?" active":""}`}   onClick={()=>setViewMode("MATRIX")}>⊞ MATRIX</button>
 
-      {activeTab==="DASHBOARD"&&(
-        <div style={{display:"flex",height:"calc(100vh - 88px)",overflow:"hidden"}}>
+        {/* MH / AH sub-mode (TABLE only) */}
+        {viewMode === "TABLE" && (
+          <div style={{ display:"flex", background:T.bg2, border:`1px solid ${T.border}`, borderRadius:5, overflow:"hidden" }}>
+            {[["MH","MARKET HOURS"],["AH","AFTER HOURS"]].map(([id, lbl]) => (
+              <button key={id} onClick={()=>setSubMode(id)}
+                style={{ background:subMode===id?T.cyan+"14":"transparent",
+                  color:subMode===id?T.cyan:T.text2,
+                  border:"none", padding:"5px 12px", cursor:"pointer",
+                  fontFamily:T.font, fontSize:9, letterSpacing:1, borderRight:id==="MH"?`1px solid ${T.border}`:"none" }}>
+                {lbl}
+              </button>
+            ))}
+          </div>
+        )}
 
-          {/* ── LEFT DETAIL PANEL ── */}
-          <div style={{width:256,flexShrink:0,borderRight:`1px solid ${T.line2}`,
-                       display:"flex",flexDirection:"column",overflowY:"auto"}}>
-            {stock?(
-              <div style={{padding:12}}>
-                <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
-                  <div>
-                    <div style={{fontFamily:"'Rajdhani',sans-serif",fontSize:22,fontWeight:700}}>{stock.ticker}</div>
-                    <div style={{fontSize:8,color:T.muted,maxWidth:130,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                      {stock.company_name||"—"}</div>
-                  </div>
-                  <div style={{textAlign:"right"}}>
-                    {/* FIX: always live_price — irrespective of AH/AM session */}
-                    <div style={{fontFamily:"'Rajdhani',sans-serif",fontSize:24,fontWeight:700,color:clr(stock.change_value)}}>
-                      ${fmt2(stock.live_price)}</div>
-                    <div style={{fontSize:10,color:clr(stock.change_value)}}>
-                      {stock.change_value>=0?"+":""}{fmt2(stock.change_value)} ({pct(stock.percent_change)})</div>
-                  </div>
-                </div>
-                <div style={{position:"relative",height:194,borderRadius:6,overflow:"hidden",background:T.panel2,marginBottom:8}}>
-                  <TradingViewChart symbol={stock.ticker} darkMode={darkMode}/>
-                </div>
-                <div style={{display:"flex",gap:3,marginBottom:8}}>
-                  {["1","5","15","60","D"].map(tf=>(
-                    <Btn key={tf} active={timeframe===tf} label={tf+(tf==="D"?"":"m")} onClick={()=>setTf(tf)} sx={{fontSize:9,padding:"2px 6px"}}/>
-                  ))}
-                </div>
-                {[["SECTOR",stock.sector||"—"],["VOLUME",(stock.volume||0).toLocaleString()],
-                  ["VOL RATIO",stock.volume_ratio?`${fmt2(stock.volume_ratio)}x`:"—"],
-                  ["MKT CAP",fmtK(stock.market_cap)],["GAP %",pct(stock.gap_percent||0)],
-                  ["OPEN",stock.open_price?`$${fmt2(stock.open_price)}`:"—"],
-                  ["PREV CLOSE",stock.prev_close?`$${fmt2(stock.prev_close)}`:"—"],
-                  ["DAY HI/LO",stock.day_high?`$${fmt2(stock.day_high)} / $${fmt2(stock.day_low)}`:"—"],
-                  ["ATR (est)",`$${atr}`],["STOP LOSS",`$${sl}`],["AI CONF",`${aiConf}%`],
-                ].map(([k,v])=>(
-                  <div key={k} style={{display:"flex",justifyContent:"space-between",
-                    borderBottom:`1px solid ${T.line}`,padding:"4px 0",fontSize:10}}>
-                    <span style={{color:T.muted,fontSize:8,letterSpacing:".08em"}}>{k}</span>
-                    <span style={{color:k==="AI CONF"?C.violet:T.text,fontWeight:600}}>{v}</span>
-                  </div>
-                ))}
-                <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:8}}>
-                  {stock.volume_spike&&<span style={{background:`rgba(245,158,11,0.15)`,border:`1px solid ${C.amber}`,borderRadius:3,padding:"1px 6px",fontSize:8,color:C.amber}}>VOL SPIKE</span>}
-                  {(stock.gap_percent||0)>2&&<span style={{background:`rgba(34,211,238,0.12)`,border:`1px solid ${C.cyan}`,borderRadius:3,padding:"1px 6px",fontSize:8,color:C.cyan}}>GAP PLAY</span>}
-                  {stock.ah_momentum&&<span style={{background:`rgba(52,211,153,0.12)`,border:`1px solid ${C.green}`,borderRadius:3,padding:"1px 6px",fontSize:8,color:C.green2}}>AH MOMT</span>}
-                  {stock.pullback_state&&stock.pullback_state!=="neutral"&&<span style={{background:`rgba(139,92,246,0.12)`,border:`1px solid ${C.violet}`,borderRadius:3,padding:"1px 6px",fontSize:8,color:C.violet}}>PULLBACK</span>}
-                </div>
-                <a href={`https://www.tradingview.com/chart/?symbol=${stock.ticker}`} target="_blank" rel="noreferrer"
-                  style={{display:"block",marginTop:10,background:`rgba(245,158,11,0.1)`,border:`1px solid ${C.amber}`,
-                    borderRadius:5,padding:"5px",textAlign:"center",color:C.amber,fontSize:10,textDecoration:"none",
-                    fontFamily:"'Rajdhani',sans-serif",fontWeight:700,letterSpacing:".1em"}}>
-                  OPEN IN TRADINGVIEW ↗</a>
+        {/* Min delta slider */}
+        <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+          <span style={{ color:T.text2, fontSize:9.5, fontFamily:T.font }}>MIN Δ$</span>
+          <input type="range" min="0" max="5" step="0.1" value={minDelta}
+            onChange={e=>setMinDelta(Number(e.target.value))} style={{ width:90, accentColor:T.cyan }}/>
+          <span style={{ color:T.cyan, fontSize:9.5, fontFamily:T.font, minWidth:26 }}>{minDelta.toFixed(1)}</span>
+        </div>
+
+        {/* Source + chart count + external link */}
+        <div style={{ marginLeft:"auto", display:"flex", gap:6, alignItems:"center" }}>
+          {["ALL","WATCHLIST"].map(s => (
+            <button key={s} className={`btn-ghost${source===s?" active":""}`}
+              onClick={()=>setSource(s)} style={{ fontSize:9 }}>{s}</button>
+          ))}
+
+          {/* Chart count selector */}
+          <div style={{ display:"flex", alignItems:"center", gap:4, marginLeft:8 }}>
+            <span style={{ color:T.text2, fontSize:9, fontFamily:T.font, whiteSpace:"nowrap" }}>OPEN</span>
+            <select value={chartOpenCount} onChange={e=>setChartOpenCount(Number(e.target.value))}
+              style={{ background:T.bg2, border:`1px solid ${T.border}`, color:T.text1, fontFamily:T.font, fontSize:9, padding:"5px 8px", cursor:"pointer", outline:"none", borderRadius:5, letterSpacing:0.5 }}>
+              <option value={5}>5</option>
+              <option value={10}>10</option>
+              <option value={20}>20</option>
+              <option value={50}>50</option>
+            </select>
+            <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>CHARTS</span>
+          </div>
+
+          {/* External chart opener */}
+          <div style={{ display:"flex", alignItems:"center", gap:0, border:`1px solid ${T.border}`, borderRadius:5, overflow:"hidden" }}>
+            <select value={extLink} onChange={e=>setExtLink(e.target.value)}
+              style={{ background:T.bg2, border:"none", color:T.text1, fontFamily:T.font, fontSize:9, padding:"5px 8px", cursor:"pointer", outline:"none", letterSpacing:0.5 }}>
+              <option>Yahoo Finance</option>
+              <option>TradingView</option>
+            </select>
+            <button onClick={openExternalCharts}
+              style={{ background:T.cyan+"14", border:"none", borderLeft:`1px solid ${T.border}`, color:T.cyan,
+                padding:"5px 10px", cursor:"pointer", fontFamily:T.font, fontSize:9, letterSpacing:0.5, fontWeight:600 }}>
+              OPEN CHARTS
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* ── TABLE VIEW with optional Chart Panel ── */}
+      {viewMode === "TABLE" && (
+        <div style={{ display:"flex", gap:16, height:"100%" }}>
+          {/* Main Table */}
+          <div className="card" style={{ flex: selectedSymbol ? "1 1 60%" : "1 1 100%", transition:"flex 0.3s ease" }}>
+          <SectionHeader title={`Live Stock Data · ${subMode === "MH" ? "Market Hours" : "After Hours"}${!selectedSectors.includes("ALL") ? ` · ${activeLabel}` : ""}`} T={T}>
+            <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+              <span style={{ color:T.text2, fontSize:12, fontFamily:T.font, fontWeight:500 }}>{tickerCount.toLocaleString()} tickers</span>
+              {tickers.size > 0 ? (
+                <>
+                  <span className="live-dot"/>
+                  <span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:600 }}>LIVE</span>
+                </>
+              ) : (
+                <span style={{ color:T.text2, fontSize:12, fontFamily:T.font, fontWeight:500 }}>CONNECTING…</span>
+              )}
+            </div>
+          </SectionHeader>
+
+          {/* Column headers */}
+          <div style={{ display:"grid", gridTemplateColumns:gridCols, background:T.bg0, borderBottom:`1px solid ${T.border}` }}>
+            {cols.map(c => (
+              <div key={c.key} style={{ padding:"12px 14px", color:T.text0, fontSize:11, letterSpacing:1, fontFamily:T.font, fontWeight:800, textTransform:"uppercase" }}>
+                {c.label} <span style={{ opacity:0.3, fontSize:10 }}>⇅</span>
               </div>
-            ):(
-              <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",
-                           flexDirection:"column",gap:8,color:T.muted,padding:16}}>
-                <div style={{fontSize:24}}>📡</div>
-                <div style={{fontSize:10,color:C.amber,textAlign:"center"}}>
-                  {allRows.length===0?"Connecting to live feed…":"Select a stock"}</div>
-                {allRows.length===0&&<div style={{fontSize:8,color:T.muted,textAlign:"center"}}>{WS_URL}</div>}
+            ))}
+          </div>
+
+          {/* Scrollable Rows Container */}
+          <div ref={tableScrollRef} style={{ maxHeight:"calc(100vh - 420px)", minHeight:"300px", overflowY:"auto", overflowX:"hidden", position:"relative" }}>
+            {paginatedTickers.length === 0 ? (
+              <div style={{ padding:40, textAlign:"center", color:T.text2, fontSize:13, fontFamily:T.font }}>
+                {tickers.size === 0 ? 'Waiting for live data from WebSocket...' : 'No tickers match the current filter'}
               </div>
+            ) : (
+              <>
+                {paginatedTickers.map((ticker, i) => {
+                const isPositive = (ticker.change_value || 0) >= 0;
+                const changeColor = isPositive ? T.green : T.red;
+                
+                return (
+                  <div key={ticker.ticker || i} className="tr-hover" style={{ display:"grid", gridTemplateColumns:gridCols, borderBottom:`1px solid ${T.border}` }}>
+                    {subMode === "MH" ? (
+                      <>
+                        {/* Symbol + Company (stacked with star) */}
+                        <div style={{ padding:"10px 14px", display:"flex", alignItems:"flex-start", gap:10 }}>
+                          {/* Star icon for watchlist */}
+                          <button
+                            onClick={(e) => { e.stopPropagation(); toggleWatchlist(ticker.ticker); }}
+                            style={{ 
+                              background:"none", 
+                              border:"none", 
+                              cursor:"pointer", 
+                              fontSize:14, 
+                              padding:0,
+                              marginTop:2,
+                              color: watchlist.has(ticker.ticker) ? T.gold : T.text2,
+                              opacity: watchlist.has(ticker.ticker) ? 1 : 0.3,
+                              transition:"all 0.2s",
+                              flexShrink:0
+                            }}
+                            onMouseEnter={e => e.currentTarget.style.opacity = 1}
+                            onMouseLeave={e => e.currentTarget.style.opacity = watchlist.has(ticker.ticker) ? 1 : 0.3}
+                            title={watchlist.has(ticker.ticker) ? "Remove from watchlist" : "Add to watchlist"}
+                          >
+                            {watchlist.has(ticker.ticker) ? "⭐" : "☆"}
+                          </button>
+                          
+                          {/* Symbol + Company stacked */}
+                          <div 
+                            style={{ flex:1, cursor:"pointer", minWidth:0 }}
+                            onClick={() => setSelectedSymbol(ticker.ticker)}
+                          >
+                            <div style={{ 
+                              color:T.cyan, 
+                              fontSize:13, 
+                              fontFamily:T.font, 
+                              fontWeight:700,
+                              textDecoration:"underline",
+                              textDecorationColor:T.cyan+"40",
+                              marginBottom:3,
+                              lineHeight:1.2
+                            }}>{ticker.ticker}</div>
+                            <div style={{ 
+                              color:T.text2, 
+                              fontSize:10, 
+                              fontFamily:T.font, 
+                              whiteSpace:"nowrap", 
+                              overflow:"hidden", 
+                              textOverflow:"ellipsis",
+                              maxWidth:"100%",
+                              lineHeight:1.3
+                            }}>
+                              {ticker.company_name && ticker.company_name !== ticker.ticker
+                                ? ticker.company_name
+                                : <span style={{ opacity:0.4 }}>—</span>}
+                            </div>
+                          </div>
+                        </div>
+                        {/* Open */}
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.open || 0)}</div>
+                        {/* Price */}
+                        <div style={{ padding:"10px 14px", color:T.text0, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price || 0)}</div>
+                        {/* Change */}
+                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+                          {isPositive ? '+' : ''}{fmt2(ticker.change_value || 0)}
+                        </div>
+                        {/* %CHG */}
+                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+                          {pct(ticker.percent_change || 0)}
+                        </div>
+                        {/* Volume */}
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+                          {fmtVol(ticker.volume || 0)}
+                        </div>
+                        {/* VWAP */}
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>—</div>
+                        {/* RSI */}
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>—</div>
+                        {/* Signal */}
+                        <div style={{ padding:"10px 14px", display:"flex", alignItems:"center" }}>
+                          {ticker.volume_spike && (
+                            <span style={{ color:T.orange, fontSize:10, fontFamily:T.font, background:T.orangeDim, padding:"3px 8px", borderRadius:4, fontWeight:600 }}>VOL</span>
+                          )}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        {/* Symbol + Company (stacked with star) */}
+                        <div style={{ padding:"10px 14px", display:"flex", alignItems:"flex-start", gap:10 }}>
+                          {/* Star icon for watchlist */}
+                          <button
+                            onClick={(e) => { e.stopPropagation(); toggleWatchlist(ticker.ticker); }}
+                            style={{ 
+                              background:"none", 
+                              border:"none", 
+                              cursor:"pointer", 
+                              fontSize:14, 
+                              padding:0,
+                              marginTop:2,
+                              color: watchlist.has(ticker.ticker) ? T.gold : T.text2,
+                              opacity: watchlist.has(ticker.ticker) ? 1 : 0.3,
+                              transition:"all 0.2s",
+                              flexShrink:0
+                            }}
+                            onMouseEnter={e => e.currentTarget.style.opacity = 1}
+                            onMouseLeave={e => e.currentTarget.style.opacity = watchlist.has(ticker.ticker) ? 1 : 0.3}
+                            title={watchlist.has(ticker.ticker) ? "Remove from watchlist" : "Add to watchlist"}
+                          >
+                            {watchlist.has(ticker.ticker) ? "⭐" : "☆"}
+                          </button>
+                          
+                          {/* Symbol + Company stacked */}
+                          <div 
+                            style={{ flex:1, cursor:"pointer", minWidth:0 }}
+                            onClick={() => setSelectedSymbol(ticker.ticker)}
+                          >
+                            <div style={{ 
+                              color:T.cyan, 
+                              fontSize:13, 
+                              fontFamily:T.font, 
+                              fontWeight:700,
+                              textDecoration:"underline",
+                              textDecorationColor:T.cyan+"40",
+                              marginBottom:3,
+                              lineHeight:1.2
+                            }}>{ticker.ticker}</div>
+                            <div style={{ 
+                              color:T.text2, 
+                              fontSize:10, 
+                              fontFamily:T.font, 
+                              whiteSpace:"nowrap", 
+                              overflow:"hidden", 
+                              textOverflow:"ellipsis",
+                              maxWidth:"100%",
+                              lineHeight:1.3
+                            }}>
+                              {ticker.company_name && ticker.company_name !== ticker.ticker
+                                ? ticker.company_name
+                                : <span style={{ opacity:0.4 }}>—</span>}
+                            </div>
+                          </div>
+                        </div>
+                        {/* Prev Close */}
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.prev_close || 0)}</div>
+                        {/* Today Close */}
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.today_close || 0)}</div>
+                        {/* Live Price */}
+                        <div style={{ padding:"10px 14px", color:T.cyan, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price || 0)}</div>
+                        {/* Change */}
+                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+                          {isPositive ? '+' : ''}{fmt2(ticker.change_value || 0)}
+                        </div>
+                        {/* %CHG */}
+                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+                          {pct(ticker.percent_change || 0)}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                );
+              })
+              }
+              
+              {/* Bottom fade gradient — purely decorative, shows more content below */}
+              {paginatedTickers.length >= 10 && (
+                <div style={{ 
+                  position:"sticky", 
+                  bottom:0, 
+                  left:0, 
+                  right:0, 
+                  height:40,
+                  background:`linear-gradient(to bottom, transparent, ${T.bg1})`,
+                  pointerEvents:"none"
+                }}/>
+              )}
+              </>
             )}
           </div>
 
-          {/* ── CENTRE ── */}
-          <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
-            {/* Sector heatmap */}
-            <div style={{padding:"7px 12px",borderBottom:`1px solid ${T.line}`,
-                         display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:5}}>
-              {sectorData.map(s=>(
-                <HeatTile key={s.name} s={s} T={T}
-                  active={activeSector===s.name}
-                  onClick={()=>{
-                    const newSector = activeSector===s.name?"ALL":s.name;
-                    setSector(newSector);
-                    if(onSectorChange) onSectorChange(newSector);
-                  }}/>
-              ))}
-            </div>
-
-            {/* Toolbar */}
-            <div style={{display:"flex",alignItems:"center",gap:6,
-                         padding:"5px 12px",borderBottom:`1px solid ${T.line}`,flexWrap:"wrap"}}>
-              <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search ticker / name…"
-                style={{background:T.panel2,border:`1px solid ${T.line2}`,borderRadius:5,padding:"4px 8px",
-                        color:T.text,fontSize:10,outline:"none",width:160,fontFamily:"inherit"}}/>
-              <div style={{display:"flex",gap:3}}>
-                {[["all","ALL"],["monitor","WATCHLIST"],["portfolio","PORTFOLIO"]].map(([v,l])=>(
-                  <Btn key={v} active={dataSource===v} label={l} onClick={()=>{
-                    setDS(v);
-                    if(onSourceChange) onSourceChange(v);
-                  }} sx={{fontSize:9}}/>
-                ))}
-              </div>
-              {activeSector!=="ALL"&&(
-                <div style={{background:`rgba(245,158,11,0.12)`,border:`1px solid ${C.amber}`,borderRadius:4,
-                             padding:"2px 8px",fontSize:9,color:C.amber,display:"flex",alignItems:"center",gap:4}}>
-                  {activeSector}
-                  <span onClick={()=>{
-                    setSector("ALL");
-                    if(onSectorChange) onSectorChange("ALL");
-                  }} style={{cursor:"pointer",color:T.muted}}>✕</span>
-                </div>
-              )}
-              <div style={{marginLeft:"auto",display:"flex",gap:4,alignItems:"center"}}>
-                <Btn active={viewMode==="TABLE"} label="≡ TABLE" onClick={()=>setView("TABLE")}/>
-                <Btn active={viewMode==="MOVERS"} label="↑ MOVERS" onClick={()=>setView("MOVERS")}/>
-                <select value={bulkTarget} onChange={e=>setBulkT(e.target.value)}
-                  style={{background:T.panel2,border:`1px solid ${T.line2}`,color:T.muted,borderRadius:4,fontSize:9,padding:"2px 4px"}}>
-                  <option value="tradingview">TradingView</option>
-                  <option value="yahoo">Yahoo Finance</option>
-                </select>
-                <select value={tvCount} onChange={e=>setTvCount(Number(e.target.value))}
-                  style={{background:T.panel2,border:`1px solid ${T.line2}`,color:T.muted,borderRadius:4,fontSize:9,padding:"2px 4px"}}>
-                  {[3,5,10].map(n=><option key={n} value={n}>Top {n}</option>)}
-                </select>
-                <button onClick={openBulk} style={{background:`rgba(34,211,238,0.1)`,border:`1px solid ${C.cyan}`,
-                  color:C.cyan,borderRadius:5,padding:"3px 9px",fontSize:9,
-                  fontFamily:"'Rajdhani',sans-serif",fontWeight:700,cursor:"pointer"}}>OPEN CHARTS</button>
-              </div>
-            </div>
-
-            {/* Table / Movers */}
-            <div style={{flex:1,overflowY:"auto"}}>
-              {allRows.length===0?(
-                <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100%",gap:10,color:T.muted}}>
-                  <div style={{fontSize:28}}>📡</div>
-                  <div style={{fontSize:12,color:C.amber}}>Connecting to live data feed…</div>
-                  <div style={{fontSize:9}}>WS: {wsStatus} · {WS_URL}</div>
-                </div>
-              ):viewMode==="MOVERS"?(
-                <div style={{padding:12,display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(175px,1fr))",gap:8}}>
-                  {top10.map(r=>(
-                    <div key={r.ticker} onClick={()=>setSelected(r.ticker)}
-                      style={{background:selectedTicker===r.ticker?`rgba(245,158,11,0.08)`:T.panel2,
-                        border:`1px solid ${selectedTicker===r.ticker?C.amber:T.line2}`,
-                        borderRadius:8,padding:"10px 12px",cursor:"pointer"}}>
-                      <div style={{display:"flex",justifyContent:"space-between"}}>
-                        <span style={{fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:15}}>{r.ticker}</span>
-                        <span style={{fontSize:8,color:T.muted}}>{r.sector||"—"}</span>
-                      </div>
-                      <div style={{fontFamily:"'Rajdhani',sans-serif",fontSize:20,fontWeight:700,color:clr(r.change_value),marginTop:2}}>
-                        ${fmt2(r.live_price)}</div>
-                      <div style={{fontSize:10,color:clr(r.percent_change)}}>{pct(r.percent_change)}</div>
-                      <div style={{fontSize:8,color:T.muted,marginTop:4,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                        {r.company_name}</div>
-                    </div>
-                  ))}
-                </div>
-              ):(
-                <table style={{width:"100%",borderCollapse:"collapse"}}>
-                  <thead style={{position:"sticky",top:0,background:T.panel2,zIndex:2}}>
-                    <tr>
-                      <Th label="TICKER"  col="ticker"/>
-                      <th style={{padding:"6px 8px",fontSize:9,color:T.muted,letterSpacing:".08em",
-                        textTransform:"uppercase",borderBottom:`1px solid ${T.line}`,fontWeight:600}}>TREND</th>
-                      <Th label="PRICE"   col="live_price"/>
-                      <Th label="CHG $"   col="change_value"/>
-                      <Th label="CHG %"   col="percent_change"/>
-                      <Th label="VOLUME"  col="volume"/>
-                      <Th label="GAP %"   col="gap_percent"/>
-                      <th style={{padding:"6px 8px",fontSize:9,color:T.muted,letterSpacing:".08em",
-                        textTransform:"uppercase",borderBottom:`1px solid ${T.line}`,fontWeight:600}}>SECTOR</th>
-                      <th style={{padding:"6px 8px",fontSize:9,color:T.muted,letterSpacing:".08em",
-                        textTransform:"uppercase",borderBottom:`1px solid ${T.line}`,fontWeight:600}}>FLAGS</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filtered.map(r=>{
-                      return(
-                        <tr key={r.ticker}
-                          onClick={()=>setSelected(r.ticker)}
-                          style={{cursor:"pointer",
-                            background:selectedTicker===r.ticker?`rgba(245,158,11,0.06)`:"transparent",
-                            borderLeft:selectedTicker===r.ticker?`2px solid ${C.amber}`:"2px solid transparent"}}
-                          onMouseEnter={e=>e.currentTarget.style.background=T.panel2}
-                          onMouseLeave={e=>e.currentTarget.style.background=selectedTicker===r.ticker?`rgba(245,158,11,0.06)`:"transparent"}>
-                          <td style={{padding:"5px 8px",borderBottom:`1px solid ${T.line}`}}>
-                            <span style={{fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:12}}>{r.ticker}</span>
-                            <div style={{fontSize:8,color:T.muted,maxWidth:100,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.company_name}</div>
-                          </td>
-                          {/* Sparkline */}
-                          <td style={{padding:"5px 8px",borderBottom:`1px solid ${T.line}`}}>
-                            <MiniSparkline
-                              data={priceHistory.get(r.ticker)||[r.live_price||0]}
-                              width={60}
-                              height={24}
-                              color={r.change_value >= 0 ? C.green : C.red}
-                              isPositive={r.change_value >= 0}
-                              showTooltip={false}
-                              ticker={r.ticker}
-                            />
-                          </td>
-                          {/* live_price — always shown irrespective of AH/AM */}
-                          <td style={{padding:"5px 8px",borderBottom:`1px solid ${T.line}`,fontFamily:"'Rajdhani',sans-serif",fontSize:13,fontWeight:600}}>
-                            ${fmt2(r.live_price)}</td>
-                          <td style={{padding:"5px 8px",borderBottom:`1px solid ${T.line}`,color:clr(r.change_value),fontSize:11}}>
-                            {r.change_value>=0?"+":""}{fmt2(r.change_value)}</td>
-                          <td style={{padding:"5px 8px",borderBottom:`1px solid ${T.line}`,color:clr(r.percent_change),fontWeight:700,fontSize:11}}>
-                            {pct(r.percent_change)}</td>
-                          <td style={{padding:"5px 8px",borderBottom:`1px solid ${T.line}`,color:T.muted,fontSize:10}}>
-                            {(r.volume||0).toLocaleString()}</td>
-                          <td style={{padding:"5px 8px",borderBottom:`1px solid ${T.line}`,color:clr(r.gap_percent||0),fontSize:10}}>
-                            {r.gap_percent?pct(r.gap_percent):"—"}</td>
-                          <td style={{padding:"5px 8px",borderBottom:`1px solid ${T.line}`,fontSize:8,color:T.muted,letterSpacing:".06em"}}>
-                            {r.sector||"—"}</td>
-                          <td style={{padding:"5px 8px",borderBottom:`1px solid ${T.line}`}}>
-                            <div style={{display:"flex",gap:3}}>
-                              {r.volume_spike&&<span style={{background:C.amber,color:"#000",borderRadius:2,padding:"1px 4px",fontSize:7,fontWeight:700}}>VOL</span>}
-                              {(r.gap_percent||0)>2&&<span style={{background:C.cyan,color:"#000",borderRadius:2,padding:"1px 4px",fontSize:7,fontWeight:700}}>GAP</span>}
-                              {r.ah_momentum&&<span style={{background:C.green,color:"#000",borderRadius:2,padding:"1px 4px",fontSize:7,fontWeight:700}}>AH</span>}
-                              {r.pullback_state&&r.pullback_state!=="neutral"&&<span style={{background:C.violet,color:"#fff",borderRadius:2,padding:"1px 4px",fontSize:7,fontWeight:700}}>PB</span>}
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              )}
-            </div>
-
-            {/* Status bar */}
-            <div style={{padding:"4px 12px",borderTop:`1px solid ${T.line}`,display:"flex",
-                         justifyContent:"space-between",fontSize:8,color:T.muted,background:T.panel}}>
-              <span>Showing {filtered.length.toLocaleString()} of {
-                dataSource==="portfolio"?portfolioRows.length:
-                dataSource==="monitor"?monitorSet.size:
-                (stockListMap.size||allRows.length)
-              } stocks</span>
-              <span>{activeSector!=="ALL"?`Sector: ${activeSector} · `:""}{dataSource.toUpperCase()} · {heartbeat}</span>
-            </div>
-          </div>
-
-          {/* ── RIGHT SIDEBAR ── */}
-          <div style={{width:238,borderLeft:`1px solid ${T.line2}`,display:"flex",flexDirection:"column"}}>
-            {/* Signals sidebar */}
-            <div style={{borderBottom:`1px solid ${T.line2}`,flex:"0 0 auto"}}>
-              <div style={{padding:"6px 10px",display:"flex",justifyContent:"space-between",
-                           alignItems:"center",borderBottom:`1px solid ${T.line}`}}>
-                <span style={{fontSize:9,letterSpacing:".12em",color:T.muted}}>SCALP SIGNALS</span>
-                <div style={{display:"flex",gap:3}}>
-                  {["ALL","LONG","SHORT"].map(f=>(
-                    <Btn key={f} active={sigFilter===f} label={f} onClick={()=>setSigF(f)} sx={{fontSize:8,padding:"1px 6px"}}/>
-                  ))}
-                </div>
-              </div>
-              <div style={{maxHeight:260,overflowY:"auto"}}>
-                {(sigFilter==="ALL"?signals:signals.filter(s=>s.direction===sigFilter)).length===0?(
-                  <div style={{padding:12,textAlign:"center",color:T.muted,fontSize:9}}>No signals</div>
-                ):(sigFilter==="ALL"?signals:signals.filter(s=>s.direction===sigFilter)).slice(0,20).map((sig,i)=>(
-                  <div key={i} onClick={()=>setSelected(sig.symbol)}
-                    style={{padding:"6px 10px",borderBottom:`1px solid ${T.line}`,cursor:"pointer"}}
-                    onMouseEnter={e=>e.currentTarget.style.background=T.panel2}
-                    onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                    <div style={{display:"flex",justifyContent:"space-between"}}>
-                      <span style={{fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:13}}>{sig.symbol}</span>
-                      <span style={{fontSize:8,fontWeight:700,padding:"1px 5px",borderRadius:3,
-                        background:sig.direction==="LONG"?`rgba(16,185,129,0.15)`:`rgba(239,68,68,0.15)`,
-                        color:sig.direction==="LONG"?C.green2:C.red2}}>{sig.direction}</span>
-                    </div>
-                    <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:T.muted,marginTop:2}}>
-                      <span>Entry: <span style={{color:T.text}}>${fmt2(sig.entry_price)}</span></span>
-                      <span>Score: <span style={{color:C.amber}}>{sig.score}</span></span>
-                    </div>
-                    <div style={{display:"flex",justifyContent:"space-between",fontSize:8,color:T.muted}}>
-                      <span>TP: ${fmt2(sig.take_profit)}</span>
-                      <span style={{color:C.violet}}>Conf: {sig.confidence}%</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <div style={{padding:"4px 10px",borderTop:`1px solid ${T.line}`,textAlign:"center"}}>
-                <button onClick={()=>setTab("SIGNALS")} style={{background:"transparent",border:`1px solid ${T.line2}`,
-                  color:T.muted,borderRadius:4,padding:"2px 10px",fontSize:8,cursor:"pointer",
-                  fontFamily:"'Rajdhani',sans-serif",letterSpacing:".08em"}}>VIEW ALL →</button>
-              </div>
-            </div>
-            {/* Earnings sidebar */}
-            <div style={{flex:1,display:"flex",flexDirection:"column",overflowY:"auto"}}>
-              <div style={{padding:"6px 10px",borderBottom:`1px solid ${T.line}`,
-                           display:"flex",justifyContent:"space-between",fontSize:9,color:T.muted}}>
-                <span>EARNINGS (7d)</span><span style={{color:C.amber}}>{earnings.length}</span>
-              </div>
-              {earnings.slice(0,20).map((e,i)=>(
-                <div key={i} onClick={()=>setSelected(e.ticker)}
-                  style={{padding:"6px 10px",borderBottom:`1px solid ${T.line}`,cursor:"pointer"}}
-                  onMouseEnter={ev=>ev.currentTarget.style.background=T.panel2}
-                  onMouseLeave={ev=>ev.currentTarget.style.background="transparent"}>
-                  <div style={{display:"flex",justifyContent:"space-between"}}>
-                    <span style={{fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:12}}>{e.ticker}</span>
-                    <span style={{fontSize:8,color:C.amber}}>{e.earnings_time==="BMO"?"pre-mkt":"after"}</span>
-                  </div>
-                  <div style={{fontSize:8,color:T.muted,marginTop:1}}>
-                    {new Date(e.earnings_date+"T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})}</div>
-                </div>
-              ))}
-              <div style={{padding:"4px 10px",borderTop:`1px solid ${T.line}`,textAlign:"center"}}>
-                <button onClick={()=>setTab("EARNINGS")} style={{background:"transparent",border:`1px solid ${T.line2}`,
-                  color:T.muted,borderRadius:4,padding:"2px 10px",fontSize:8,cursor:"pointer",
-                  fontFamily:"'Rajdhani',sans-serif",letterSpacing:".08em"}}>VIEW ALL →</button>
-              </div>
+          {/* Pagination Footer - Always visible at bottom */}
+          <div style={{ 
+            padding:"14px 18px", 
+            borderTop:`2px solid ${T.border}`, 
+            display:"flex", 
+            justifyContent:"space-between", 
+            alignItems:"center", 
+            background:T.bg1,
+            position:"sticky",
+            bottom:0,
+            zIndex:10
+          }}>
+            <span style={{ color:T.text1, fontSize:13, fontFamily:T.font, fontWeight:600 }}>
+              {paginatedTickers.length > 0 
+                ? `Showing ${startIndex + 1}-${Math.min(endIndex, filteredTickers.length)} of ${filteredTickers.length.toLocaleString()} stocks`
+                : 'No stocks to display'}
+            </span>
+            <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+              <span style={{ color:T.text1, fontSize:13, fontFamily:T.font, fontWeight:600 }}>
+                Page {currentPage} of {totalPages || 1}
+              </span>
+              <button 
+                className="btn-ghost" 
+                style={{ fontSize:12, padding:"6px 12px" }}
+                onClick={handlePrevPage}
+                disabled={currentPage === 1}
+              >
+                ← PREV
+              </button>
+              <button 
+                className="btn-ghost" 
+                style={{ fontSize:12, padding:"6px 12px" }}
+                onClick={handleNextPage}
+                disabled={currentPage >= totalPages}
+              >
+                NEXT →
+              </button>
             </div>
           </div>
         </div>
+          
+          {/* Chart Panel - Appears on right when symbol selected */}
+          {selectedSymbol && (
+            <div className="card" style={{ flex:"1 1 38%", display:"flex", flexDirection:"column", minWidth:400, maxWidth:500 }}>
+              <SectionHeader title={selectedSymbol} T={T}>
+                <button 
+                  className="btn-ghost" 
+                  style={{ fontSize:11, padding:"4px 10px" }}
+                  onClick={() => setSelectedSymbol(null)}
+                >
+                  ✕ CLOSE
+                </button>
+              </SectionHeader>
+              
+              {/* TradingView Chart */}
+              <div style={{ flex:1, minHeight:400 }}>
+                <TVChart symbol={selectedSymbol} height={400} T={T} />
+              </div>
+              
+              {/* Quick Stats */}
+              <div style={{ padding:"14px 16px", borderTop:`1px solid ${T.border}`, background:T.bg0 }}>
+                {(() => {
+                  const tickerData = tickers.get(selectedSymbol);
+                  if (!tickerData) return <div style={{ color:T.text2, fontSize:12, fontFamily:T.font }}>Loading data...</div>;
+                  
+                  const isPositive = (tickerData.change_value || 0) >= 0;
+                  const changeColor = isPositive ? T.green : T.red;
+                  
+                  return (
+                    <div style={{ display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:12 }}>
+                      <div>
+                        <div style={{ color:T.text2, fontSize:11, fontFamily:T.font, marginBottom:4, fontWeight:600 }}>PRICE</div>
+                        <div style={{ color:T.text0, fontSize:18, fontFamily:T.font, fontWeight:700 }}>${fmt2(tickerData.live_price || 0)}</div>
+                      </div>
+                      <div>
+                        <div style={{ color:T.text2, fontSize:11, fontFamily:T.font, marginBottom:4, fontWeight:600 }}>CHANGE</div>
+                        <div style={{ color:changeColor, fontSize:16, fontFamily:T.font, fontWeight:700 }}>
+                          {isPositive ? '+' : ''}{fmt2(tickerData.change_value || 0)} ({pct(tickerData.percent_change || 0)})
+                        </div>
+                      </div>
+                      <div>
+                        <div style={{ color:T.text2, fontSize:11, fontFamily:T.font, marginBottom:4, fontWeight:600 }}>OPEN</div>
+                        <div style={{ color:T.text1, fontSize:14, fontFamily:T.font, fontWeight:600 }}>${fmt2(tickerData.open || 0)}</div>
+                      </div>
+                      <div>
+                        <div style={{ color:T.text2, fontSize:11, fontFamily:T.font, marginBottom:4, fontWeight:600 }}>VOLUME</div>
+                        <div style={{ color:T.text1, fontSize:14, fontFamily:T.font, fontWeight:600 }}>{fmtK(tickerData.volume || 0)}</div>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            </div>
+          )}
+        </div>
       )}
+
+      {/* ── MATRIX VIEW: Top 50 clean TradingView charts ── */}
+      {viewMode === "MATRIX" && (
+        <div>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
+            <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+              <span style={{ color:T.text1, fontSize:10, fontFamily:T.font, letterSpacing:1.5 }}>TOP</span>
+              {[20,50].map(n=>(
+                <button key={n} className={`btn-ghost${matrixCount===n?" active":""}`}
+                  onClick={()=>setMatrixCount(n)} style={{ fontSize:9, padding:"3px 9px" }}>
+                  {n}
+                </button>
+              ))}
+              <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>clean chart · no indicators</span>
+            </div>
+          </div>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))", gap:10 }}>
+            {matrixSymbols.map(sym => (
+              <div key={sym} className="card" style={{ overflow:"hidden" }}>
+                <div style={{ padding:"7px 12px", borderBottom:`1px solid ${T.border}`, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                  <span style={{ color:T.text0, fontFamily:T.font, fontSize:12, fontWeight:700 }}>{sym}</span>
+                  <a href={`https://www.tradingview.com/chart/?symbol=${sym}`} target="_blank" rel="noreferrer"
+                    style={{ color:T.text2, fontSize:8.5, textDecoration:"none", fontFamily:T.font }}>↗ TV</a>
+                </div>
+                <TVChart symbol={sym} height={180} />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── PAGE: Chart (PRESERVED as-is) ───────────────────────────────────────────
+function PageChart({ T }) {
+  const [sym, setSym] = useState("");
+  const [tf,  setTf]  = useState("1D");
+  return (
+    <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:16 }}>
+      <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+        <input placeholder="Enter symbol…" value={sym} onChange={e=>setSym(e.target.value.toUpperCase())}
+          style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:7, padding:"7px 13px", color:T.text0, fontFamily:T.font, fontSize:13, outline:"none", width:170 }}/>
+        {["1m","5m","15m","1H","4H","1D","1W"].map(t=>(
+          <button key={t} onClick={()=>setTf(t)}
+            style={{ background:tf===t?T.cyanDim:T.bg2, border:`1px solid ${tf===t?T.cyanMid:T.border}`, color:tf===t?T.cyan:T.text2, borderRadius:5, padding:"5px 11px", cursor:"pointer", fontFamily:T.font, fontSize:10, letterSpacing:1 }}>{t}</button>
+        ))}
+        <div style={{ marginLeft:"auto", display:"flex", gap:6 }}>
+          {["CANDLE","LINE","BAR"].map(ct=><button key={ct} className="btn-ghost" style={{ fontSize:9 }}>{ct}</button>)}
+        </div>
+      </div>
+      <div style={{ display:"flex", gap:16, flexWrap:"wrap" }}>
+        <div className="card" style={{ flex:3, minWidth:300 }}>
+          <SectionHeader title={sym||"— SELECT SYMBOL"}><Chip color={T.cyan}>{tf}</Chip></SectionHeader>
+          <div style={{ padding:16 }}>
+            <div style={{ display:"flex", gap:16, marginBottom:14, flexWrap:"wrap" }}>
+              {["OPEN","HIGH","LOW","CLOSE","VOL"].map(l=>(
+                <div key={l}>
+                  <div style={{ color:T.text2, fontSize:8.5, letterSpacing:1.5, fontFamily:T.font, marginBottom:4 }}>{l}</div>
+                  <Shimmer w={70} h={15}/>
+                </div>
+              ))}
+            </div>
+            <EmptyChart height={250} label={sym?`Waiting for ${sym} data`:"Select a symbol to view chart"}/>
+            <div style={{ marginTop:8 }}>
+              <div style={{ color:T.text2, fontSize:8.5, letterSpacing:1.5, fontFamily:T.font, marginBottom:5 }}>VOLUME</div>
+              <EmptyChart height={55} label=""/>
+            </div>
+          </div>
+        </div>
+        <div style={{ flex:1, minWidth:190, display:"flex", flexDirection:"column", gap:14 }}>
+          <div className="card">
+            <SectionHeader title="Indicators"/>
+            <div style={{ padding:13, display:"flex", flexDirection:"column", gap:9 }}>
+              {["RSI (14)","MACD (12,26,9)","BB (20,2)","VWAP","EMA (9)","EMA (21)"].map(ind=>(
+                <div key={ind} style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                  <span style={{ color:T.text1, fontSize:10, fontFamily:T.font }}>{ind}</span>
+                  <Shimmer w={44} h={10}/>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="card">
+            <SectionHeader title="Order Book"/>
+            <div style={{ padding:13 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+                <span style={{ color:T.red, fontSize:9.5, fontFamily:T.font }}>ASKS</span>
+                <span style={{ color:T.green, fontSize:9.5, fontFamily:T.font }}>BIDS</span>
+              </div>
+              {Array(5).fill(0).map((_,i)=>(
+                <div key={i} style={{ display:"flex", gap:6, marginBottom:5 }}>
+                  <Shimmer w="48%" h={9}/><Shimmer w="48%" h={9}/>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── PAGE: Signals (PRESERVED as-is) ─────────────────────────────────────────
+// ─── PAGE: Signals - Uses live ticker data directly ──────────────────────────
+function PageSignals({ tickers = new Map(), selectedSectors = ["ALL"], T }) {
+  const [filter, setFilter] = useState("ALL");
+  const [minStrength, setMinStrength] = useState("WEAK");
+
+  // Convert tickers to signals based on live data
+  const signals = useMemo(() => {
+    const tickerArray = Array.from(tickers.values());
+    
+    return tickerArray
+      .filter(ticker => {
+        // Filter by sector
+        if (!selectedSectors.includes("ALL")) {
+          const tickerSector = normalizeSector(ticker.sector);
+          if (!tickerSector || !selectedSectors.some(s => tickerSector === s)) {
+            return false;
+          }
+        }
+        
+        // Must have significant movement
+        return Math.abs(ticker.percent_change || 0) >= 1;
+      })
+      .map(ticker => {
+        const isPositive = (ticker.percent_change || 0) > 0;
+        const absChange = Math.abs(ticker.percent_change || 0);
+        
+        // Determine strength based on % change
+        let strength = 'WEAK';
+        if (absChange >= 5) strength = 'STRONG';
+        else if (absChange >= 3) strength = 'MEDIUM';
+        
+        // Determine direction
+        const direction = isPositive ? 'LONG' : 'SHORT';
+        
+        // Build reasons
+        const reasons = [];
+        if (absChange >= 5) reasons.push('Strong momentum');
+        if (ticker.volume_spike) reasons.push('Volume spike');
+        if (absChange >= 3) reasons.push('Significant move');
+        
+        return {
+          ticker: ticker.ticker,
+          company: ticker.company_name || ticker.ticker,
+          direction,
+          strength,
+          price: ticker.live_price || 0,
+          change: ticker.change_value || 0,
+          pct: ticker.percent_change || 0,
+          volume: ticker.volume || 0,
+          reasons,
+          timestamp: new Date().toISOString(),
+        };
+      })
+      .sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct));
+  }, [tickers, selectedSectors]);
+
+  // Filter signals
+  const filteredSignals = useMemo(() => {
+    let filtered = signals;
+    
+    // Filter by direction
+    if (filter === "LONG") filtered = filtered.filter(s => s.direction === "LONG");
+    else if (filter === "SHORT") filtered = filtered.filter(s => s.direction === "SHORT");
+    
+    // Filter by strength
+    if (minStrength === "MEDIUM") filtered = filtered.filter(s => s.strength !== "WEAK");
+    else if (minStrength === "STRONG") filtered = filtered.filter(s => s.strength === "STRONG");
+    
+    return filtered;
+  }, [signals, filter, minStrength]);
+
+  return (
+    <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:16 }}>
+      {/* Filter Controls */}
+      <div style={{ display:"flex", gap:7, flexWrap:"wrap", alignItems:"center" }}>
+        {["ALL","LONG","SHORT"].map(f=>(
+          <button key={f}
+            style={{ background:filter===f?T.cyanDim:T.bg2, border:`1px solid ${filter===f?T.cyanMid:T.border}`, color:filter===f?T.cyan:T.text2, borderRadius:5, padding:"5px 11px", cursor:"pointer", fontFamily:T.font, fontSize:9.5, letterSpacing:1, fontWeight:600 }}
+            onClick={()=>setFilter(f)}>{f}</button>
+        ))}
+        <div style={{ marginLeft:"auto", display:"flex", gap:7, alignItems:"center" }}>
+          <span style={{ color:T.text2, fontSize:9.5, fontFamily:T.font, fontWeight:600 }}>MIN STRENGTH</span>
+          {["WEAK","MEDIUM","STRONG"].map(s=>(
+            <button key={s}
+              className={minStrength===s?"btn-primary":"btn-ghost"}
+              style={{ fontSize:9, fontWeight:600 }}
+              onClick={()=>setMinStrength(s)}>{s}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Signal Feed Card */}
+      <div className="card">
+        <SectionHeader title="Scalp Signals" T={T}>
+          <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+            {tickers.size > 0 ? (
+              <>
+                <span className="live-dot"/>
+                <span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:700 }}>LIVE</span>
+              </>
+            ) : (
+              <span style={{ color:T.text2, fontSize:12, fontFamily:T.font, fontWeight:600 }}>CONNECTING…</span>
+            )}
+          </div>
+        </SectionHeader>
+
+        {/* Scrollable Signal List */}
+        <div style={{ maxHeight:"calc(100vh - 350px)", minHeight:"400px", overflowY:"auto", position:"relative" }}>
+          {filteredSignals.length === 0 ? (
+            <EmptyState 
+              icon="◉" 
+              label={tickers.size === 0 ? "CONNECTING TO BACKEND" : "NO SIGNALS"} 
+              sub={tickers.size === 0 ? "Waiting for live data stream..." : "Signals will appear when stocks show significant movement (>1% change)"} 
+              h={300} 
+              T={T}
+            />
+          ) : (
+            <>
+              <div style={{ padding:14, display:"flex", flexDirection:"column", gap:10 }}>
+                {filteredSignals.map((sig, i) => (
+                  <div key={i}
+                    style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:8, padding:14, transition:"all 0.2s" }}
+                    onMouseEnter={e => e.currentTarget.style.borderColor = T.borderHi}
+                    onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+                      <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                        <span style={{ color:T.text0, fontSize:16, fontFamily:T.font, fontWeight:700 }}>{sig.ticker}</span>
+                        <span style={{
+                          color: sig.direction === 'LONG' ? T.green : T.red,
+                          fontSize:10,
+                          fontFamily:T.font,
+                          fontWeight:700,
+                          padding:"3px 8px",
+                          background: sig.direction === 'LONG' ? T.greenDim : T.redDim,
+                          borderRadius:4
+                        }}>{sig.direction}</span>
+                        <span style={{
+                          color: sig.strength === 'STRONG' ? T.purple : sig.strength === 'MEDIUM' ? T.cyan : T.text2,
+                          fontSize:8,
+                          fontFamily:T.font,
+                          letterSpacing:1,
+                          fontWeight:700
+                        }}>{sig.strength}</span>
+                      </div>
+                      <div style={{ color:T.text2, fontSize:9, fontFamily:T.font, fontWeight:600 }}>
+                        {new Date(sig.timestamp).toLocaleTimeString()}
+                      </div>
+                    </div>
+
+                    <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10, marginBottom:10 }}>
+                      {[
+                        ['PRICE', `$${fmt2(sig.price)}`, T.cyan],
+                        ['CHANGE', `${sig.change >= 0 ? '+' : ''}${fmt2(sig.change)}`, sig.change >= 0 ? T.green : T.red],
+                        ['% CHG', pct(sig.pct), sig.pct >= 0 ? T.green : T.red],
+                        ['VOLUME', fmtVol(sig.volume), T.text1]
+                      ].map(([label, value, color]) => (
+                        <div key={label}>
+                          <div style={{ color:T.text2, fontSize:8, fontFamily:T.font, marginBottom:4, fontWeight:600 }}>{label}</div>
+                          <div style={{ color, fontSize:13, fontFamily:T.font, fontWeight:700 }}>{value}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {sig.reasons.length > 0 && (
+                      <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                        {sig.reasons.map((reason, j) => (
+                          <span key={j} style={{
+                            color:T.text1,
+                            fontSize:8,
+                            fontFamily:T.font,
+                            background:T.bg0,
+                            padding:"4px 8px",
+                            borderRadius:4,
+                            fontWeight:600
+                          }}>• {reason}</span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+              
+              {/* Bottom fade gradient — purely decorative */}
+              {filteredSignals.length >= 5 && (
+                <div style={{ 
+                  position:"sticky", 
+                  bottom:0, 
+                  left:0, 
+                  right:0, 
+                  height:40,
+                  background:`linear-gradient(to bottom, transparent, ${T.bg1})`,
+                  pointerEvents:"none"
+                }}/>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── PAGE: Earnings (with real data from Supabase) ───────────────────────────
+function PageEarnings({ T }) {
+  const [weekOffset, setWeekOffset] = useState(0);
+  const [selectedDay, setSelectedDay] = useState(null);
+  const [earningsData, setEarningsData] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const weekDates = useMemo(() => getWeekDates(weekOffset), [weekOffset]);
+
+  // Fetch earnings data
+  useEffect(() => {
+    const fetchEarnings = async () => {
+      try {
+        const startDate = weekDates[0]?.isoDate;
+        const endDate = weekDates[weekDates.length - 1]?.isoDate;
+        
+        const res = await fetch(`${API_BASE}/api/earnings?start=${startDate}&end=${endDate}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        setEarningsData(data || []);
+        setLoading(false);
+      } catch (err) {
+        console.error('[Earnings] Fetch error:', err);
+        setLoading(false);
+      }
+    };
+
+    if (weekDates.length > 0) {
+      fetchEarnings();
+    }
+  }, [weekOffset, weekDates]);
+
+  useEffect(() => {
+    const todayEntry = weekDates.find(d => d.isToday);
+    if (todayEntry) setSelectedDay(todayEntry.isoDate);
+    else if (weekOffset === 0) setSelectedDay(null);
+  }, [weekOffset, weekDates]);
+
+  const activeDay = selectedDay || weekDates.find(d=>d.isToday)?.isoDate || weekDates[0]?.isoDate;
+
+  // Filter earnings by selected day
+  const dayEarnings = useMemo(() => {
+    if (!activeDay) return [];
+    return earningsData.filter(e => e.date === activeDay || e.earnings_date === activeDay);
+  }, [earningsData, activeDay]);
+
+  return (
+    <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:16 }}>
+      <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+        <button className="btn-ghost" onClick={()=>setWeekOffset(o=>o-1)}>← PREV WEEK</button>
+        {weekDates.map(d=>(
+          <button key={d.isoDate} onClick={()=>setSelectedDay(d.isoDate)}
+            style={{ background:activeDay===d.isoDate?T.cyanDim:T.bg2, border:`1px solid ${activeDay===d.isoDate?T.cyanMid:d.isToday?T.borderHi:T.border}`, color:activeDay===d.isoDate?T.cyan:d.isToday?T.text0:T.text2, borderRadius:5, padding:"6px 13px", cursor:"pointer", fontFamily:T.font, fontSize:10, letterSpacing:1, display:"flex", flexDirection:"column", alignItems:"center", gap:2 }}>
+            <span>{d.day}</span>
+            <span style={{ fontSize:8, opacity:0.7 }}>{d.date}</span>
+            {d.isToday && <span style={{ fontSize:7, color:T.cyan }}>TODAY</span>}
+          </button>
+        ))}
+        <button className="btn-ghost" onClick={()=>setWeekOffset(o=>o+1)}>NEXT WEEK →</button>
+        <div style={{ marginLeft:"auto", display:"flex", gap:8 }}>
+          {weekOffset!==0&&<button className="btn-ghost" onClick={()=>setWeekOffset(0)} style={{ fontSize:9 }}>THIS WEEK</button>}
+          <button className="btn-primary">+ ADD TO WATCHLIST</button>
+        </div>
+      </div>
+      <div style={{ display:"flex", gap:16, flexWrap:"wrap" }}>
+        <div className="card" style={{ flex:2, minWidth:300 }}>
+          <SectionHeader title={`Earnings Calendar${activeDay?` · ${weekDates.find(d=>d.isoDate===activeDay)?.date||""}`:""}`} T={T}>
+            {loading ? (
+              <Chip color={T.gold} T={T}>LOADING</Chip>
+            ) : (
+              <Chip color={T.green} T={T}>{dayEarnings.length} EARNINGS</Chip>
+            )}
+          </SectionHeader>
+          <div>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(8,1fr)", background:T.bg0, borderBottom:`1px solid ${T.border}` }}>
+              {["SYMBOL","DATE","TIME","EPS EST","REV EST","MKT CAP","SECTOR","WATCH"].map(h=>(
+                <div key={h} style={{ padding:"9px 12px", color:T.text1, fontSize:9, letterSpacing:1.5, fontFamily:T.font, fontWeight:800, textTransform:"uppercase" }}>{h}</div>
+              ))}
+            </div>
+            
+            {/* Scrollable container */}
+            <div style={{ maxHeight:"calc(100vh - 450px)", minHeight:"300px", overflowY:"auto", position:"relative" }}>
+              {loading ? (
+                // Show shimmer
+                Array(10).fill(0).map((_,i)=>(
+                  <div key={i} className="tr-hover" style={{ display:"grid", gridTemplateColumns:"repeat(8,1fr)", borderBottom:`1px solid #080f1a` }}>
+                    {[50,55,70,55,70,55,60,45].map((w,j)=>(
+                      <div key={j} style={{ padding:"11px 12px" }}>
+                        {j===7?<div style={{ width:26,height:16,background:T.cyanDim,border:`1px solid ${T.cyanMid}`,borderRadius:3}}/>
+                              :<Shimmer w={w} h={10} opacity={j===0?0.75:0.45} T={T}/>}
+                      </div>
+                    ))}
+                  </div>
+                ))
+              ) : dayEarnings.length === 0 ? (
+                <EmptyState icon="◎" label="NO EARNINGS" sub="No earnings scheduled for this day" h={200} T={T}/>
+              ) : (
+                <>
+                  {dayEarnings.map((earning, i) => (
+                    <div key={i} className="tr-hover" style={{ display:"grid", gridTemplateColumns:"repeat(8,1fr)", borderBottom:`1px solid ${T.border}` }}>
+                      <div style={{ padding:"11px 12px", color:T.cyan, fontSize:12, fontFamily:T.font, fontWeight:700 }}>
+                        {earning.ticker || earning.symbol}
+                      </div>
+                      <div style={{ padding:"11px 12px", color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>
+                        {earning.date || earning.earnings_date}
+                      </div>
+                      <div style={{ padding:"11px 12px", color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>
+                        {earning.time || earning.earnings_time || '—'}
+                      </div>
+                      <div style={{ padding:"11px 12px", color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>
+                        {earning.eps_est || earning.eps_estimate || '—'}
+                      </div>
+                      <div style={{ padding:"11px 12px", color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>
+                        {earning.rev_est || earning.revenue_estimate || '—'}
+                      </div>
+                      <div style={{ padding:"11px 12px", color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>
+                        {earning.market_cap ? fmtK(earning.market_cap) : '—'}
+                      </div>
+                      <div style={{ padding:"11px 12px", color:T.text2, fontSize:10, fontFamily:T.font, fontWeight:600 }}>
+                        {earning.sector || '—'}
+                      </div>
+                      <div style={{ padding:"11px 12px" }}>
+                        <button className="btn-ghost" style={{ fontSize:8, padding:"3px 8px", fontWeight:600 }}>⭐</button>
+                      </div>
+                    </div>
+                  ))}
+                  
+                  {/* Bottom fade gradient — purely decorative */}
+                  {dayEarnings.length >= 10 && (
+                    <div style={{ 
+                      position:"sticky", 
+                      bottom:0, 
+                      left:0, 
+                      right:0, 
+                      height:40,
+                      background:`linear-gradient(to bottom, transparent, ${T.bg1})`,
+                      pointerEvents:"none"
+                    }}/>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+        <div style={{ flex:1, minWidth:190, display:"flex", flexDirection:"column", gap:14 }}>
+          <div className="card">
+            <SectionHeader title="Selected Earnings"/>
+            <EmptyState icon="◎" label="SELECT A TICKER" sub="Click any row to see earnings details, historical beats/misses, and implied move" h={140}/>
+          </div>
+          <div className="card">
+            <SectionHeader title="Gap Stats"/>
+            <div style={{ padding:14 }}>
+              {["AVG GAP UP","AVG GAP DOWN","BEAT RATE","MISS RATE"].map(s=>(
+                <div key={s} style={{ display:"flex", justifyContent:"space-between", padding:"8px 0", borderBottom:`1px solid ${T.border}` }}>
+                  <span style={{ color:T.text2, fontSize:9.5, fontFamily:T.font }}>{s}</span>
+                  <Shimmer w={44} h={10}/>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── PAGE: Portfolio ──────────────────────────────────────────────────────────
+// Allocation section: SVG donut with sector breakdown by portfolio weight.
+// Sectors drawn proportionally once real data arrives from /api/portfolio.
+// Until then, shows empty donut with usage guide.
+function PagePortfolio({ tickers = new Map(), marketSession = "market", T }) {
+  const [portfolioData, setPortfolioData] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [currentPage, setCurrentPage] = useState(1);
+  const ITEMS_PER_PAGE = 50;
+
+  // Fetch portfolio data
+  useEffect(() => {
+    const fetchPortfolio = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/portfolio`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        setPortfolioData(data || []);
+        setLoading(false);
+      } catch (err) {
+        console.error('[Portfolio] Fetch error:', err);
+        setLoading(false);
+      }
+    };
+
+    fetchPortfolio();
+    const interval = setInterval(fetchPortfolio, 30000); // Refresh every 30s
+    return () => clearInterval(interval);
+  }, []);
+
+  // Enrich portfolio with live prices and calculate values
+  const enrichedPortfolio = useMemo(() => {
+    return portfolioData.map(position => {
+      const ticker = tickers.get(position.ticker);
+      // FIX: use live_price (was wrongly ticker?.price)
+      const livePrice  = ticker?.live_price || position.last_price || 0;
+      const openPrice  = ticker?.open       || 0;
+      const prevClose  = ticker?.prev_close || 0;
+      const todayClose = ticker?.today_close || 0;
+      const shares   = position.shares  || 0;
+      const avgCost  = position.avg_cost || 0;
+
+      const marketValue = shares * livePrice;
+      const costBasis   = shares * avgCost;
+      const totalPnL    = marketValue - costBasis;
+      const totalPnLPct = costBasis > 0 ? (totalPnL / costBasis) * 100 : 0;
+
+      // Day P&L: MH = vs open; AH = vs today_close (regular session close)
+      const isAH       = marketSession !== "market";
+      const dayBase    = isAH ? (todayClose || prevClose || livePrice)
+                               : (openPrice  || prevClose || livePrice);
+      const dayChange  = dayBase > 0 ? livePrice - dayBase : 0;
+      const dayPnL     = shares * dayChange;
+      const dayPct     = dayBase > 0 ? (dayChange / dayBase) * 100 : 0;
+
+      return {
+        ...position,
+        livePrice,
+        openPrice,
+        prevClose,
+        todayClose,
+        marketValue,
+        costBasis,
+        totalPnL,
+        totalPnLPct,
+        dayPnL,
+        dayPct,
+        sector: ticker?.sector || position.sector || 'OTHER',
+      };
+    });
+  }, [portfolioData, tickers]);
+
+  // Calculate allocation by sector
+  const allocationData = useMemo(() => {
+    if (enrichedPortfolio.length === 0) return [];
+
+    const totalValue = enrichedPortfolio.reduce((sum, p) => sum + p.marketValue, 0);
+    if (totalValue === 0) return [];
+
+    // Group by sector
+    const sectorMap = {};
+    enrichedPortfolio.forEach(p => {
+      const sector = (p.sector || 'OTHER').toUpperCase();
+      if (!sectorMap[sector]) {
+        sectorMap[sector] = 0;
+      }
+      sectorMap[sector] += p.marketValue;
+    });
+
+    // Convert to array with percentages
+    const sectorColors = {
+      'TECHNOLOGY': T.cyan,
+      'BANKING': T.green,
+      'BIO': T.purple,
+      'CONSUMER': T.gold,
+      'BM & UENE': T.orange,
+      'REALCOM': '#00bcd4',
+      'INDUSTRIALS': '#ff9800',
+      'OTHER': T.text2,
+    };
+
+    return Object.entries(sectorMap)
+      .map(([label, value]) => ({
+        label,
+        pct: parseFloat(((value / totalValue) * 100).toFixed(1)),
+        color: sectorColors[label] || T.text2,
+      }))
+      .sort((a, b) => b.pct - a.pct);
+  }, [enrichedPortfolio]);
+
+  // Calculate KPIs
+  const kpis = useMemo(() => {
+    if (enrichedPortfolio.length === 0) {
+      return {
+        totalValue: 0,
+        dayPnL: 0,
+        totalPnL: 0,
+        maxDrawdown: 0,
+        winRate: 0,
+        topHolding: '—',
+        concentration: 0,
+        sectorCount: 0,
+      };
+    }
+
+    const totalValue = enrichedPortfolio.reduce((sum, p) => sum + p.marketValue, 0);
+    const dayPnL = enrichedPortfolio.reduce((sum, p) => sum + p.dayPnL, 0);
+    const totalPnL = enrichedPortfolio.reduce((sum, p) => sum + p.totalPnL, 0);
+
+    // Top holding
+    const sorted = [...enrichedPortfolio].sort((a, b) => b.marketValue - a.marketValue);
+    const topHolding = sorted[0]?.ticker || '—';
+
+    // Concentration (top 5% of holdings)
+    const top5Pct = Math.ceil(enrichedPortfolio.length * 0.05);
+    const top5Value = sorted.slice(0, top5Pct).reduce((sum, p) => sum + p.marketValue, 0);
+    const concentration = totalValue > 0 ? (top5Value / totalValue) * 100 : 0;
+
+    // Sector count
+    const uniqueSectors = new Set(enrichedPortfolio.map(p => p.sector));
+    const sectorCount = uniqueSectors.size;
+
+    // Max drawdown (simplified - would need historical data for accurate calculation)
+    const maxDrawdown = enrichedPortfolio.reduce((max, p) => {
+      const dd = p.totalPnLPct < 0 ? Math.abs(p.totalPnLPct) : 0;
+      return Math.max(max, dd);
+    }, 0);
+
+    // Win rate (positions with positive P&L)
+    const winners = enrichedPortfolio.filter(p => p.totalPnL > 0).length;
+    const winRate = (winners / enrichedPortfolio.length) * 100;
+
+    return {
+      totalValue,
+      dayPnL,
+      totalPnL,
+      maxDrawdown,
+      winRate,
+      topHolding,
+      concentration,
+      sectorCount,
+    };
+  }, [enrichedPortfolio]);
+
+  // SVG donut builder
+  function DonutChart({ data, size=130, thick=18 }) {
+    const r = (size - thick) / 2;
+    const cx = size / 2, cy = size / 2;
+    const circ = 2 * Math.PI * r;
+    if (!data.length) {
+      return (
+        <div style={{ position:"relative", width:size, height:size, flexShrink:0 }}>
+          <svg width={size} height={size}>
+            <circle cx={cx} cy={cy} r={r} fill="none" stroke={T.border} strokeWidth={thick} strokeDasharray={`${circ * 0.8} ${circ * 0.2}`} strokeDashoffset={circ * 0.1} strokeLinecap="round"/>
+            <circle cx={cx} cy={cy} r={r} fill="none" stroke={T.borderHi} strokeWidth={1} opacity={0.4}/>
+          </svg>
+          <div style={{ position:"absolute", inset:0, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center" }}>
+            <span style={{ color:T.text2, fontSize:9, fontFamily:T.font, letterSpacing:1 }}>—%</span>
+          </div>
+        </div>
+      );
+    }
+    let offset = circ * 0.25; // start at top
+    const totalPct = data.reduce((s,d)=>s+d.pct,0);
+    return (
+      <div style={{ position:"relative", width:size, height:size, flexShrink:0 }}>
+        <svg width={size} height={size}>
+          {data.map((seg, i) => {
+            const dash = circ * seg.pct / 100;
+            const gap  = circ - dash;
+            const el = (
+              <circle key={i} cx={cx} cy={cy} r={r} fill="none"
+                stroke={seg.color} strokeWidth={thick}
+                strokeDasharray={`${dash} ${gap}`}
+                strokeDashoffset={-offset + circ * 0.25}
+                strokeLinecap="butt" opacity={0.85}/>
+            );
+            offset += dash;
+            return el;
+          })}
+          {/* center label */}
+          <text x={cx} y={cy-4} textAnchor="middle" fill={T.text0} fontSize="13" fontFamily="Syne Mono,monospace" fontWeight="700">
+            {totalPct.toFixed(0)}%
+          </text>
+          <text x={cx} y={cy+10} textAnchor="middle" fill={T.text2} fontSize="7" fontFamily="Syne Mono,monospace">ALLOCATED</text>
+        </svg>
+      </div>
+    );
+  }
+
+  const KPICard = ({ icon, label, value, note, color=T.cyan }) => (
+    <div className="card" style={{ padding:"16px 18px", flex:1, minWidth:130, position:"relative", overflow:"hidden" }}>
+      <div style={{ position:"absolute", top:0, left:0, right:0, height:2, background:`linear-gradient(90deg,transparent,${color},transparent)`, opacity:0.45 }}/>
+      <div style={{ fontSize:17, marginBottom:7 }}>{icon}</div>
+      <div style={{ color:T.text2, fontSize:9, letterSpacing:2, marginBottom:9, fontFamily:T.font, textTransform:"uppercase" }}>{label}</div>
+      <div style={{ fontFamily:T.font, fontSize:20, fontWeight:700, color, letterSpacing:1, marginBottom:5 }}>{value}</div>
+      <div style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>{note}</div>
+    </div>
+  );
+
+  return (
+    <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:16 }}>
+      {/* KPIs */}
+      <div style={{ display:"flex", gap:13, flexWrap:"wrap" }}>
+        <KPICard icon="💰" label="Total Value" value={fmtK(kpis.totalValue)} color={T.cyan} note="Unrealized"/>
+        <KPICard icon="📈" label="Day P&L" value={kpis.dayPnL >= 0 ? `+${fmtK(kpis.dayPnL)}` : fmtK(kpis.dayPnL)} color={kpis.dayPnL >= 0 ? T.green : T.red} note="Today"/>
+        <KPICard icon="📊" label="Total P&L" value={kpis.totalPnL >= 0 ? `+${fmtK(kpis.totalPnL)}` : fmtK(kpis.totalPnL)} color={kpis.totalPnL >= 0 ? T.green : T.red} note="All time"/>
+        <KPICard icon="📉" label="Max Drawdown" value={`-${kpis.maxDrawdown.toFixed(1)}%`} color={T.red} note="Portfolio risk"/>
+        <KPICard icon="⚡" label="Win Rate" value={`${kpis.winRate.toFixed(0)}%`} color={T.purple} note={`${enrichedPortfolio.filter(p => p.totalPnL > 0).length} winners`}/>
+      </div>
+
+      <div style={{ display:"flex", gap:16, flexWrap:"wrap" }}>
+        {/* Holdings */}
+        <div className="card" style={{ flex:2, minWidth:300 }}>
+          <SectionHeader title="Holdings">
+            <span style={{ color:T.text2, fontSize:8.5, fontFamily:T.font }}>{enrichedPortfolio.length} positions · /api/portfolio</span>
+            <button className="btn-primary">+ ADD POSITION</button>
+          </SectionHeader>
+          {/* Session-aware column headers */}
+          {marketSession === "market" ? (
+            <div style={{ display:"grid", gridTemplateColumns:"1.4fr 0.7fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.6fr", background:T.bg0, borderBottom:`1px solid ${T.border}` }}>
+              {["SYMBOL","SHARES","AVG COST","OPEN","LIVE PRICE","CHANGE","% CHG","VALUE","DAY P&L","TOTAL P&L","ACTION"].map(h=>(
+                <div key={h} style={{ padding:"9px 10px", color:T.text1, fontSize:9, letterSpacing:1, fontFamily:T.font, whiteSpace:"nowrap", fontWeight:800 }}>{h}</div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ display:"grid", gridTemplateColumns:"1.4fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.9fr 0.9fr 0.9fr 0.6fr", background:T.bg0, borderBottom:`1px solid ${T.border}` }}>
+              {["SYMBOL","SHARES","AVG COST","PREV CLOSE","TODAY CLOSE","LIVE PRICE","$ CHG","% CHG","VALUE","TOTAL P&L","ACTION"].map(h=>(
+                <div key={h} style={{ padding:"9px 10px", color:T.text1, fontSize:9, letterSpacing:1, fontFamily:T.font, whiteSpace:"nowrap", fontWeight:800 }}>{h}</div>
+              ))}
+            </div>
+          )}
+          {loading ? (
+            <EmptyState icon="◆" label="LOADING PORTFOLIO..." sub="Fetching positions from /api/portfolio" h={120}/>
+          ) : enrichedPortfolio.length === 0 ? (
+            <EmptyState icon="◆" label="NO POSITIONS" sub="Add your first position to get started" h={120} T={T}/>
+          ) : (
+            <>
+              <div style={{ maxHeight:"calc(100vh - 520px)", minHeight:"300px", overflowY:"auto" }}>
+                {enrichedPortfolio.slice((currentPage - 1) * ITEMS_PER_PAGE, currentPage * ITEMS_PER_PAGE).map((pos, i) => {
+                  if (marketSession === "market") {
+                    return (
+                    /* ── MH ROW: SYMBOL | SHARES | AVG COST | OPEN | LIVE PRICE | CHANGE | % CHG | VALUE | DAY P&L | TOTAL P&L | ACTION */
+                    <div key={i} style={{ display:"grid", gridTemplateColumns:"1.4fr 0.7fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.6fr", borderBottom:`1px solid ${T.border}`, fontSize:12, fontFamily:T.font }}>
+                      <div style={{ padding:"10px", color:T.cyan, fontWeight:700, fontSize:13 }}>{pos.ticker}<div style={{ color:T.text2, fontSize:9, fontWeight:400 }}>{pos.company_name || ""}</div></div>
+                      <div style={{ padding:"10px", color:T.text1 }}>{pos.shares?.toLocaleString() || 0}</div>
+                      <div style={{ padding:"10px", color:T.text1 }}>${fmt2(pos.avg_cost)}</div>
+                      <div style={{ padding:"10px", color:T.text1 }}>{pos.openPrice > 0 ? `$${fmt2(pos.openPrice)}` : "—"}</div>
+                      <div style={{ padding:"10px", color:T.cyan, fontWeight:700 }}>${fmt2(pos.livePrice)}</div>
+                      <div style={{ padding:"10px", color:pos.dayPnL >= 0 ? T.green : T.red, fontWeight:600 }}>{pos.dayPnL >= 0 ? "+" : ""}{fmt2(pos.dayPnL)}</div>
+                      <div style={{ padding:"10px", color:pos.dayPct >= 0 ? T.green : T.red, fontWeight:700 }}>{pos.dayPct >= 0 ? "+" : ""}{pos.dayPct.toFixed(2)}%</div>
+                      <div style={{ padding:"10px", color:T.text0 }}>{fmtK(pos.marketValue)}</div>
+                      <div style={{ padding:"10px", color:pos.dayPnL >= 0 ? T.green : T.red }}>{pos.dayPnL >= 0 ? "+" : ""}{fmtK(pos.dayPnL)}</div>
+                      <div style={{ padding:"10px", color:pos.totalPnL >= 0 ? T.green : T.red }}>{pos.totalPnL >= 0 ? "+" : ""}{fmtK(pos.totalPnL)}</div>
+                      <div style={{ padding:"10px" }}><button className="btn-ghost" style={{ fontSize:8, padding:"3px 6px" }}>SELL</button></div>
+                    </div>
+                    );
+                  } else {
+                    /* ── AH ROW: SYMBOL | SHARES | AVG COST | PREV CLOSE | TODAY CLOSE | LIVE PRICE | $ CHG | % CHG | VALUE | TOTAL P&L | ACTION */
+                    return (
+                    <div key={i} style={{ display:"grid", gridTemplateColumns:"1.4fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.9fr 0.9fr 0.9fr 0.6fr", borderBottom:`1px solid ${T.border}`, fontSize:12, fontFamily:T.font }}>
+                      <div style={{ padding:"10px", color:T.cyan, fontWeight:700, fontSize:13 }}>{pos.ticker}<div style={{ color:T.text2, fontSize:9, fontWeight:400 }}>{pos.company_name || ""}</div></div>
+                      <div style={{ padding:"10px", color:T.text1 }}>{pos.shares?.toLocaleString() || 0}</div>
+                      <div style={{ padding:"10px", color:T.text1 }}>${fmt2(pos.avg_cost)}</div>
+                      <div style={{ padding:"10px", color:T.text1 }}>{pos.prevClose > 0 ? `$${fmt2(pos.prevClose)}` : "—"}</div>
+                      <div style={{ padding:"10px", color:T.text1 }}>{pos.todayClose > 0 ? `$${fmt2(pos.todayClose)}` : "—"}</div>
+                      <div style={{ padding:"10px", color:T.cyan, fontWeight:700 }}>${fmt2(pos.livePrice)}</div>
+                      <div style={{ padding:"10px", color:pos.dayPnL >= 0 ? T.green : T.red, fontWeight:600 }}>{pos.dayPnL >= 0 ? "+" : ""}{fmt2(pos.dayPnL)}</div>
+                      <div style={{ padding:"10px", color:pos.dayPct >= 0 ? T.green : T.red, fontWeight:700 }}>{pos.dayPct >= 0 ? "+" : ""}{pos.dayPct.toFixed(2)}%</div>
+                      <div style={{ padding:"10px", color:T.text0 }}>{fmtK(pos.marketValue)}</div>
+                      <div style={{ padding:"10px", color:pos.totalPnL >= 0 ? T.green : T.red }}>{pos.totalPnL >= 0 ? "+" : ""}{fmtK(pos.totalPnL)}</div>
+                      <div style={{ padding:"10px" }}><button className="btn-ghost" style={{ fontSize:8, padding:"3px 6px" }}>SELL</button></div>
+                    </div>
+                    );
+                  }
+                })}
+              </div>
+              
+              {/* Pagination Footer */}
+              {enrichedPortfolio.length > ITEMS_PER_PAGE && (
+                <div style={{ 
+                  padding:"14px 18px", 
+                  borderTop:`2px solid ${T.border}`, 
+                  display:"flex", 
+                  justifyContent:"space-between", 
+                  alignItems:"center", 
+                  background:T.bg1,
+                  position:"sticky",
+                  bottom:0,
+                  zIndex:10
+                }}>
+                  <span style={{ color:T.text1, fontSize:13, fontFamily:T.font, fontWeight:600 }}>
+                    Showing {((currentPage - 1) * ITEMS_PER_PAGE) + 1}-{Math.min(currentPage * ITEMS_PER_PAGE, enrichedPortfolio.length)} of {enrichedPortfolio.length.toLocaleString()} positions
+                  </span>
+                  <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+                    <span style={{ color:T.text1, fontSize:13, fontFamily:T.font, fontWeight:600 }}>
+                      Page {currentPage} of {Math.ceil(enrichedPortfolio.length / ITEMS_PER_PAGE)}
+                    </span>
+                    <button 
+                      className="btn-ghost" 
+                      style={{ fontSize:12, padding:"6px 12px" }}
+                      onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                      disabled={currentPage === 1}
+                    >
+                      ← PREV
+                    </button>
+                    <button 
+                      className="btn-ghost" 
+                      style={{ fontSize:12, padding:"6px 12px" }}
+                      onClick={() => setCurrentPage(prev => Math.min(Math.ceil(enrichedPortfolio.length / ITEMS_PER_PAGE), prev + 1))}
+                      disabled={currentPage >= Math.ceil(enrichedPortfolio.length / ITEMS_PER_PAGE)}
+                    >
+                      NEXT →
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Right: Allocation + Performance */}
+        <div style={{ flex:1, minWidth:200, display:"flex", flexDirection:"column", gap:14 }}>
+
+          {/* ── ALLOCATION DONUT ── */}
+          <div className="card">
+            <SectionHeader title="Allocation">
+              <Chip color={T.text2}>BY SECTOR</Chip>
+            </SectionHeader>
+            <div style={{ padding:"16px 18px" }}>
+              {/* How allocation is calculated */}
+              <div style={{ color:T.text2, fontSize:8.5, fontFamily:T.font, marginBottom:12, lineHeight:1.6 }}>
+                <span style={{ color:T.cyan }}>Formula: </span>
+                (shares × live_price) ÷ total_portfolio_value × 100
+                <br/>Grouped by <span style={{ color:T.text0 }}>sector</span> from stock_list JOIN portfolio.
+              </div>
+
+              <div style={{ display:"flex", gap:14, alignItems:"flex-start" }}>
+                <DonutChart data={allocationData} size={130} thick={18}/>
+                <div style={{ flex:1, display:"flex", flexDirection:"column", gap:6 }}>
+                  {allocationData.length === 0 ? (
+                    // Skeleton legend — matches sector list
+                    [T.cyan, T.green, T.purple, T.gold, T.orange].map((c,i)=>(
+                      <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                        <div style={{ display:"flex", gap:7, alignItems:"center" }}>
+                          <div style={{ width:9,height:9,borderRadius:2,background:c,opacity:0.6 }}/>
+                          <Shimmer w={55} h={9} opacity={0.5}/>
+                        </div>
+                        <Shimmer w={28} h={9} opacity={0.35}/>
+                      </div>
+                    ))
+                  ) : (
+                    allocationData.map((seg,i)=>(
+                      <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                        <div style={{ display:"flex", gap:7, alignItems:"center" }}>
+                          <div style={{ width:9,height:9,borderRadius:2,background:seg.color }}/>
+                          <span style={{ color:T.text1, fontSize:9, fontFamily:T.font }}>{seg.label}</span>
+                        </div>
+                        <span style={{ color:seg.color, fontSize:10, fontFamily:T.font, fontWeight:700 }}>{seg.pct}%</span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              {/* Additional allocation breakdowns */}
+              <div style={{ marginTop:14, paddingTop:12, borderTop:`1px solid ${T.border}`, display:"flex", gap:8, flexWrap:"wrap" }}>
+                <div style={{ flex:1, background:T.bg2, border:`1px solid ${T.border}`, borderRadius:6, padding:"7px 10px", minWidth:70 }}>
+                  <div style={{ color:T.text2, fontSize:7.5, letterSpacing:1.5, fontFamily:T.font }}>TOP HOLDING</div>
+                  <div style={{ color:T.text0, fontFamily:T.font, fontSize:14, fontWeight:700, marginTop:3 }}>{kpis.topHolding}</div>
+                  <div style={{ color:T.text2, fontSize:7.5, fontFamily:T.font, marginTop:1 }}>symbol</div>
+                </div>
+                <div style={{ flex:1, background:T.bg2, border:`1px solid ${T.border}`, borderRadius:6, padding:"7px 10px", minWidth:70 }}>
+                  <div style={{ color:T.text2, fontSize:7.5, letterSpacing:1.5, fontFamily:T.font }}>CONCENTRATION</div>
+                  <div style={{ color:T.text0, fontFamily:T.font, fontSize:14, fontWeight:700, marginTop:3 }}>{kpis.concentration.toFixed(0)}%</div>
+                  <div style={{ color:T.text2, fontSize:7.5, fontFamily:T.font, marginTop:1 }}>top 5%</div>
+                </div>
+                <div style={{ flex:1, background:T.bg2, border:`1px solid ${T.border}`, borderRadius:6, padding:"7px 10px", minWidth:70 }}>
+                  <div style={{ color:T.text2, fontSize:7.5, letterSpacing:1.5, fontFamily:T.font }}>SECTORS</div>
+                  <div style={{ color:T.text0, fontFamily:T.font, fontSize:14, fontWeight:700, marginTop:3 }}>{kpis.sectorCount}</div>
+                  <div style={{ color:T.text2, fontSize:7.5, fontFamily:T.font, marginTop:1 }}>count</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Performance chart */}
+          <div className="card">
+            <SectionHeader title="Performance"/>
+            <div style={{ padding:13 }}>
+              <EmptyChart height={95} label="No closed trades"/>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Closed Trades */}
+      <div className="card">
+        <SectionHeader title="Closed Trades">
+          <button className="btn-ghost" style={{ fontSize:9 }}>EXPORT CSV</button>
+        </SectionHeader>
+        <EmptyState icon="◇" label="NO CLOSED TRADES" sub="Completed positions will appear here" h={90}/>
+      </div>
+    </div>
+  );
+}
+
+// ─── App Shell ────────────────────────────────────────────────────────────────
+export default function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp = 'all', sector: sectorProp = 'ALL', onSourceChange, onSectorChange, onThemeChange, currentTheme = 'auto' }) {
+  const [page,          setPage]         = useState("dashboard");
+  const [sideCollapsed, setSideCollapsed]= useState(false);
+  const [headerPanel,   setHeaderPanel]  = useState(null); // "notifications" | "settings" | "signals" | null
+  
+  // Get theme-aware design tokens
+  const T = useMemo(() => getThemeTokens(darkModeProp), [darkModeProp]);
+  
+  // Multi-sector selection — default ALL or from props
+  const [selectedSectors, setSelectedSectors] = useState(() => {
+    if (sectorProp && sectorProp !== 'ALL') {
+      return [sectorProp.toUpperCase()];
+    }
+    return ["ALL"];
+  });
+
+  // WebSocket state for live ticker data
+  const [tickers, setTickers] = useState(new Map());
+  const wsRef = useRef(null);
+
+  // Market session — rechecked every 30s; drives auto-subMode + sidebar chip
+  const [marketSession, setMarketSession] = useState(getMarketSession);
+  useEffect(() => {
+    const id = setInterval(() => setMarketSession(getMarketSession()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Sync with parent props
+  useEffect(() => {
+    if (sectorProp && sectorProp !== 'ALL') {
+      setSelectedSectors([sectorProp.toUpperCase()]);
+    } else {
+      setSelectedSectors(["ALL"]);
+    }
+  }, [sectorProp]);
+
+  // FIX #6: use a mutable ref as the primary ticker store so ticks never
+  // trigger a full Map copy on every message. A throttled interval flushes
+  // the ref into React state at most once every 250 ms, keeping the UI
+  // responsive without copying 1 500+ entries on every price update.
+  const tickerCacheRef = useRef(new Map());
+
+  // ── Live Notifications ────────────────────────────────────────────────────
+  // Accumulates real alerts fired by WS ticks. Capped at 50 entries (ring buffer).
+  // Each entry: { id, type, icon, color, title, sub, time, ticker, ts }
+  const [notifications,    setNotifications]    = useState([]);
+  const [unreadCount,      setUnreadCount]       = useState(0);
+  const notifRef           = useRef([]);          // mutable buffer — same pattern as tickerCacheRef
+  // Per-ticker cooldown: don't re-alert same ticker+type within 60 s
+  const notifCooldownRef   = useRef({});          // { "AAPL_vol": timestamp }
+  const NOTIF_CAP          = 50;
+  const NOTIF_COOLDOWN_MS  = 60_000;
+
+  const _pushNotif = (entry) => {
+    const key = `${entry.ticker}_${entry.type}`;
+    const now  = Date.now();
+    if ((notifCooldownRef.current[key] || 0) + NOTIF_COOLDOWN_MS > now) return; // still in cooldown
+    notifCooldownRef.current[key] = now;
+    const next = [{ ...entry, id: now + Math.random(), ts: now }, ...notifRef.current].slice(0, NOTIF_CAP);
+    notifRef.current = next;
+    setNotifications([...next]);
+    setUnreadCount(c => c + 1);
+  };
+
+  // WebSocket connection for live data
+  // FIX #4: 'cancelled' flag prevents onclose from spawning new sockets
+  // after the effect cleanup runs (React strict-mode double-mount / hot reload).
+  //
+  // KEEPALIVE FIX:
+  //   Render (and most proxies) drop idle TCP connections after ~55 s.
+  //   The server sends {"type":"ping"} every 30 s.  We reply with
+  //   {"type":"pong"} so the server's receive loop knows we're alive.
+  //   We also send our own heartbeat every 30 s in case the server ping
+  //   is buffered or swallowed by an intermediate proxy.
+  useEffect(() => {
+    const WS_URL = import.meta.env.VITE_WS_URL ||
+      (import.meta.env.PROD
+        ? `wss://${window.location.host}/ws/live`
+        : 'ws://localhost:8000/ws/live');
+
+    let cancelled = false;   // FIX #4: guards the reconnect timer
+    let heartbeatTimer = null;
+
+    const connectWS = () => {
+      if (cancelled) return;   // don't open a new socket after cleanup
+      const ws = new WebSocket(WS_URL);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        console.log('[NexRadar] WebSocket connected');
+        // Client-side heartbeat: send a ping every 30 s so the proxy sees
+        // traffic in the client→server direction even between market ticks.
+        heartbeatTimer = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping' }));
+          }
+        }, 30000);
+      };
+
+      ws.onmessage = async (event) => {
+        try {
+          let data = event.data;
+          if (data instanceof Blob) {
+            data = await data.text();
+          }
+          const msg = JSON.parse(data);
+
+          // Server keepalive ping — reply with pong immediately
+          if (msg.type === 'ping') {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'pong' }));
+            }
+            return;
+          }
+
+          // Ignore our own pong echo if server reflects it back
+          if (msg.type === 'pong') return;
+
+          if (msg.type === "snapshot") {
+            // Snapshot: replace entire cache and push straight to state
+            const m = new Map();
+            for (const row of msg.data ?? []) {
+              m.set(row.ticker, row);
+            }
+            tickerCacheRef.current = m;
+            setTickers(new Map(m));   // one full copy for snapshot is fine
+
+          } else if (msg.type === "tick") {
+            // FIX #6: mutate the ref in-place; NO Map copy here.
+            // The flush interval below will propagate it to React state.
+            const cache = tickerCacheRef.current;
+            const prev  = cache.get(msg.ticker) ?? {};
+            const next  = { ...prev, ...msg.data };
+            cache.set(msg.ticker, next);
+
+            // ── Live alert detection ──────────────────────────────────────
+            const d      = msg.data;
+            const ticker = msg.ticker;
+            const pct    = (d.percent_change ?? 0).toFixed(2);
+            const price  = d.live_price ? `$${(+d.live_price).toFixed(2)}` : "";
+
+            if (d.volume_spike && d.volume_spike_level === "high" && !prev.volume_spike) {
+              _pushNotif({ type:"vol", icon:"📡", color:"#00d4ff",
+                title:`${ticker} Volume Spike`,
+                sub:`${d.volume_ratio?.toFixed(1) ?? "?"}× avg vol · ${pct}% · ${price}`,
+                ticker });
+            }
+            if (d.is_gap_play && !prev.is_gap_play) {
+              const dir = d.gap_direction === "up" ? "↑" : "↓";
+              _pushNotif({ type:"gap", icon:"📊", color:"#f5a623",
+                title:`${ticker} Gap Play ${dir}`,
+                sub:`Gap ${d.gap_percent > 0 ? "+" : ""}${(d.gap_percent ?? 0).toFixed(2)}% · ${price}`,
+                ticker });
+            }
+            if (d.ah_momentum && !prev.ah_momentum) {
+              _pushNotif({ type:"ah", icon:"🌙", color:"#a78bfa",
+                title:`${ticker} AH Momentum`,
+                sub:`AH move exceeds regular session · ${price}`,
+                ticker });
+            }
+            if (d.went_positive === 1 && (prev.went_positive ?? 0) !== 1) {
+              _pushNotif({ type:"turn", icon:"🔄", color:"#22c55e",
+                title:`${ticker} Turned Positive`,
+                sub:`+${pct}% · ${price}`,
+                ticker });
+            }
+            if (d.is_earnings_gap_play && !prev.is_earnings_gap_play) {
+              _pushNotif({ type:"earn", icon:"📋", color:"#f97316",
+                title:`${ticker} Earnings Gap`,
+                sub:`Gap ${d.gap_percent > 0 ? "+" : ""}${(d.gap_percent ?? 0).toFixed(2)}% post-earnings · ${price}`,
+                ticker });
+            }
+            if (Math.abs(d.percent_change ?? 0) >= 5 && Math.abs(prev.percent_change ?? 0) < 5) {
+              _pushNotif({ type:"diamond", icon:"💎", color:"#00d4ff",
+                title:`${ticker} Diamond +5%`,
+                sub:`${pct}% · ${price}`,
+                ticker });
+            }
+          }
+        } catch (err) {
+          console.error('[NexRadar] WebSocket parse error:', err);
+        }
+      };
+
+      ws.onerror = () => {
+        console.error('[NexRadar] WebSocket error');
+      };
+
+      ws.onclose = () => {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+        if (cancelled) return;   // FIX #4: don't reconnect after unmount
+        console.log('[NexRadar] WebSocket closed, reconnecting...');
+        setTimeout(connectWS, 3000);
+      };
+    };
+
+    connectWS();
+
+    // FIX #6: flush tick buffer to React state at 250 ms intervals.
+    // This bounds re-renders to ≤4/s regardless of tick rate.
+    const flushInterval = setInterval(() => {
+      if (!cancelled) {
+        setTickers(new Map(tickerCacheRef.current));
+      }
+    }, 250);
+
+    return () => {
+      cancelled = true;   // FIX #4: block any pending reconnect timers
+      clearInterval(flushInterval);
+      clearInterval(heartbeatTimer);
+      if (wsRef.current) {
+        wsRef.current.onclose = null;   // prevent the handler from firing during intentional close
+        wsRef.current.close();
+      }
+    };
+  }, []);
+
+  // Calculate sector performance from live ticker data
+  const sectorPerformance = useMemo(() => {
+    const allRows = Array.from(tickers.values());
+    const performance = {};
+
+    SECTORS.forEach(sector => {
+      if (sector.id === "ALL" || sector.id === "EARNINGS") return;
+
+      // Filter tickers by sector using normalization
+      const sectorTickers = allRows.filter(row => {
+        const normalizedSector = normalizeSector(row.sector);
+        return normalizedSector === sector.id;
+      });
+
+      if (sectorTickers.length === 0) {
+        performance[sector.id] = { avgReturn: 0, count: 0, gainers: 0, losers: 0 };
+        return;
+      }
+
+      // Calculate average percent change
+      const totalReturn = sectorTickers.reduce((sum, row) => sum + (row.percent_change || 0), 0);
+      const avgReturn = totalReturn / sectorTickers.length;
+
+      // Count gainers and losers
+      const gainers = sectorTickers.filter(row => (row.percent_change || 0) > 0).length;
+      const losers = sectorTickers.filter(row => (row.percent_change || 0) < 0).length;
+
+      performance[sector.id] = {
+        avgReturn: parseFloat(avgReturn.toFixed(2)),
+        count: sectorTickers.length,
+        gainers,
+        losers,
+      };
+    });
+
+    return performance;
+  }, [tickers]);
+
+  const current = NAV.find(n => n.id === page);
+
+  const handleSectorChange = (sectorIds) => {
+    setSelectedSectors(sectorIds);
+    // Notify parent if callback provided
+    if (onSectorChange) {
+      onSectorChange(sectorIds[0] || 'ALL');
+    }
+  };
+
+  const renderPage = () => {
+    switch (page) {
+      case "dashboard": return <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange} onNavigate={setPage} sectorPerformance={sectorPerformance} tickers={tickers} T={T} />;
+      case "live":      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} T={T} />;
+      case "chart":     return <PageChart T={T} />;
+      case "signals":   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} T={T} />;
+      case "earnings":  return <PageEarnings T={T} />;
+      case "portfolio": return <PagePortfolio tickers={tickers} marketSession={marketSession} T={T} />;
+      default:          return null;
+    }
+  };
+
+  const activeLabel = selectedSectors.includes("ALL") ? null : selectedSectors.join(" + ");
+  const tickerTotal = computeSectorTotal(selectedSectors);
+
+  return (
+    <div style={{ display:"flex", height:"100vh", background:T.bg0, color:T.text0, fontFamily:T.font, overflow:"hidden" }}>
+      <style>{getCSS(T)}</style>
+
+      {/* ── SIDEBAR ── */}
+      <div style={{ width:sideCollapsed?56:218, minWidth:sideCollapsed?56:218, background:T.bg1, borderRight:`1px solid ${T.border}`, display:"flex", flexDirection:"column", transition:"width 0.22s,min-width 0.22s", overflow:"hidden" }}>
+        {/* Logo */}
+        <div style={{ padding:"17px 13px", borderBottom:`1px solid ${T.border}`, display:"flex", alignItems:"center", gap:10, overflow:"hidden", flexShrink:0 }}>
+          <div style={{ width:30, height:30, borderRadius:7, background:`linear-gradient(135deg,${T.cyan},#0055bb)`, display:"flex", alignItems:"center", justifyContent:"center", fontWeight:800, color:"#000", fontSize:13, flexShrink:0 }}>N</div>
+          {!sideCollapsed && (
+            <div>
+              <div style={{ fontFamily:T.fontSans, fontWeight:800, fontSize:13.5, color:T.text0, letterSpacing:2.5, whiteSpace:"nowrap" }}>NEXRADAR</div>
+              <div style={{ color:T.text2, fontSize:7.5, letterSpacing:3.5, whiteSpace:"nowrap" }}>PROFESSIONAL</div>
+            </div>
+          )}
+        </div>
+
+        {/* Status */}
+        {!sideCollapsed && (
+          <div style={{ padding:"9px 13px", borderBottom:`1px solid ${T.border}`, display:"flex", gap:7, flexShrink:0 }}>
+            <Chip color={T.green}>● LIVE</Chip>
+            <Chip color={T[SESSION_META[marketSession].chipColorKey]}>{SESSION_META[marketSession].chipLabel}</Chip>
+          </div>
+        )}
+
+        {/* Nav */}
+        <nav style={{ padding:"9px 7px", flex:1, display:"flex", flexDirection:"column", gap:2 }}>
+          {NAV.map(n=>(
+            <button key={n.id} className={`nav-btn${page===n.id?" active":""}`} onClick={()=>setPage(n.id)} title={sideCollapsed?n.label:""}>
+              <span className="icon">{n.icon}</span>
+              {!sideCollapsed && <span style={{ whiteSpace:"nowrap" }}>{n.label}</span>}
+            </button>
+          ))}
+        </nav>
+
+        {/* Signal Engine */}
+        {!sideCollapsed && (
+          <div style={{ padding:13, borderTop:`1px solid ${T.border}`, flexShrink:0 }}>
+            <div style={{ color:T.text2, fontSize:8.5, letterSpacing:2, marginBottom:9 }}>SIGNAL ENGINE</div>
+            <div style={{ display:"flex", gap:7, marginBottom:8 }}>
+              {[["WATCHING","—"],["SIGNALS","—"],["BARS","—"]].map(([l,v])=>(
+                <div key={l} style={{ flex:1, background:T.bg2, border:`1px solid ${T.border}`, borderRadius:5, padding:"5px 7px", textAlign:"center" }}>
+                  <div style={{ color:T.text2, fontSize:7.5, letterSpacing:1 }}>{l}</div>
+                  <div style={{ color:T.cyan, fontFamily:T.font, fontSize:14, fontWeight:700, marginTop:2 }}>{v}</div>
+                </div>
+              ))}
+            </div>
+            <button className="btn-primary" style={{ width:"100%", padding:"8px 0", fontSize:10 }}>✓ APPLY WATCHLIST</button>
+          </div>
+        )}
+
+        <button onClick={()=>setSideCollapsed(c=>!c)}
+          style={{ background:"none", border:"none", borderTop:`1px solid ${T.border}`, color:T.text2, padding:"10px", cursor:"pointer", fontFamily:T.font, fontSize:16, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+          {sideCollapsed?"›":"‹"}
+        </button>
+      </div>
+
+      {/* ── MAIN ── */}
+      <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+        {/* Top bar */}
+        <div style={{ background:T.bg1, borderBottom:`1px solid ${T.border}`, padding:"0 20px", height:56, display:"flex", alignItems:"center", gap:14, flexShrink:0, position:"relative" }}>
+          <span style={{ fontFamily:T.font, fontWeight:700, fontSize:16, color:T.text0, letterSpacing:0.5 }}>
+            {current?.icon}&nbsp;{current?.label.toUpperCase()}
+          </span>
+          {activeLabel && (
+            <div style={{ display:"flex", alignItems:"center", gap:6, background:T.cyan+"10", border:`1px solid ${T.cyan}30`, borderRadius:6, padding:"4px 12px" }}>
+              <span style={{ color:T.cyan, fontSize:11, letterSpacing:0.5, fontFamily:T.font, fontWeight:600 }}>{activeLabel}</span>
+              <span style={{ color:T.cyan, fontSize:10, fontFamily:T.font }}>· {tickerTotal.toLocaleString()}</span>
+              <button onClick={()=>setSelectedSectors(["ALL"])} style={{ background:"none", border:"none", color:T.cyan, cursor:"pointer", fontSize:13, padding:0, lineHeight:1, opacity:0.7 }} onMouseEnter={e=>e.target.style.opacity=1} onMouseLeave={e=>e.target.style.opacity=0.7}>✕</button>
+            </div>
+          )}
+          <div style={{ flex:1 }}/>
+          
+          {/* Search Input */}
+          <input placeholder="Search symbol…"
+            style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:6, padding:"8px 14px", color:T.text0, fontFamily:T.font, fontSize:13, outline:"none", width:180 }}
+            onFocus={e=>e.target.style.borderColor=T.cyanMid}
+            onBlur={e=>e.target.style.borderColor=T.border}/>
+          
+          <div style={{ width:1, height:24, background:T.border }}/>
+          
+          {/* System Status */}
+          <div style={{ 
+            display:"flex", 
+            alignItems:"center", 
+            gap:6, 
+            background:T.greenDim, 
+            border:`1px solid ${T.green}30`, 
+            borderRadius:6, 
+            padding:"6px 12px",
+            cursor:"pointer"
+          }}
+          title="System Status: All services operational">
+            <span style={{ width:8, height:8, borderRadius:"50%", background:T.green, animation:"dotblink 1.4s ease-in-out infinite" }}/>
+            <span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:600, letterSpacing:0.3 }}>SYS OK</span>
+          </div>
+          
+          {/* Notifications Button */}
+          <button 
+            onClick={() => { setHeaderPanel(p => p === "notifications" ? null : "notifications"); setUnreadCount(0); }}
+            style={{ 
+              width:36, height:36, borderRadius:6, background: headerPanel==="notifications" ? T.cyanDim : T.bg2, 
+              border:`1px solid ${headerPanel==="notifications" ? T.cyanMid : T.border}`, 
+              display:"flex", alignItems:"center", justifyContent:"center", 
+              cursor:"pointer", color: headerPanel==="notifications" ? T.cyan : T.text1, 
+              fontSize:16, position:"relative", transition:"all 0.2s"
+            }}
+            onMouseEnter={e => { if(headerPanel!=="notifications"){ e.currentTarget.style.borderColor=T.cyanMid; e.currentTarget.style.color=T.cyan; }}}
+            onMouseLeave={e => { if(headerPanel!=="notifications"){ e.currentTarget.style.borderColor=T.border; e.currentTarget.style.color=T.text1; }}}
+            title="Notifications"
+          >
+            🔔
+            {unreadCount > 0 && (
+              <span style={{ position:"absolute", top:3, right:3, minWidth:16, height:16, borderRadius:8,
+                background:T.red, border:`2px solid ${T.bg1}`, color:"#fff",
+                fontSize:9, fontWeight:700, fontFamily:T.font,
+                display:"flex", alignItems:"center", justifyContent:"center", padding:"0 3px" }}>
+                {unreadCount > 9 ? "9+" : unreadCount}
+              </span>
+            )}
+            {unreadCount === 0 && (
+              <span style={{ position:"absolute", top:4, right:4, width:8, height:8, borderRadius:"50%", background:T.border, border:`2px solid ${T.bg1}` }}/>
+            )}
+          </button>
+          
+          {/* Settings Button */}
+          <button 
+            onClick={() => setHeaderPanel(p => p === "settings" ? null : "settings")}
+            style={{ 
+              width:36, height:36, borderRadius:6, background: headerPanel==="settings" ? T.cyanDim : T.bg2, 
+              border:`1px solid ${headerPanel==="settings" ? T.cyanMid : T.border}`, 
+              display:"flex", alignItems:"center", justifyContent:"center", 
+              cursor:"pointer", color: headerPanel==="settings" ? T.cyan : T.text1, 
+              fontSize:16, transition:"all 0.2s"
+            }}
+            onMouseEnter={e => { if(headerPanel!=="settings"){ e.currentTarget.style.borderColor=T.cyanMid; e.currentTarget.style.color=T.cyan; }}}
+            onMouseLeave={e => { if(headerPanel!=="settings"){ e.currentTarget.style.borderColor=T.border; e.currentTarget.style.color=T.text1; }}}
+            title="Settings"
+          >
+            ⚙️
+          </button>
+          
+          {/* Signal Watchlist Button */}
+          <button
+            onClick={() => setHeaderPanel(p => p === "signals" ? null : "signals")}
+            style={{
+              width:36, height:36, borderRadius:6, background: headerPanel==="signals" ? T.cyanDim : T.bg2,
+              border:`1px solid ${headerPanel==="signals" ? T.cyanMid : T.border}`,
+              display:"flex", alignItems:"center", justifyContent:"center",
+              cursor:"pointer", color: headerPanel==="signals" ? T.cyan : T.text1,
+              fontSize:16, transition:"all 0.2s"
+            }}
+            onMouseEnter={e => { if(headerPanel!=="signals"){ e.currentTarget.style.borderColor=T.cyanMid; e.currentTarget.style.color=T.cyan; }}}
+            onMouseLeave={e => { if(headerPanel!=="signals"){ e.currentTarget.style.borderColor=T.border; e.currentTarget.style.color=T.text1; }}}
+            title="Signal Engine"
+          >
+            ⚡
+          </button>
+
+          {/* Theme Selector */}
+          {onThemeChange && (
+            <div style={{ position:"relative", display:"inline-block" }} className="theme-selector-group">
+              <button 
+                style={{ 
+                  width:36, height:36, borderRadius:6, background:T.bg2, border:`1px solid ${T.border}`, 
+                  display:"flex", alignItems:"center", justifyContent:"center", 
+                  cursor:"pointer", color:T.text1, fontSize:16, transition:"all 0.2s"
+                }}
+                onMouseEnter={e => { e.currentTarget.style.borderColor=T.cyanMid; e.currentTarget.style.color=T.cyan; }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor=T.border; e.currentTarget.style.color=T.text1; }}
+                title="Change theme"
+              >
+                {currentTheme === 'light' ? '☀️' : currentTheme === 'dark' ? '🌙' : currentTheme === 'high-contrast' ? '◐' : '⚡'}
+              </button>
+              <div className="theme-dropdown" style={{ 
+                position:"absolute", right:0, top:"calc(100% + 8px)", width:220, 
+                background:T.bg1, border:`1px solid ${T.border}`, borderRadius:8, 
+                boxShadow:"0 8px 24px rgba(0,0,0,0.4)", zIndex:9999,
+                opacity:0, visibility:"hidden", transition:"opacity 0.2s, visibility 0.2s", padding:8
+              }}>
+                {[
+                  { id:'light', icon:'☀️', label:'Light' },
+                  { id:'dark', icon:'🌙', label:'Dark' },
+                  { id:'high-contrast', icon:'◐', label:'High Contrast' },
+                  { id:'auto', icon:'⚡', label:'Auto (Day/Night)' },
+                ].map(({ id, icon, label }) => (
+                  <div key={id} onClick={() => onThemeChange(id)}
+                    style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:10,
+                      padding:"10px 14px", borderRadius:6, cursor:"pointer",
+                      background: currentTheme===id ? T.cyan+"14" : "transparent",
+                      color: currentTheme===id ? T.cyan : T.text1,
+                      fontFamily:T.font, fontSize:13, fontWeight:500, transition:"all 0.15s"
+                    }}
+                    onMouseEnter={e => { if(currentTheme!==id) e.currentTarget.style.background=T.bg2; }}
+                    onMouseLeave={e => { if(currentTheme!==id) e.currentTarget.style.background="transparent"; }}
+                  >
+                    <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                      <span style={{ fontSize:16 }}>{icon}</span><span>{label}</span>
+                    </div>
+                    {currentTheme===id && <span style={{ color:T.cyan, fontSize:14, fontWeight:700 }}>✓</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* User Avatar */}
+          <div style={{ width:32, height:32, borderRadius:6, background:T.cyanDim, border:`1px solid ${T.cyanMid}`, display:"flex", alignItems:"center", justifyContent:"center", color:T.cyan, fontWeight:800, fontSize:13, cursor:"pointer", letterSpacing:0.5 }}
+            title="Account"
+          >S</div>
+
+          {/* ── Dropdown Panels ── */}
+          {headerPanel && (
+            <div style={{ position:"fixed", inset:0, zIndex:9998 }} onClick={() => setHeaderPanel(null)}/>
+          )}
+
+          {/* Notifications Panel */}
+          {headerPanel === "notifications" && (
+            <div style={{ position:"absolute", right:20, top:64, width:340, maxHeight:480, display:"flex", flexDirection:"column", background:T.bg1, border:`1px solid ${T.border}`, borderRadius:10, boxShadow:"0 12px 40px rgba(0,0,0,0.5)", zIndex:9999, overflow:"hidden" }}>
+              <div style={{ padding:"14px 16px", borderBottom:`1px solid ${T.border}`, display:"flex", justifyContent:"space-between", alignItems:"center", flexShrink:0 }}>
+                <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                  <span style={{ color:T.text0, fontFamily:T.font, fontWeight:700, fontSize:13 }}>Notifications</span>
+                  {notifications.length > 0 && (
+                    <span style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:10, padding:"1px 7px", color:T.text2, fontFamily:T.font, fontSize:10 }}>{notifications.length}</span>
+                  )}
+                </div>
+                <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                  {notifications.length > 0 && (
+                    <button onClick={() => { notifRef.current = []; setNotifications([]); setUnreadCount(0); }}
+                      style={{ background:"none", border:"none", color:T.text2, cursor:"pointer", fontFamily:T.font, fontSize:11, padding:0 }}>
+                      Clear all
+                    </button>
+                  )}
+                  <button onClick={() => setHeaderPanel(null)} style={{ background:"none", border:"none", color:T.text2, cursor:"pointer", fontSize:16, padding:0 }}>✕</button>
+                </div>
+              </div>
+
+              <div style={{ overflowY:"auto", flex:1 }}>
+                {notifications.length === 0 ? (
+                  <div style={{ padding:"32px 16px", textAlign:"center" }}>
+                    <div style={{ fontSize:28, marginBottom:10 }}>🔔</div>
+                    <div style={{ color:T.text2, fontFamily:T.font, fontSize:12 }}>No alerts yet</div>
+                    <div style={{ color:T.text2, fontFamily:T.font, fontSize:11, marginTop:4, opacity:0.6 }}>
+                      Volume spikes, gap plays, AH momentum<br/>and signals will appear here live
+                    </div>
+                  </div>
+                ) : notifications.map((n) => {
+                  const elapsed = Math.floor((Date.now() - n.ts) / 1000);
+                  const timeStr = elapsed < 60 ? `${elapsed}s ago`
+                    : elapsed < 3600 ? `${Math.floor(elapsed/60)}m ago`
+                    : `${Math.floor(elapsed/3600)}h ago`;
+                  return (
+                    <div key={n.id}
+                      onClick={() => { setPage("live"); setHeaderPanel(null); }}
+                      style={{ padding:"11px 16px", borderBottom:`1px solid ${T.border}`, display:"flex", gap:11, alignItems:"flex-start", cursor:"pointer", transition:"background 0.12s" }}
+                      onMouseEnter={e=>e.currentTarget.style.background=T.bg2}
+                      onMouseLeave={e=>e.currentTarget.style.background="transparent"}
+                    >
+                      <div style={{ width:32, height:32, borderRadius:7, background:n.color+"18", border:`1px solid ${n.color}30`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, flexShrink:0 }}>{n.icon}</div>
+                      <div style={{ flex:1, minWidth:0 }}>
+                        <div style={{ color:T.text0, fontFamily:T.font, fontSize:12, fontWeight:600, display:"flex", justifyContent:"space-between", alignItems:"center", gap:6 }}>
+                          <span style={{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{n.title}</span>
+                          <span style={{ color:T.text2, fontSize:10, flexShrink:0 }}>{timeStr}</span>
+                        </div>
+                        <div style={{ color:T.text2, fontFamily:T.font, fontSize:11, marginTop:2, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{n.sub}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div style={{ padding:"10px 16px", borderTop:`1px solid ${T.border}`, flexShrink:0, textAlign:"center" }}>
+                <button onClick={() => { setPage("signals"); setHeaderPanel(null); }}
+                  style={{ background:"none", border:"none", color:T.cyan, fontFamily:T.font, fontSize:12, cursor:"pointer", fontWeight:600 }}>
+                  View all signals →
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Settings Panel */}
+          {headerPanel === "settings" && (
+            <div style={{ position:"absolute", right:20, top:64, width:300, background:T.bg1, border:`1px solid ${T.border}`, borderRadius:10, boxShadow:"0 12px 40px rgba(0,0,0,0.5)", zIndex:9999, overflow:"hidden" }}>
+              <div style={{ padding:"14px 16px", borderBottom:`1px solid ${T.border}`, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                <span style={{ color:T.text0, fontFamily:T.font, fontWeight:700, fontSize:13 }}>Settings</span>
+                <button onClick={() => setHeaderPanel(null)} style={{ background:"none", border:"none", color:T.text2, cursor:"pointer", fontSize:16, padding:0 }}>✕</button>
+              </div>
+              {[
+                { label:"Broadcast Throttle", key:"throttle", value:"350ms", note:"Min interval between tick broadcasts" },
+                { label:"Portfolio Refresh", key:"portfolio", value:"30s", note:"How often portfolio/monitor reloads" },
+                { label:"Display Cap", key:"cap", value:"1 600 tickers", note:"Max tickers shown across all sectors" },
+                { label:"AH Close Refresh", key:"ah", value:"120s", note:"After-hours closing price refresh rate" },
+              ].map(s => (
+                <div key={s.key} style={{ padding:"11px 16px", borderBottom:`1px solid ${T.border}` }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                    <span style={{ color:T.text1, fontFamily:T.font, fontSize:12, fontWeight:600 }}>{s.label}</span>
+                    <span style={{ color:T.cyan, fontFamily:T.font, fontSize:12, fontWeight:700 }}>{s.value}</span>
+                  </div>
+                  <div style={{ color:T.text2, fontFamily:T.font, fontSize:10, marginTop:3 }}>{s.note}</div>
+                </div>
+              ))}
+              <div style={{ padding:"12px 16px", borderBottom:`1px solid ${T.border}` }}>
+                <div style={{ color:T.text1, fontFamily:T.font, fontSize:12, fontWeight:600, marginBottom:8 }}>Theme</div>
+                <div style={{ display:"flex", gap:6 }}>
+                  {[["🌙","dark"],["☀️","light"],["⚡","auto"]].map(([icon,id]) => (
+                    <button key={id} onClick={() => onThemeChange && onThemeChange(id)}
+                      style={{ flex:1, padding:"6px 0", borderRadius:6, border:`1px solid ${currentTheme===id ? T.cyanMid : T.border}`, background:currentTheme===id ? T.cyanDim : T.bg2, color:currentTheme===id ? T.cyan : T.text2, fontFamily:T.font, fontSize:12, cursor:"pointer", transition:"all 0.15s" }}>
+                      {icon} {id}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div style={{ padding:"12px 16px", display:"flex", gap:8 }}>
+                <button onClick={() => setHeaderPanel(null)} style={{ flex:1, padding:"8px 0", borderRadius:6, border:`1px solid ${T.border}`, background:T.bg2, color:T.text1, fontFamily:T.font, fontSize:12, cursor:"pointer" }}>Close</button>
+                <button onClick={() => { setPage("dashboard"); setHeaderPanel(null); }} style={{ flex:1, padding:"8px 0", borderRadius:6, border:"none", background:T.cyan, color:"#000", fontFamily:T.font, fontSize:12, fontWeight:700, cursor:"pointer" }}>Dashboard</button>
+              </div>
+            </div>
+          )}
+
+          {/* Signal Engine Panel */}
+          {headerPanel === "signals" && (
+            <div style={{ position:"absolute", right:20, top:64, width:300, background:T.bg1, border:`1px solid ${T.border}`, borderRadius:10, boxShadow:"0 12px 40px rgba(0,0,0,0.5)", zIndex:9999, overflow:"hidden" }}>
+              <div style={{ padding:"14px 16px", borderBottom:`1px solid ${T.border}`, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                <span style={{ color:T.text0, fontFamily:T.font, fontWeight:700, fontSize:13 }}>⚡ Signal Engine</span>
+                <button onClick={() => setHeaderPanel(null)} style={{ background:"none", border:"none", color:T.text2, cursor:"pointer", fontSize:16, padding:0 }}>✕</button>
+              </div>
+              <div style={{ padding:"12px 16px", display:"flex", gap:8 }}>
+                {[["WATCHING","—",T.cyan],["SIGNALS","—",T.green],["BARS","—",T.text1]].map(([l,v,c])=>(
+                  <div key={l} style={{ flex:1, background:T.bg2, border:`1px solid ${T.border}`, borderRadius:6, padding:"8px 6px", textAlign:"center" }}>
+                    <div style={{ color:T.text2, fontSize:8, letterSpacing:1 }}>{l}</div>
+                    <div style={{ color:c, fontFamily:T.font, fontSize:16, fontWeight:700, marginTop:3 }}>{v}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ padding:"0 16px 12px" }}>
+                <div style={{ color:T.text2, fontFamily:T.font, fontSize:10, marginBottom:6 }}>COOLDOWN · SESSION FILTER · ADX THRESHOLD</div>
+                {[["Signal Cooldown","120s"],["Min Score","0.45"],["Min Confidence","50%"],["Session Filter","Midday skipped"]].map(([l,v])=>(
+                  <div key={l} style={{ display:"flex", justifyContent:"space-between", padding:"5px 0", borderBottom:`1px solid ${T.border}` }}>
+                    <span style={{ color:T.text2, fontFamily:T.font, fontSize:11 }}>{l}</span>
+                    <span style={{ color:T.cyan, fontFamily:T.font, fontSize:11, fontWeight:600 }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+              <div style={{ padding:"12px 16px", display:"flex", gap:8 }}>
+                <button onClick={() => { setPage("signals"); setHeaderPanel(null); }} style={{ flex:1, padding:"8px 0", borderRadius:6, border:"none", background:T.cyan, color:"#000", fontFamily:T.font, fontSize:12, fontWeight:700, cursor:"pointer" }}>Open Signals Page</button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Global alert strip (hidden on live page — sector pills shown there instead) */}
+        {page !== "live" && (
+          <div style={{ background:T.bg1, borderBottom:`1px solid #080f1a`, padding:"7px 20px", display:"flex", gap:9, flexShrink:0, overflowX:"auto" }}>
+            {(() => {
+              const all = Array.from(tickers.values());
+              const counts = [
+                ["📡","VOL SPIKES", T.cyan,   all.filter(t => t.volume_spike).length],
+                ["📊","GAP PLAYS",  T.gold,   all.filter(t => t.is_gap_play).length],
+                ["🌙","AH MOMT.",   T.purple, all.filter(t => t.ah_momentum).length],
+                ["📋","EARN. GAPS", T.orange, all.filter(t => t.is_earnings_gap_play).length],
+                ["💎","DIAMOND",    T.cyan,   all.filter(t => Math.abs(t.percent_change || 0) >= 5).length],
+              ];
+              return counts.map(([icon,label,color,count]) => (
+                <div key={label}
+                  onClick={() => setPage("live")}
+                  style={{ display:"flex",alignItems:"center",gap:8,background:T.bg2,border:`1px solid ${T.border}`,borderRadius:7,padding:"5px 13px",cursor:"pointer",flexShrink:0,transition:"all 0.2s" }}
+                  onMouseEnter={e=>{e.currentTarget.style.borderColor=color+"40"; e.currentTarget.style.background=color+"08";}}
+                  onMouseLeave={e=>{e.currentTarget.style.borderColor=T.border; e.currentTarget.style.background=T.bg2;}}>
+                  <span style={{ fontSize:12 }}>{icon}</span>
+                  <span style={{ color:T.text2, fontSize:8.5, letterSpacing:1.5, fontFamily:T.font }}>{label}</span>
+                  <span style={{ color:count > 0 ? color : T.text2, fontFamily:T.font, fontSize:14, fontWeight:700 }}>{count > 0 ? count : "—"}</span>
+                </div>
+              ));
+            })()}
+          </div>
+        )}
+
+        {/* Page content */}
+        <div key={page} style={{ flex:1, overflowY:"auto", padding:18 }}>
+          {renderPage()}
+        </div>
+      </div>
     </div>
   );
 }

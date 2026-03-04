@@ -42,7 +42,8 @@ export const THRESHOLDS = {
 
 // LocalStorage keys
 export const STORAGE_KEYS = {
-  DARK_MODE: 'nexradar-dark-mode',
+  THEME: 'nexradar-theme',  // 'light', 'dark', 'high-contrast', 'auto'
+  DARK_MODE: 'nexradar-dark-mode',  // Legacy - kept for backwards compatibility
   LAST_TAB: 'nexradar-last-tab',
   LAST_SOURCE: 'nexradar-last-source',
   LAST_SECTOR: 'nexradar-last-sector',

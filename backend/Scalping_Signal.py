@@ -7,10 +7,10 @@
   Taps Polygon A.* (1-min aggregate) messages from the existing
   single WebSocket connection. No new connections. No new threads.
 
-  DEFAULT WATCHLIST (25 symbols):
-    AAPL, LITE, GOOGL, LMT, SNDK, WDC, ORCL, MU, NVDA, SPOT,
-    SHOP, AMD, TSLA, GRMN, META, RKLB, STX, CHTR, AMZN, DE,
-    TER, IDCC, MSFT, MDB, AVGO
+  WATCHLIST:
+    Empty by default - managed via frontend UI
+    User can add/remove symbols dynamically
+    Max 50 symbols
 
   SIGNAL SCORING WEIGHTS:
     Trend    30%  — EMA stack + VWAP position
@@ -528,14 +528,10 @@ class SignalWatchlistManager:
         Load watchlist from JSON file on disk.
         Called automatically at StockDashboard init so the engine
         starts watching immediately without sidebar interaction.
-        Falls back to DEFAULT_WATCHLIST if file not found.
+        Falls back to empty watchlist if file not found.
         """
         import json
-        DEFAULT_WATCHLIST = [
-            "AAPL","LITE","GOOGL","LMT","SNDK","WDC","ORCL","MU","NVDA","SPOT",
-            "SHOP","AMD","TSLA","GRMN","META","RKLB","STX","CHTR","AMZN","DE",
-            "TER","IDCC","MSFT","MDB","AVGO",
-        ]
+        DEFAULT_WATCHLIST = []  # Empty by default - user manages via frontend
         try:
             if os.path.exists(path):
                 with open(path, "r") as f:
@@ -544,13 +540,13 @@ class SignalWatchlistManager:
                 logger.info(f"⚡ Signal watchlist loaded from {path}: {len(accepted)} symbols")
             else:
                 accepted = self.set_watchlist(DEFAULT_WATCHLIST)
-                # Save default to disk for next run
+                # Save empty list to disk for next run
                 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
                 with open(path, "w") as f:
                     json.dump(DEFAULT_WATCHLIST, f, indent=2)
-                logger.info(f"⚡ Signal watchlist defaulted to {len(accepted)} symbols, saved to {path}")
+                logger.info(f"⚡ Signal watchlist initialized empty, saved to {path}")
         except Exception as e:
-            logger.warning(f"Signal watchlist load failed ({e}), using defaults")
+            logger.warning(f"Signal watchlist load failed ({e}), using empty list")
             self.set_watchlist(DEFAULT_WATCHLIST)
 
     def add(self, symbol: str) -> bool:

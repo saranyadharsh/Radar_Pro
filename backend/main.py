@@ -91,14 +91,14 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_event_loop()
     engine = WSEngine(broadcast_cb=_broadcast, loop=loop)
 
-    tickers     = db.get_all_tickers()
-    company_map = db.get_company_map()
+    # FIX: use get_stock_meta() — one paginated pass instead of three separate calls
+    tickers, company_map, sector_map = db.get_stock_meta()
 
     if not tickers:
         logger.warning("No tickers in stock_list — run migrate_all.py first.")
     else:
         logger.info(f"Loaded {len(tickers)} tickers")
-        engine.start(tickers, company_map)
+        engine.start(tickers, company_map, sector_map)
 
     yield
 
@@ -135,6 +135,34 @@ async def health():
 @app.get("/api/metrics")
 async def get_metrics():
     return engine.get_metrics() if engine else {"error": "not ready"}
+
+
+# ── Debug: Sector Map ──────────────────────────────────────────────────────────
+@app.get("/api/debug/sectors")
+async def debug_sectors():
+    """Debug endpoint to check sector map"""
+    if not engine:
+        return {"error": "engine not ready"}
+    
+    sector_map = engine.sector_map
+    
+    # Count tickers per sector
+    sector_counts = {}
+    for ticker, sector in sector_map.items():
+        sector_counts[sector] = sector_counts.get(sector, 0) + 1
+    
+    # Sample tickers per sector
+    sector_samples = {}
+    for sector in sector_counts.keys():
+        samples = [t for t, s in sector_map.items() if s == sector][:5]
+        sector_samples[sector] = samples
+    
+    return {
+        "total_tickers": len(sector_map),
+        "sector_counts": sector_counts,
+        "sector_samples": sector_samples,
+        "sample_tickers": dict(list(sector_map.items())[:10])
+    }
 
 
 # ── Live tickers ───────────────────────────────────────────────────────────────
@@ -218,20 +246,18 @@ async def get_stock_list():
     for every symbol, even those not yet streaming via WebSocket.
     """
     try:
-        tickers = db.get_all_tickers()          # returns list of ticker strings
-        company_map = db.get_company_map()       # returns {ticker: {company_name, sector, ...}}
+        # FIX: use get_stock_meta() — one paginated pass for all three maps
+        tickers, company_map, sector_map = db.get_stock_meta()
         result = []
         for t in tickers:
-            meta = company_map.get(t, {})
             result.append({
                 "ticker":       t,
-                "company_name": meta.get("company_name") or meta.get("name") or "—",
-                "sector":       meta.get("sector") or "—",
+                "company_name": company_map.get(t) or "—",
+                "sector":       sector_map.get(t)  or "—",
             })
         return result
     except Exception as e:
         logger.error(f"stock-list error: {e}")
-        # Fallback: return WS snapshot which includes sector from v_live_enriched
         if engine:
             return engine.get_live_snapshot(limit=5000, only_positive=False)
         return []

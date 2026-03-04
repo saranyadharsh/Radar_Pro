@@ -67,7 +67,8 @@ GAP_EXTREME_THRESHOLD        = 10.0
 AH_MOMENTUM_MULTIPLIER       = 1.5
 PRICE_STALE_SECONDS          = 300
 AH_CLOSE_REFRESH_INTERVAL    = 120
-MAX_WEBSOCKET_TICKERS        = 1500
+MAX_WEBSOCKET_TICKERS        = 10000  # Polygon T+A supports unlimited — raised from 1500
+LIVE_DISPLAY_CAP             = 1600   # matches supabase_db.LIVE_DISPLAY_CAP
 WS_BACKOFF_BASE_DELAY        = 1.0
 WS_BACKOFF_MAX_DELAY         = 60.0
 
@@ -124,8 +125,8 @@ class WSEngine:
         self._monitor_tickers: Set[str]       = set()
         self._portfolio_tickers: Set[str]     = set()
         self._last_portfolio_refresh          = 0.0
-        # Refresh interval: 3s for responsive updates (matches SQLite local behavior)
-        self._PORTFOLIO_REFRESH_INTERVAL      = float(os.getenv("PORTFOLIO_REFRESH_INTERVAL", "3.0"))
+        # FIX #7: default was 3 s (10× too frequent). 30 s matches documented behaviour.
+        self._PORTFOLIO_REFRESH_INTERVAL      = float(os.getenv("PORTFOLIO_REFRESH_INTERVAL", "30.0"))
 
         # ── WebSocket state ────────────────────────────────────────────────────
         self.ws_health_status    = "connecting"
@@ -149,9 +150,10 @@ class WSEngine:
 
         # ── Source stats ──────────────────────────────────────────────────────
         self.source_stats = {
-            "total_attempted": 0,
-            "polygon_success": 0,
-            "yfinance_fallback": 0,
+            "total_attempted":  0,
+            "polygon_success":  0,   # tickers seeded by Polygon snapshot (primary)
+            "yfinance_success": 0,   # tickers rescued by yfinance (fallback)
+            "failed":           0,   # tickers with no data from either source
         }
 
         # ── Threading ─────────────────────────────────────────────────────────
@@ -159,6 +161,7 @@ class WSEngine:
         self.run_event.set()
 
         self._pending_writes: Dict[str, Dict] = {}
+        self._pending_writes_lock = threading.Lock()   # FIX #10: was unprotected
         self._last_db_flush  = time.time()
         self._DB_FLUSH_INTERVAL = 1.0
 
@@ -172,13 +175,16 @@ class WSEngine:
 
     # ── START / STOP ──────────────────────────────────────────────────────────
 
-    def start(self, tickers: List[str], company_map: Dict[str, str]):
-        self.all_tickers = set(tickers[:MAX_WEBSOCKET_TICKERS])
+    def start(self, tickers: List[str], company_map: Dict[str, str], sector_map: Dict[str, str] = None):
+        """
+        FIX #1: accepts sector_map from the caller (main.py passes it from
+        get_stock_meta() so we don't hit stock_list a 4th time here).
+        Falls back to db.get_sector_map() only if not provided (backward compat).
+        """
+        self.all_tickers = set(tickers)
         self.company_map = company_map
-
-        # ← SECTOR: Load sector map once at startup
-        self.sector_map = self.db.get_sector_map()
-        logger.info(f"Loaded sector map: {len(self.sector_map)} tickers with sector data")
+        self.sector_map  = sector_map if sector_map is not None else self.db.get_sector_map()
+        logger.info(f"Sector map: {len(self.sector_map)} tickers")
 
         # ← PORTFOLIO/MONITOR: Initial load
         self._refresh_portfolio_monitor()
@@ -428,12 +434,15 @@ class WSEngine:
         with self.alert_cache_lock:
             self.alert_cache[ticker] = cache_entry
 
-        self._pending_writes[ticker] = cache_entry
+        # FIX #10: lock around pending_writes to prevent lost ticks between
+        # .values() snapshot and .clear() when multiple WS threads flush concurrently
         now = time.time()
-        if now - self._last_db_flush >= self._DB_FLUSH_INTERVAL:
-            self.db_write_queue.put(list(self._pending_writes.values()))
-            self._pending_writes.clear()
-            self._last_db_flush = now
+        with self._pending_writes_lock:
+            self._pending_writes[ticker] = cache_entry
+            if now - self._last_db_flush >= self._DB_FLUSH_INTERVAL:
+                self.db_write_queue.put(list(self._pending_writes.values()))
+                self._pending_writes.clear()
+                self._last_db_flush = now
 
         is_priority = (
             abs(percent_change) >= 5.0 or
@@ -513,6 +522,16 @@ class WSEngine:
                 with self.historical_data_lock:
                     hist = self.historical_data.get(ticker)
                     if hist is None:
+                        # Ticker had no historical data — seed a minimal entry
+                        # so future WS ticks have a baseline to compute change from
+                        if official_close > 0:
+                            self.historical_data[ticker] = {
+                                "open":        official_close,
+                                "prev_close":  official_close,
+                                "today_close": official_close,
+                                "avg_volume":  0.0,
+                            }
+                            updated += 1
                         continue
                     old = hist.get("today_close", 0.0)
                     if abs(official_close - old) > 0.01:
@@ -531,18 +550,164 @@ class WSEngine:
     # ── HISTORICAL FETCH ──────────────────────────────────────────────────────
 
     def _fetch_historical_batch(self, tickers: List[str]):
+        """
+        Two-pass historical data seeding at startup:
+
+          Pass 1 — Polygon REST snapshot (PRIMARY, bulk):
+            Single paginated call covering all tickers. Returns open, prev_close,
+            today_close, avg_volume in one fast round-trip per batch of 100.
+            Skipped entirely if MASSIVE_API_KEY is not set.
+
+          Pass 2 — yfinance per-ticker (FALLBACK, threaded):
+            Runs only for tickers Polygon missed (not in response or zero prices).
+            30 worker threads, period="5d" interval="1d".
+
+        After both passes, remaining failures are logged and counted in
+        source_stats["failed"]. Those tickers will show 0% change until a
+        live WS tick arrives and self-corrects.
+        """
         logger.info(f"Fetching historical data for {len(tickers)} tickers …")
         self.source_stats["total_attempted"] = len(tickers)
 
-        def fetch_one(ticker):
+        failed_after_polygon: List[str] = list(tickers)  # assume all failed until seeded
+
+        # ── PASS 1: Polygon REST snapshot (primary, bulk) ────────────────────
+        if self.massive_api_key:
+            failed_after_polygon = self._fetch_polygon_snapshot_bulk(tickers)
+            logger.info(
+                f"Polygon pass complete — "
+                f"{self.source_stats['polygon_success']} seeded, "
+                f"{len(failed_after_polygon)} need yfinance fallback"
+            )
+        else:
+            logger.warning(
+                "MASSIVE_API_KEY not set — skipping Polygon snapshot, "
+                "falling back to yfinance for all tickers"
+            )
+
+        # ── PASS 2: yfinance fallback for any tickers Polygon missed ─────────
+        if failed_after_polygon:
+            self._fetch_yfinance_fallback(failed_after_polygon)
+
+        total_seeded = self.source_stats["polygon_success"] + self.source_stats["yfinance_success"]
+        logger.info(
+            f"Historical fetch complete — "
+            f"{total_seeded}/{len(tickers)} seeded "
+            f"(polygon={self.source_stats['polygon_success']}, "
+            f"yf={self.source_stats['yfinance_success']}, "
+            f"failed={self.source_stats['failed']})"
+        )
+
+    def _fetch_polygon_snapshot_bulk(self, tickers: List[str]) -> List[str]:
+        """
+        Polygon REST snapshot — primary bulk fetch at startup.
+
+        Batches tickers in groups of 100 (URL-length safe).
+        Polygon snapshot fields used:
+          day.o      → today's open price
+          day.c      → today's close (or last trade if still open)
+          day.av     → average daily volume (Polygon 30-day rolling)
+          prevDay.c  → previous session close  ← key for change_value calc
+          lastTrade.p → last trade price (used if day.c is 0, pre-market)
+
+        Returns list of tickers that were NOT successfully seeded (for yfinance
+        fallback). A ticker is considered failed if open <= 0 AND close <= 0.
+        """
+        BATCH_SIZE = 100
+        failed: List[str] = []
+        polygon_seeded = 0
+
+        for i in range(0, len(tickers), BATCH_SIZE):
+            batch       = tickers[i : i + BATCH_SIZE]
+            tickers_csv = ",".join(batch)
+            url = (
+                f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+                f"?tickers={tickers_csv}&apiKey={self.massive_api_key}"
+            )
+            try:
+                resp = requests.get(url, timeout=20)
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"Polygon snapshot HTTP {resp.status_code} "
+                        f"for batch {i}–{i + len(batch) - 1} — "
+                        f"queuing all {len(batch)} for yfinance fallback"
+                    )
+                    failed.extend(batch)
+                    continue
+
+                snap_map = {
+                    item["ticker"]: item
+                    for item in resp.json().get("tickers", [])
+                }
+
+                for ticker in batch:
+                    item = snap_map.get(ticker)
+                    if not item:
+                        # Ticker absent from Polygon response (unlisted, OTC, etc.)
+                        failed.append(ticker)
+                        continue
+
+                    day      = item.get("day",      {}) or {}
+                    prev_day = item.get("prevDay",   {}) or {}
+                    last_trade = item.get("lastTrade", {}) or {}
+
+                    open_price  = float(day.get("o",  0) or 0)
+                    today_close = float(day.get("c",  0) or 0)
+                    avg_vol     = float(day.get("av", 0) or 0)
+                    prev_close  = float(prev_day.get("c", 0) or 0)
+
+                    # Pre-market: day.c may be 0, use lastTrade.p as today_close seed
+                    if today_close <= 0:
+                        today_close = float(last_trade.get("p", 0) or 0)
+
+                    # Both open and close are zero → no useful data, send to yfinance
+                    if open_price <= 0 and today_close <= 0:
+                        failed.append(ticker)
+                        continue
+
+                    # Fill gaps with sensible substitutes
+                    if open_price  <= 0: open_price  = today_close
+                    if prev_close  <= 0: prev_close  = open_price
+                    if today_close <= 0: today_close = open_price
+
+                    with self.historical_data_lock:
+                        self.historical_data[ticker] = {
+                            "open":        open_price,
+                            "prev_close":  prev_close,
+                            "today_close": today_close,
+                            "avg_volume":  avg_vol,
+                        }
+                    polygon_seeded += 1
+
+            except Exception as e:
+                logger.error(f"Polygon snapshot batch {i}: {e} — queuing {len(batch)} for yfinance")
+                failed.extend(batch)
+
+        self.source_stats["polygon_success"] = polygon_seeded
+        return failed
+
+    def _fetch_yfinance_fallback(self, tickers: List[str]):
+        """
+        yfinance per-ticker fallback — runs only for tickers Polygon missed.
+        30 worker threads. period="5d" interval="1d" gives prev_close reliably.
+        Updates source_stats["yfinance_success"] and source_stats["failed"].
+        """
+        logger.info(f"yfinance fallback for {len(tickers)} tickers …")
+        yf_success = 0
+        yf_failed: List[str] = []
+
+        def fetch_one(ticker: str):
+            nonlocal yf_success
             try:
                 hist = yf.Ticker(ticker).history(period="5d", interval="1d")
                 if hist.empty:
+                    yf_failed.append(ticker)
                     return
+
                 today_close = float(hist["Close"].iloc[-1])
                 prev_close  = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else today_close
                 open_price  = float(hist["Open"].iloc[-1])
-                avg_vol     = float(hist["Volume"].mean()) if "Volume" in hist.columns else 0
+                avg_vol     = float(hist["Volume"].mean()) if "Volume" in hist.columns else 0.0
 
                 with self.historical_data_lock:
                     self.historical_data[ticker] = {
@@ -551,14 +716,24 @@ class WSEngine:
                         "today_close": today_close,
                         "avg_volume":  avg_vol,
                     }
-                self.source_stats["yfinance_fallback"] += 1
+                yf_success += 1
             except Exception as e:
-                logger.debug(f"Historical fetch failed {ticker}: {e}")
+                logger.debug(f"yfinance fallback failed {ticker}: {e}")
+                yf_failed.append(ticker)
 
         with ThreadPoolExecutor(max_workers=30) as ex:
             ex.map(fetch_one, tickers)
 
-        logger.info("Historical data fetch complete")
+        self.source_stats["yfinance_success"] = yf_success
+        self.source_stats["failed"]           = len(yf_failed)
+
+        if yf_failed:
+            logger.warning(
+                f"{len(yf_failed)} tickers have no historical data after both passes "
+                f"— they will show 0% change until a live WS tick arrives. "
+                f"Sample: {yf_failed[:10]}"
+            )
+        logger.info(f"yfinance fallback complete — {yf_success} seeded, {len(yf_failed)} failed")
 
     # ── PORTFOLIO/MONITOR REFRESH ─────────────────────────────────────────────
 
@@ -613,8 +788,9 @@ class WSEngine:
                 db_rows.append({
                     "ticker":              c["ticker"],
                     "company_name":        c.get("company_name", ""),
+                    "sector":              c.get("sector", "Unknown"),   # FIX #3
                     "live_price":          c.get("live_price", 0),
-                    "open_price":          c.get("open", 0),
+                    "open_price":          c.get("open", 0),             # FIX #2: cache key "open" → DB col "open_price"
                     "prev_close":          c.get("prev_close", 0),
                     "day_high":            c.get("hwm", 0),
                     "volume":              c.get("volume", 0),
@@ -641,33 +817,56 @@ class WSEngine:
 
     def get_live_snapshot(
         self,
-        limit: int = 1500,
+        limit: int = 1600,
         only_positive: bool = True,
         source: str = "all",
-        sector: str = "",           # ← SECTOR: new param
+        sector: str = "",
+        sectors: List[str] = None,
     ) -> List[Dict]:
+        """
+        Returns live ticker data from in-memory alert_cache.
+
+        sector / sectors:
+          - 'sector' (str): single sector name, kept for backward compat.
+          - 'sectors' (list): multi-sector list from the frontend sidebar.
+            If either contains "ALL" or is empty, no sector filter is applied.
+
+        Cap logic (matches supabase_db.LIVE_DISPLAY_CAP = 1 600):
+          - All / stock_list source: capped at 1 600 (1 500 display + 100 buffer).
+          - Portfolio / monitor: uncapped — users need all their own positions.
+          - If selected sectors total > 1 600 tickers, only the top movers
+            (by change_value) are returned; the lowest-ranked 100+ are dropped.
+        """
         with self.alert_cache_lock:
             rows = list(self.alert_cache.values())
 
         # Source filter
-        # "stock_list" and "all" show everything (stock_list IS all tickers)
         if source == "monitor":
             monitor_set = getattr(self, "_monitor_tickers", set())
             rows = [r for r in rows if r["ticker"] in monitor_set]
         elif source == "portfolio":
             portfolio_set = getattr(self, "_portfolio_tickers", set())
             rows = [r for r in rows if r["ticker"] in portfolio_set]
-        # "stock_list" and "all" → no ticker filter, just apply sector below
 
-        # ← SECTOR: filter by sector when Stock List is selected
-        if sector and sector not in ("", "all"):
-            rows = [r for r in rows if r.get("sector", "").lower() == sector.lower()]
+        # Sector filter — unify single 'sector' param and 'sectors' list
+        active_sectors: List[str] = []
+        if sectors:
+            active_sectors = [s for s in sectors if s and s.upper() != "ALL"]
+        elif sector and sector.upper() not in ("", "ALL"):
+            active_sectors = [sector]
+
+        if active_sectors:
+            lower = [s.lower() for s in active_sectors]
+            rows = [r for r in rows if r.get("sector", "").lower() in lower]
 
         if only_positive:
             rows = [r for r in rows if r.get("is_positive")]
 
         rows.sort(key=lambda r: r.get("change_value", 0), reverse=True)
-        return rows[:limit]
+
+        # Apply display cap for non-personal sources
+        cap = limit if source in ("portfolio", "monitor") else min(limit, LIVE_DISPLAY_CAP)
+        return rows[:cap]
 
     def get_metrics(self) -> Dict:
         with self.alert_cache_lock:
@@ -704,7 +903,12 @@ class WSEngine:
             "earnings_gap_plays": earnings_gaps,
             "diamond":            diamond_cnt,
             "session":            _get_market_status(),
-            "source_stats":       self.source_stats,
+            "source_stats":       {
+                "total_attempted":  self.source_stats.get("total_attempted",  0),
+                "polygon_success":  self.source_stats.get("polygon_success",  0),
+                "yfinance_success": self.source_stats.get("yfinance_success", 0),
+                "failed":           self.source_stats.get("failed",           0),
+            },
             "signal_watched":     len(self._signal_watcher.watched),
             "signal_count":       len(self._signal_engine.signal_history),
             "signal_bars":        len(self._signal_engine._calcs),

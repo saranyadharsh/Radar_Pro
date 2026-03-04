@@ -76,7 +76,7 @@ const BTNS = [
   { key: 'SHORT', label: '▼ SHORT',      active: 'border-red-400 text-red-400'         },
 ]
 
-export default function SignalFeed() {
+export default function SignalFeed({ darkMode = true }) {
   const [signals, setSignals] = useState([])
   const [filter,  setFilter]  = useState('TOTAL')
   const [loading, setLoading] = useState(true)
@@ -99,11 +99,20 @@ export default function SignalFeed() {
 
   const filtered = filter === 'TOTAL' ? signals : signals.filter(s => s.direction === filter)
 
-  // Active filter color
-  const fc = { TOTAL: '#c8d8f0', LONG: '#00e5a0', SHORT: '#ff4060' }[filter]
+  // Active filter color (theme-aware)
+  const fc = darkMode 
+    ? { TOTAL: '#c8d8f0', LONG: '#00e5a0', SHORT: '#ff4060' }[filter]
+    : { TOTAL: '#475569', LONG: '#16a34a', SHORT: '#dc2626' }[filter]
   const fl = filter === 'TOTAL' ? `Showing all ${total} signals`
     : filter === 'LONG' ? `Showing ${longs} LONG signal${longs !== 1 ? 's' : ''}`
     : `Showing ${shorts} SHORT signal${shorts !== 1 ? 's' : ''}`
+  
+  // Theme-aware colors
+  const textGray = darkMode ? 'text-gray-500' : 'text-slate-500'
+  const textGrayDark = darkMode ? 'text-gray-600' : 'text-slate-400'
+  const textGrayLight = darkMode ? 'text-gray-400' : 'text-slate-600'
+  const borderGray = darkMode ? 'border-gray-700' : 'border-slate-300'
+  const borderGrayHover = darkMode ? 'hover:border-gray-500' : 'hover:border-slate-400'
 
   return (
     <div className="flex flex-col gap-4">
@@ -114,7 +123,7 @@ export default function SignalFeed() {
           <button key={b.key} onClick={() => setFilter(b.key)}
             className={clsx(
               'px-4 py-2 rounded border text-xs font-bold transition-all min-w-[110px]',
-              filter === b.key ? b.active + ' bg-white/5' : 'border-gray-700 text-gray-500 hover:border-gray-500',
+              filter === b.key ? b.active + (darkMode ? ' bg-white/5' : ' bg-slate-100') : `${borderGray} ${textGray} ${borderGrayHover}`,
             )}>
             {b.label}<br />
             <span className="font-mono text-lg">{counts[b.key]}</span>
@@ -128,10 +137,10 @@ export default function SignalFeed() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Signal feed */}
         <div className="lg:col-span-2">
-          <p className="text-[10px] text-gray-500 tracking-widest mb-2">LIVE SIGNAL FEED</p>
-          {loading && <p className="text-gray-600 text-sm py-8 text-center">Loading…</p>}
+          <p className={clsx("text-[10px] tracking-widest mb-2", textGray)}>LIVE SIGNAL FEED</p>
+          {loading && <p className={clsx("text-sm py-8 text-center", textGrayDark)}>Loading…</p>}
           {!loading && filtered.length === 0 && (
-            <p className="text-gray-600 text-sm py-8 text-center">
+            <p className={clsx("text-sm py-8 text-center", textGrayDark)}>
               {total === 0
                 ? '⏳ Waiting for signals… engine warms up after 27 bars per symbol'
                 : `No ${filter} signals yet — try ALL SIGNALS or wait for next bar`}
@@ -142,8 +151,8 @@ export default function SignalFeed() {
 
         {/* Session guide */}
         <div>
-          <p className="text-[10px] text-gray-500 tracking-widest mb-3">SESSION GUIDE (ET)</p>
-          <div className="text-xs text-gray-400 space-y-2">
+          <p className={clsx("text-[10px] tracking-widest mb-3", textGray)}>SESSION GUIDE (ET)</p>
+          <div className={clsx("text-xs space-y-2", textGrayLight)}>
             {[
               ['🟡', '09:30–10:00', 'Open (volatile)'],
               ['🟢', '10:00–11:30', 'Best scalp window'],

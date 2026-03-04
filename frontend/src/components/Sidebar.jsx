@@ -12,11 +12,8 @@ import SectorFilter from './SectorFilter'
 
 const API = import.meta.env.VITE_API_BASE || ''
 
-const DEFAULT_WATCHLIST = [
-  'AAPL','LITE','GOOGL','LMT','SNDK','WDC','ORCL','MU','NVDA','SPOT',
-  'SHOP','AMD','TSLA','GRMN','META','RKLB','STX','CHTR','AMZN','DE',
-  'TER','IDCC','MSFT','MDB','AVGO',
-]
+// Empty default watchlist - users will add their own
+const DEFAULT_WATCHLIST = []
 
 function Section({ title, icon, children, defaultOpen = true }) {
   const [open, setOpen] = useState(defaultOpen)
