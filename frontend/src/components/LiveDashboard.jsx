@@ -203,17 +203,27 @@ export default function LiveDashboard({
   return (
     <div className={clsx(
       'flex flex-col gap-3 rounded-lg p-4',
-      darkMode ? 'bg-[#0a0f1a]' : 'bg-white'
+      darkMode ? 'bg-[#0a0f1a]' : 'bg-white shadow-sm'
     )}>
 
       {/* Closed warnings */}
       {session === 'OVERNIGHT_SLEEP' && (
-        <div className="bg-yellow-900/30 border border-yellow-700/50 rounded p-3 text-yellow-300 text-xs">
+        <div className={clsx(
+          'border rounded p-3 text-xs',
+          darkMode
+            ? 'bg-yellow-900/30 border-yellow-700/50 text-yellow-300'
+            : 'bg-yellow-50 border-yellow-300 text-yellow-900'
+        )}>
           🌙 MARKET CLOSED (Overnight 8 PM–4 AM EST) — Live data is unreliable until 4:00 AM EST.
         </div>
       )}
       {session === 'CLOSED_WEEKEND' && (
-        <div className="bg-blue-900/20 border border-blue-700/30 rounded p-3 text-blue-300 text-xs">
+        <div className={clsx(
+          'border rounded p-3 text-xs',
+          darkMode
+            ? 'bg-blue-900/20 border-blue-700/30 text-blue-300'
+            : 'bg-blue-50 border-blue-300 text-blue-900'
+        )}>
           🏖️ Market Closed (Weekend)
         </div>
       )}
@@ -221,14 +231,23 @@ export default function LiveDashboard({
       {/* Controls row */}
       <div className="flex items-center gap-4 flex-wrap">
         {/* View toggle — mirrors segmented control */}
-        <div className="flex rounded overflow-hidden border border-white/20 text-xs">
+        <div className={clsx(
+          'flex rounded overflow-hidden border text-xs',
+          darkMode ? 'border-white/20' : 'border-slate-300'
+        )}>
           {['table', 'matrix'].map((v) => (
             <button
               key={v}
               onClick={() => setViewMode(v)}
               className={clsx(
                 'px-3 py-1.5 font-semibold transition-colors',
-                viewMode === v ? 'bg-blue-600 text-white' : 'bg-white/5 text-gray-400 hover:bg-white/10',
+                viewMode === v 
+                  ? darkMode 
+                    ? 'bg-blue-600 text-white' 
+                    : 'bg-blue-500 text-white'
+                  : darkMode
+                    ? 'bg-white/5 text-gray-400 hover:bg-white/10'
+                    : 'bg-slate-50 text-slate-600 hover:bg-slate-100',
               )}
             >
               {v === 'table' ? '≡ Table' : '⊞ Matrix'}
@@ -237,7 +256,7 @@ export default function LiveDashboard({
         </div>
 
         {/* Min Change slider */}
-        <div className="flex items-center gap-2 text-xs text-gray-400">
+        <div className={clsx('flex items-center gap-2 text-xs', darkMode ? 'text-gray-400' : 'text-slate-600')}>
           <span>Min Δ $: {fmt(minChange, 1)}</span>
           <input type="range" min={0} max={5} step={0.1} value={minChange}
             onChange={e => setMinChange(+e.target.value)}
@@ -245,22 +264,25 @@ export default function LiveDashboard({
         </div>
 
         {/* Show negative */}
-        <label className="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer">
+        <label className={clsx('flex items-center gap-1.5 text-xs cursor-pointer', darkMode ? 'text-gray-400' : 'text-slate-600')}>
           <input type="checkbox" checked={showNegative} onChange={e => setShowNegative(e.target.checked)}
             className="accent-blue-500" />
           Show –ve
         </label>
 
-        <div className="ml-auto text-xs text-gray-500">
+        <div className={clsx('ml-auto text-xs', darkMode ? 'text-gray-500' : 'text-slate-600')}>
           {rows.length} stocks shown
         </div>
       </div>
 
       {/* Custom Filter Builder expander */}
-      <div className="border border-white/10 rounded">
+      <div className={clsx('border rounded', darkMode ? 'border-white/10' : 'border-slate-200')}>
         <button
           onClick={() => setFilterOpen(o => !o)}
-          className="w-full text-left px-3 py-2 text-xs text-gray-400 flex justify-between"
+          className={clsx(
+            'w-full text-left px-3 py-2 text-xs flex justify-between',
+            darkMode ? 'text-gray-400' : 'text-slate-600'
+          )}
         >
           <span>⚙️ Custom Filter Builder {cfActive ? '(active)' : ''}</span>
           <span>{filterOpen ? '▲' : '▼'}</span>
@@ -268,23 +290,33 @@ export default function LiveDashboard({
         {filterOpen && (
           <div className="px-3 pb-3 grid grid-cols-3 gap-3">
             <div>
-              <label className="text-xs text-gray-500">Min Change %</label>
+              <label className={clsx('text-xs', darkMode ? 'text-gray-500' : 'text-slate-600')}>Min Change %</label>
               <input type="number" min={0} max={50} step={0.5} value={cfMinPct}
                 onChange={e => setCfMinPct(+e.target.value)}
-                className="w-full mt-0.5 bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-white" />
+                className={clsx(
+                  'w-full mt-0.5 border rounded px-2 py-1 text-xs',
+                  darkMode
+                    ? 'bg-gray-900 border-gray-700 text-white'
+                    : 'bg-white border-slate-300 text-slate-900'
+                )} />
             </div>
             <div>
-              <label className="text-xs text-gray-500">Volume</label>
+              <label className={clsx('text-xs', darkMode ? 'text-gray-500' : 'text-slate-600')}>Volume</label>
               <select value={cfVol} onChange={e => setCfVol(e.target.value)}
-                className="w-full mt-0.5 bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-white">
+                className={clsx(
+                  'w-full mt-0.5 border rounded px-2 py-1 text-xs',
+                  darkMode
+                    ? 'bg-gray-900 border-gray-700 text-white'
+                    : 'bg-white border-slate-300 text-slate-900'
+                )}>
                 {['Any','Spike Only (2×+)','Surge Only (5×+)'].map(o => <option key={o}>{o}</option>)}
               </select>
             </div>
             <div>
-              <label className="text-xs text-gray-500">Alert Flags</label>
+              <label className={clsx('text-xs', darkMode ? 'text-gray-500' : 'text-slate-600')}>Alert Flags</label>
               <div className="flex flex-col gap-0.5 mt-0.5">
                 {['Gap Play','AH Momentum','Turned Positive','Diamond'].map(f => (
-                  <label key={f} className="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">
+                  <label key={f} className={clsx('flex items-center gap-1 text-xs cursor-pointer', darkMode ? 'text-gray-400' : 'text-slate-600')}>
                     <input type="checkbox"
                       checked={cfFlags.includes(f)}
                       onChange={e => setCfFlags(prev =>
@@ -297,7 +329,7 @@ export default function LiveDashboard({
               </div>
             </div>
             {cfActive && (
-              <p className="col-span-3 text-xs text-amber-400">
+              <p className={clsx('col-span-3 text-xs', darkMode ? 'text-amber-400' : 'text-amber-700')}>
                 🔧 Custom filter active — {cfMinPct}% min | {cfVol} vol | flags: {cfFlags.join(', ') || 'any'}
               </p>
             )}
@@ -337,9 +369,12 @@ export default function LiveDashboard({
           {/* Data Table */}
           {rows.length > 0 && (
             <>
-              <div className="overflow-x-auto rounded-lg border border-white/10">
-                <table className="w-full text-left text-xs text-white">
-              <thead className="bg-gray-900/80 text-gray-400 text-[10px] uppercase tracking-wide">
+              <div className={clsx('overflow-x-auto rounded-lg border', darkMode ? 'border-white/10' : 'border-slate-200')}>
+                <table className="w-full text-left text-xs">
+              <thead className={clsx(
+                'text-[10px] uppercase tracking-wide',
+                darkMode ? 'bg-gray-900/80 text-gray-400' : 'bg-slate-100 text-slate-700'
+              )}>
                 <tr>
                   {tableCols.map(([key, label]) => (
                     <th

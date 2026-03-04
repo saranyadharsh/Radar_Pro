@@ -156,46 +156,6 @@ export default function Sidebar({
 
       <div className="px-2 py-2 space-y-0">
 
-        {/* System Status */}
-        <Section title="System" icon="📡" defaultOpen>
-          <div className="space-y-1.5">
-            <div className="flex items-center gap-2">
-              <span>{wsIcon}</span>
-              <span className="text-gray-400">WS:</span>
-              <span className={clsx('font-bold',
-                m?.ws_health === 'Healthy' ? 'text-emerald-400' : 'text-amber-400')}>
-                {m?.ws_health ?? '…'}
-              </span>
-            </div>
-
-            {m?.source_stats?.total_attempted > 0 && (
-              <div>
-                <div className="flex justify-between text-[10px] text-gray-600 mb-0.5">
-                  <span>YF Data Quality</span>
-                  <span>{Math.round((m.source_stats.yfinance_fallback / m.source_stats.total_attempted) * 100)}%</span>
-                </div>
-                <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden">
-                  <div className="h-full bg-gradient-to-r from-cyan-500 to-emerald-500 rounded-full transition-all"
-                    style={{ width: `${Math.round((m.source_stats.yfinance_fallback / m.source_stats.total_attempted) * 100)}%` }} />
-                </div>
-                <p className="text-[10px] text-gray-600 mt-0.5">
-                  {m.source_stats.yfinance_fallback} / {m.source_stats.total_attempted} enriched
-                </p>
-              </div>
-            )}
-
-            <p className="text-[10px] text-gray-600">
-              Heartbeat: <span className="text-gray-400">{m?.last_update ?? '—'}</span>
-            </p>
-
-            <button onClick={reconnectWS}
-              className="w-full py-1.5 rounded-lg border border-white/10 bg-white/3 hover:bg-white/8
-                         text-[10px] text-gray-400 hover:text-white transition-all font-bold tracking-wide">
-              ⟳ Reconnect WS
-            </button>
-          </div>
-        </Section>
-
         {/* Data Source */}
         <Section title="Data Source" icon="📁" defaultOpen>
           <select

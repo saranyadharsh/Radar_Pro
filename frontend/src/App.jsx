@@ -259,17 +259,85 @@ export default function App() {
           {/* RIGHT: Controls */}
           <div className="flex items-center gap-1">
 
-            {/* System Status - Compact */}
+            {/* SYS Indicator - Clickable */}
             {m && (
-              <div className={clsx(
-                'hidden lg:flex items-center gap-2 px-3 py-1.5 rounded-lg border text-[10px] mr-1',
-                darkMode ? 'bg-white/5 border-white/10' : 'bg-slate-100 border-slate-200'
-              )}>
-                <span className={clsx('font-bold', wsHealthColor)}>
-                  {m.ws_health === 'Healthy' ? '🟢' : '🟡'} SYS
-                </span>
-                <span className={clsx('text-gray-500', darkMode ? '' : 'text-slate-600')}>|</span>
-                <span className="text-gray-400">{m.live_count ?? 0} live</span>
+              <div className="relative group">
+                <button className={clsx(
+                  'flex items-center gap-2 px-3 py-1.5 rounded-lg border text-[10px] mr-1 transition-all',
+                  darkMode ? 'bg-white/5 border-white/10 hover:bg-white/10' : 'bg-slate-100 border-slate-200 hover:bg-slate-200'
+                )}>
+                  <span className={clsx('font-bold', wsHealthColor)}>
+                    {m.ws_health === 'Healthy' ? '🟢' : '🟡'} SYS
+                  </span>
+                  <span className={clsx('text-gray-500', darkMode ? '' : 'text-slate-600')}>|</span>
+                  <span className={clsx(darkMode ? 'text-gray-400' : 'text-slate-600')}>{m.live_count ?? 0} live</span>
+                </button>
+                
+                {/* SYS Dropdown */}
+                <div className={clsx(
+                  'absolute right-0 top-full mt-2 w-64 z-50 rounded-xl border backdrop-blur-xl shadow-2xl overflow-hidden',
+                  'opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all',
+                  darkMode
+                    ? 'bg-[#0d1117]/95 border-white/10'
+                    : 'bg-white/95 border-slate-200 shadow-slate-500/20'
+                )}>
+                  <div className={clsx(
+                    'px-4 py-3 border-b',
+                    darkMode ? 'border-white/10' : 'border-slate-200'
+                  )}>
+                    <p className={clsx('text-sm font-bold', darkMode ? 'text-white' : 'text-slate-900')}>
+                      System Status
+                    </p>
+                  </div>
+                  <div className="px-4 py-3 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className={clsx('text-xs', darkMode ? 'text-gray-400' : 'text-slate-600')}>WebSocket</span>
+                      <span className={clsx('text-xs font-bold', wsHealthColor)}>
+                        {m.ws_health ?? '—'}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className={clsx('text-xs', darkMode ? 'text-gray-400' : 'text-slate-600')}>Live Tickers</span>
+                      <span className={clsx('text-xs font-bold', darkMode ? 'text-white' : 'text-slate-900')}>
+                        {m.live_count ?? 0}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className={clsx('text-xs', darkMode ? 'text-gray-400' : 'text-slate-600')}>Total Tickers</span>
+                      <span className={clsx('text-xs font-bold', darkMode ? 'text-white' : 'text-slate-900')}>
+                        {m.total_tickers?.toLocaleString() ?? 0}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className={clsx('text-xs', darkMode ? 'text-gray-400' : 'text-slate-600')}>Gainers</span>
+                      <span className="text-xs font-bold text-emerald-400">
+                        {m.pos_count ?? 0}
+                      </span>
+                    </div>
+                    {m.source_stats?.total_attempted > 0 && (
+                      <>
+                        <div className={clsx('pt-2 border-t', darkMode ? 'border-white/10' : 'border-slate-200')}>
+                          <div className="flex justify-between text-[10px] mb-1">
+                            <span className={clsx(darkMode ? 'text-gray-500' : 'text-slate-500')}>Data Quality</span>
+                            <span className={clsx('font-bold', darkMode ? 'text-gray-300' : 'text-slate-700')}>
+                              {Math.round((m.source_stats.yfinance_fallback / m.source_stats.total_attempted) * 100)}%
+                            </span>
+                          </div>
+                          <div className={clsx('w-full h-1.5 rounded-full overflow-hidden', darkMode ? 'bg-white/5' : 'bg-slate-200')}>
+                            <div className="h-full bg-gradient-to-r from-cyan-500 to-emerald-500 rounded-full transition-all"
+                              style={{ width: `${Math.round((m.source_stats.yfinance_fallback / m.source_stats.total_attempted) * 100)}%` }} />
+                          </div>
+                          <p className={clsx('text-[10px] mt-1', darkMode ? 'text-gray-600' : 'text-slate-500')}>
+                            {m.source_stats.yfinance_fallback} / {m.source_stats.total_attempted} enriched
+                          </p>
+                        </div>
+                      </>
+                    )}
+                    <p className={clsx('text-[10px]', darkMode ? 'text-gray-600' : 'text-slate-500')}>
+                      Last update: {m.last_update ?? '—'}
+                    </p>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -433,7 +501,15 @@ export default function App() {
         <main className={clsx('flex-1 min-w-0', activeTab !== 'home' && 'px-4 py-3')}>
 
           {/* Dashboard - Full screen */}
-          {activeTab === 'home' && <NexRadarDashboard darkMode={darkMode} />}
+          {activeTab === 'home' && (
+            <NexRadarDashboard 
+              darkMode={darkMode} 
+              source={source}
+              sector={sector}
+              onSourceChange={handleSourceChange}
+              onSectorChange={setSector}
+            />
+          )}
 
           {/* Other tabs - With filter cards and content */}
           {activeTab !== 'home' && (

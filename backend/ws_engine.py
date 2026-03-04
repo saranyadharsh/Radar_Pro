@@ -106,6 +106,12 @@ class WSEngine:
         self.historical_data_lock             = threading.Lock()
         self.intraday_highs: Dict[str, float] = {}
 
+        # ── Portfolio/Monitor state ────────────────────────────────────────────
+        self._monitor_tickers: Set[str]       = set()
+        self._portfolio_tickers: Set[str]     = set()
+        self._last_portfolio_refresh          = 0.0
+        self._PORTFOLIO_REFRESH_INTERVAL      = 30.0
+
         # ── WebSocket state ────────────────────────────────────────────────────
         self.ws_health_status    = "connecting"
         self.ws_retry_count      = 0
@@ -159,6 +165,9 @@ class WSEngine:
         self.sector_map = self.db.get_sector_map()
         logger.info(f"Loaded sector map: {len(self.sector_map)} tickers with sector data")
 
+        # ← PORTFOLIO/MONITOR: Initial load
+        self._refresh_portfolio_monitor()
+
         threading.Thread(
             target=self._fetch_historical_batch,
             args=(list(self.all_tickers),),
@@ -167,6 +176,13 @@ class WSEngine:
 
         threading.Thread(
             target=self._ws_listener_loop, daemon=True, name="MassiveWS"
+        ).start()
+
+        # ← PORTFOLIO/MONITOR: Start periodic refresh thread
+        threading.Thread(
+            target=self._portfolio_monitor_refresh_loop,
+            daemon=True,
+            name="PortfolioMonitorRefresh"
         ).start()
 
         logger.info(f"WSEngine started — {len(self.all_tickers)} tickers")
@@ -528,6 +544,45 @@ class WSEngine:
             ex.map(fetch_one, tickers)
 
         logger.info("Historical data fetch complete")
+
+    # ── PORTFOLIO/MONITOR REFRESH ─────────────────────────────────────────────
+
+    def _refresh_portfolio_monitor(self):
+        """
+        Fetch portfolio and monitor tickers from database.
+        Called on startup and periodically every 30 seconds.
+        """
+        try:
+            portfolio_rows = self.db.get_portfolio()
+            monitor_rows = self.db.get_monitor()
+            
+            self._portfolio_tickers = {
+                r.get("ticker") for r in portfolio_rows 
+                if r.get("ticker")
+            }
+            self._monitor_tickers = {
+                r.get("ticker") for r in monitor_rows 
+                if r.get("ticker")
+            }
+            
+            logger.info(
+                f"Refreshed portfolio/monitor: "
+                f"{len(self._portfolio_tickers)} portfolio, "
+                f"{len(self._monitor_tickers)} monitor tickers"
+            )
+        except Exception as e:
+            logger.error(f"Error refreshing portfolio/monitor: {e}")
+
+    def _portfolio_monitor_refresh_loop(self):
+        """
+        Background thread that refreshes portfolio/monitor data every 30 seconds.
+        """
+        while self.run_event.is_set():
+            try:
+                time.sleep(self._PORTFOLIO_REFRESH_INTERVAL)
+                self._refresh_portfolio_monitor()
+            except Exception as e:
+                logger.error(f"Portfolio/monitor refresh loop error: {e}")
 
     # ── DB WRITER ─────────────────────────────────────────────────────────────
 

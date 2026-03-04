@@ -35,9 +35,9 @@ const DARK = {
   text:"#f1f5f9",muted:"#4a6080",muted2:"#2d4a6a",
 };
 const LIGHT = {
-  bg:"#f0f4f8",bg2:"#e4ecf4",panel:"#ffffff",panel2:"#f1f5fb",panel3:"#e2eaf5",
-  line:"rgba(0,0,0,0.07)",line2:"rgba(0,0,0,0.12)",
-  text:"#0f1e30",muted:"#6b82a0",muted2:"#8fa4bf",
+  bg:"#f8fafc",bg2:"#f1f5f9",panel:"#ffffff",panel2:"#f8fafc",panel3:"#f1f5f9",
+  line:"rgba(0,0,0,0.10)",line2:"rgba(0,0,0,0.15)",
+  text:"#0f172a",muted:"#475569",muted2:"#64748b",
 };
 const C = {
   amber:"#f59e0b",amber2:"#fbbf24",
@@ -327,7 +327,13 @@ function PortfolioPage({portfolio,tickers,T,onSelect}){
 }
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
-export default function NexRadarDashboard({darkMode:darkModeProp=true}){
+export default function NexRadarDashboard({
+  darkMode:darkModeProp=true,
+  source:sourceProp='all',
+  sector:sectorProp='ALL',
+  onSourceChange,
+  onSectorChange
+}){
   const[tickers,        setTickers]       =useState(new Map()); // Map<ticker, live_row> from WS
   const[priceHistory,   setPriceHistory]  =useState(new Map()); // Map<ticker, price[]> for sparklines
   const[monitorSet,     setMonitorSet]    =useState(new Set()); // Set<ticker> from monitor table
@@ -342,8 +348,8 @@ export default function NexRadarDashboard({darkMode:darkModeProp=true}){
   const[sortDir, setSortDir]=useState(-1);
   const[timeframe,setTf]   =useState("1");
   const[sigFilter,setSigF] =useState("ALL");
-  const[dataSource,setDS]  =useState("all");
-  const[activeSector,setSector]=useState("ALL");
+  const[dataSource,setDS]  =useState(sourceProp); // Use prop as initial value
+  const[activeSector,setSector]=useState(sectorProp); // Use prop as initial value
   const[viewMode,setView]  =useState("TABLE");
   const[search,  setSearch]=useState("");
   const[darkMode,setDark]  =useState(darkModeProp); // Use prop as initial value
@@ -355,8 +361,10 @@ export default function NexRadarDashboard({darkMode:darkModeProp=true}){
   const[activeTab,setTab]  =useState("DASHBOARD");
   const[activeAlertFilter,setAlertFilter]=useState(null); // For alert card filtering
 
-  // Sync with parent darkMode prop
+  // Sync with parent props
   useEffect(()=>{setDark(darkModeProp)},[darkModeProp]);
+  useEffect(()=>{setDS(sourceProp)},[sourceProp]);
+  useEffect(()=>{setSector(sectorProp)},[sectorProp]);
 
   const T=darkMode?DARK:LIGHT;
   const wsRef=useRef(null),retryTimer=useRef(null),retryDelay=useRef(1000);
@@ -669,7 +677,11 @@ export default function NexRadarDashboard({darkMode:darkModeProp=true}){
               {sectorData.map(s=>(
                 <HeatTile key={s.name} s={s} T={T}
                   active={activeSector===s.name}
-                  onClick={()=>setSector(activeSector===s.name?"ALL":s.name)}/>
+                  onClick={()=>{
+                    const newSector = activeSector===s.name?"ALL":s.name;
+                    setSector(newSector);
+                    if(onSectorChange) onSectorChange(newSector);
+                  }}/>
               ))}
             </div>
 
@@ -681,14 +693,20 @@ export default function NexRadarDashboard({darkMode:darkModeProp=true}){
                         color:T.text,fontSize:10,outline:"none",width:160,fontFamily:"inherit"}}/>
               <div style={{display:"flex",gap:3}}>
                 {[["all","ALL"],["monitor","WATCHLIST"],["portfolio","PORTFOLIO"]].map(([v,l])=>(
-                  <Btn key={v} active={dataSource===v} label={l} onClick={()=>setDS(v)} sx={{fontSize:9}}/>
+                  <Btn key={v} active={dataSource===v} label={l} onClick={()=>{
+                    setDS(v);
+                    if(onSourceChange) onSourceChange(v);
+                  }} sx={{fontSize:9}}/>
                 ))}
               </div>
               {activeSector!=="ALL"&&(
                 <div style={{background:`rgba(245,158,11,0.12)`,border:`1px solid ${C.amber}`,borderRadius:4,
                              padding:"2px 8px",fontSize:9,color:C.amber,display:"flex",alignItems:"center",gap:4}}>
                   {activeSector}
-                  <span onClick={()=>setSector("ALL")} style={{cursor:"pointer",color:T.muted}}>✕</span>
+                  <span onClick={()=>{
+                    setSector("ALL");
+                    if(onSectorChange) onSectorChange("ALL");
+                  }} style={{cursor:"pointer",color:T.muted}}>✕</span>
                 </div>
               )}
               <div style={{marginLeft:"auto",display:"flex",gap:4,alignItems:"center"}}>
