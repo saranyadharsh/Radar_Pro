@@ -15,8 +15,8 @@ import Sidebar          from './components/Sidebar'
 import NexRadarDashboard from './components/NexRadarDashboard'
 import TickerDetailDrawer from './components/TickerDetailDrawer'
 import UserProfile from './components/UserProfile'
-
-const API = import.meta.env.VITE_API_BASE || ''
+import { API_BASE, REFRESH_INTERVALS, STORAGE_KEYS } from './config'
+import logger from './utils/logger'
 
 const SESSION_CONFIG = {
   MARKET_HOURS:    { label: 'Market Open',  short: 'MH',  color: '#10b981', bg: 'rgba(16,185,129,0.15)', dot: 'bg-emerald-400' },
@@ -133,7 +133,11 @@ function NotificationPanel({ notes, dismiss, clearAll, onClose, darkMode }) {
 export default function App() {
   // ── "home" is the new NexRadarDashboard; existing tabs stay untouched ──
   const [activeTab,     setActiveTab]     = useState('home')      // ← DEFAULT changed to 'home'
-  const [darkMode,      setDarkMode]      = useState(true)
+  const [darkMode,      setDarkMode]      = useState(() => {
+    // Load from localStorage, default to true (dark mode)
+    const saved = localStorage.getItem(STORAGE_KEYS.DARK_MODE)
+    return saved !== null ? JSON.parse(saved) : true
+  })
   const [metrics,       setMetrics]       = useState(null)
   const [activeFilter,  setActiveFilter]  = useState(null)
   const [chartTicker,   setChartTicker]   = useState(() => {
@@ -152,11 +156,16 @@ export default function App() {
   const { tickers, wsStatus } = useWebSocket()
   const { notes, dismiss, clearAll } = useNotifications(metrics)
 
+  // Save dark mode preference to localStorage
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.DARK_MODE, JSON.stringify(darkMode))
+  }, [darkMode])
+
   useEffect(() => {
     const poll = () =>
-      fetch(`${API}/api/metrics`).then(r => r.json()).then(setMetrics).catch(() => {})
+      fetch(`${API_BASE}/api/metrics`).then(r => r.json()).then(setMetrics).catch(() => {})
     poll()
-    const id = setInterval(poll, 3000)
+    const id = setInterval(poll, REFRESH_INTERVALS.METRICS)
     return () => clearInterval(id)
   }, [])
 
@@ -402,6 +411,8 @@ export default function App() {
             {/* Dark/Light Mode Toggle */}
             <button
               onClick={() => setDarkMode(d => !d)}
+              aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+              aria-pressed={darkMode}
               className={clsx(
                 'relative w-16 h-8 rounded-full transition-all duration-300 border-2',
                 darkMode
@@ -424,6 +435,9 @@ export default function App() {
             <div className="relative">
               <button
                 onClick={() => { setShowNotif(v => !v); setShowProfile(false) }}
+                aria-label="Notifications"
+                aria-expanded={showNotif}
+                aria-haspopup="true"
                 className={clsx(
                   'w-10 h-10 rounded-xl flex items-center justify-center text-base transition-all relative',
                   darkMode
@@ -434,7 +448,8 @@ export default function App() {
                 🔔
                 {notes.length > 0 && (
                   <span className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-red-500 text-white
-                                   text-[10px] font-black flex items-center justify-center leading-none shadow-lg">
+                                   text-[10px] font-black flex items-center justify-center leading-none shadow-lg"
+                        aria-label={`${notes.length} unread notifications`}>
                     {notes.length > 9 ? '9+' : notes.length}
                   </span>
                 )}
@@ -448,6 +463,9 @@ export default function App() {
             <div className="relative">
               <button
                 onClick={() => { setShowProfile(v => !v); setShowNotif(false) }}
+                aria-label="User profile menu"
+                aria-expanded={showProfile}
+                aria-haspopup="true"
                 className={clsx(
                   'w-10 h-10 rounded-xl flex items-center justify-center transition-all text-xs font-black border-2 shadow-lg',
                   darkMode
@@ -497,8 +515,10 @@ export default function App() {
         <div className={clsx(
           'border-t overflow-x-auto scrollbar-thin',
           darkMode ? 'border-white/5 bg-[#0a0f1a]/50' : 'border-slate-200 bg-slate-50/50'
-        )}>
-          <div className="flex gap-1 px-6 min-w-max">
+        )}
+        role="navigation"
+        aria-label="Main navigation">
+          <div className="flex gap-1 px-6 min-w-max" role="tablist">
             {TABS.map(t => (
               <button
                 key={t.id}
@@ -509,6 +529,9 @@ export default function App() {
                   else if (t.id === 'portfolio') handleSourceChange('portfolio')
                   else if (t.id === 'live') handleSourceChange('all')
                 }}
+                role="tab"
+                aria-selected={activeTab === t.id}
+                aria-controls={`${t.id}-panel`}
                 className={clsx(
                   'px-6 py-3 text-xs font-bold tracking-wider transition-all uppercase whitespace-nowrap rounded-t-lg relative',
                   activeTab === t.id
@@ -569,7 +592,7 @@ export default function App() {
           {activeTab !== 'home' && (
             <>
               {/* Filter cards */}
-              <div className="grid grid-cols-5 gap-2 mb-3">
+              <div className="grid grid-cols-5 gap-2 mb-3" role="group" aria-label="Stock filters">
                 {FILTER_CARDS.map(fc => {
                   const active = activeFilter === fc.key
                   const count  = m?.[fc.metricKey] ?? 0
@@ -577,6 +600,8 @@ export default function App() {
                     <button
                       key={fc.key}
                       onClick={() => setActiveFilter(f => f === fc.key ? null : fc.key)}
+                      aria-label={`Filter by ${fc.label}`}
+                      aria-pressed={active}
                       className={clsx(
                         'relative rounded-xl p-3 text-left border transition-all overflow-hidden bg-gradient-to-br cursor-pointer',
                         active

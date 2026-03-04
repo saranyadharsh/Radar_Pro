@@ -26,12 +26,42 @@ import clsx from 'clsx'
 import { NoDataEmptyState, NoResultsEmptyState, LoadingEmptyState } from './EmptyState'
 import { TableSkeleton } from './SkeletonLoader'
 import MiniSparkline, { generateSparklineData } from './MiniSparkline'
+import { API_BASE, REFRESH_INTERVALS, DISPLAY_SETTINGS, THRESHOLDS } from '../config'
+import logger from '../utils/logger'
 
-const API = import.meta.env.VITE_API_BASE || ''
 const fmt   = (n, d = 2) => Number(n ?? 0).toFixed(d)
 const fmtS  = (n)        => (n >= 0 ? '+' : '') + fmt(n)
 const fmtP  = (n)        => (n >= 0 ? '+' : '') + fmt(n) + '%'
-const isStale = (r) => (Date.now() / 1000 - (r.last_tick_time ?? 0)) > 300
+const isStale = (r) => (Date.now() / 1000 - (r.last_tick_time ?? 0)) > THRESHOLDS.STALE_PRICE_SECONDS
+
+// Normalize sector names to handle database variations
+const normalizeSector = (sector) => {
+  if (!sector) return '';
+  const normalized = sector.trim().toUpperCase();
+  
+  // Map common variations to standard frontend names
+  const sectorMap = {
+    'BM & ENERGY': 'BM & UENE',
+    'BM&ENERGY': 'BM & UENE',
+    'BASIC MATERIALS & ENERGY': 'BM & UENE',
+    'MATERIALS': 'BM & UENE',
+    'ENERGY': 'BM & UENE',
+    'REAL ESTATE': 'REALCOM',
+    'COMMUNICATIONS': 'REALCOM',
+    'REAL ESTATE & COMMUNICATIONS': 'REALCOM',
+    'HEALTHCARE': 'BIO',
+    'BIOTECHNOLOGY': 'BIO',
+    'BIOTECH': 'BIO',
+    'TECH': 'TECHNOLOGY',
+    'IT': 'TECHNOLOGY',
+    'INFORMATION TECHNOLOGY': 'TECHNOLOGY',
+    'FINANCE': 'BANKING',
+    'FINANCIAL': 'BANKING',
+    'FINANCIAL SERVICES': 'BANKING',
+  };
+  
+  return sectorMap[normalized] || sector;
+};
 
 function Badge({ label, cls }) {
   return <span className={clsx('text-[9px] font-bold px-1.5 py-0.5 rounded', cls)}>{label}</span>
@@ -96,11 +126,11 @@ export default function LiveDashboard({
     }
 
     const refreshInterval = setInterval(() => {
-      console.log(`[LiveDashboard] Auto-refreshing ${source} data`)
+      logger.log(`[LiveDashboard] Auto-refreshing ${source} data`)
       setLastRefreshTime(Date.now())
       
       const endpoint = source === 'portfolio' ? '/api/portfolio' : '/api/monitor'
-      fetch(`${API}${endpoint}`)
+      fetch(`${API_BASE}${endpoint}`)
         .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
         .then(data => {
           const tickers = data.tickers || data || []
@@ -111,80 +141,81 @@ export default function LiveDashboard({
           }
         })
         .catch(err => {
-          console.error(`[LiveDashboard] ${source} auto-refresh error:`, err)
+          logger.error(`[LiveDashboard] ${source} auto-refresh error:`, err)
         })
-    }, 3000) // Refresh every 3 seconds to match backend
+    }, REFRESH_INTERVALS.PORTFOLIO)
 
     return () => clearInterval(refreshInterval)
   }, [source])
 
   // Reset display count when filters change
   useEffect(() => {
-    setDisplayCount(50)
+    setDisplayCount(DISPLAY_SETTINGS.INITIAL_ROW_COUNT)
   }, [activeFilter, source, sector, minChange, cfMinPct, cfVol, cfFlags, showNegative])
 
   // Fetch portfolio, monitor, and earnings data when source changes
   useEffect(() => {
-    // Debounce: wait 300ms before fetching to avoid rapid API calls
+    // Debounce: wait to avoid rapid API calls
     const timeoutId = setTimeout(() => {
       setIsLoadingSource(true)
       
       if (source === 'portfolio') {
-        fetch(`${API}/api/portfolio`)
+        fetch(`${API_BASE}/api/portfolio`)
           .then(r => {
             if (!r.ok) throw new Error(`HTTP ${r.status}`)
             return r.json()
           })
           .then(data => {
-            console.log('[LiveDashboard] Portfolio data:', data)
+            logger.log('[LiveDashboard] Portfolio data:', data)
             setPortfolioData(data.tickers || data || [])
           })
           .catch(err => {
-            console.error('[LiveDashboard] Portfolio fetch error:', err)
+            logger.error('[LiveDashboard] Portfolio fetch error:', err)
             setPortfolioData([])
           })
           .finally(() => setIsLoadingSource(false))
       } else if (source === 'monitor') {
-        fetch(`${API}/api/monitor`)
+        fetch(`${API_BASE}/api/monitor`)
           .then(r => {
             if (!r.ok) throw new Error(`HTTP ${r.status}`)
             return r.json()
           })
           .then(data => {
-            console.log('[LiveDashboard] Monitor data:', data)
+            logger.log('[LiveDashboard] Monitor data:', data)
             setMonitorData(data.tickers || data || [])
           })
           .catch(err => {
-            console.error('[LiveDashboard] Monitor fetch error:', err)
+            logger.error('[LiveDashboard] Monitor fetch error:', err)
             setMonitorData([])
           })
           .finally(() => setIsLoadingSource(false))
       } else if (source === 'earnings') {
         const start = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)
         const end   = new Date(Date.now() + 60 * 86400000).toISOString().slice(0, 10)
-        fetch(`${API}/api/earnings?start=${start}&end=${end}`)
+        fetch(`${API_BASE}/api/earnings?start=${start}&end=${end}`)
           .then(r => {
             if (!r.ok) throw new Error(`HTTP ${r.status}`)
             return r.json()
           })
           .then(data => {
-            console.log('[LiveDashboard] Earnings data:', data)
+            logger.log('[LiveDashboard] Earnings data:', data)
             const tickers = Array.isArray(data) ? data.map(e => e.ticker) : []
             setEarningsData(tickers)
           })
           .catch(err => {
-            console.error('[LiveDashboard] Earnings fetch error:', err)
+            logger.error('[LiveDashboard] Earnings fetch error:', err)
             setEarningsData([])
           })
           .finally(() => setIsLoadingSource(false))
       } else {
         // Reset when switching to 'all' or other sources
+        logger.log('[LiveDashboard] Switching to source:', source, '- clearing all data arrays')
         setPortfolioData([])
         setMonitorData([])
         setEarningsData([])
         setIsLoadingSource(false)
       }
-    }, 300) // 300ms debounce delay
+    }, DISPLAY_SETTINGS.DEBOUNCE_MS)
 
     // Cleanup: cancel pending fetch if source changes again
     return () => clearTimeout(timeoutId)
@@ -193,31 +224,31 @@ export default function LiveDashboard({
   const rows = useMemo(() => {
     let arr = Array.from(tickers.values())
     
-    console.log('[LiveDashboard] Filtering - source:', source, 'tickers count:', arr.length)
+    logger.log('[LiveDashboard] Filtering - source:', source, 'tickers count:', arr.length)
 
     // Source-based filtering
     if (source === 'portfolio') {
-      console.log('[LiveDashboard] Portfolio filter - data:', portfolioData)
+      logger.log('[LiveDashboard] Portfolio filter - data:', portfolioData)
       if (portfolioData.length > 0) {
         arr = arr.filter(r => portfolioData.includes(r.ticker))
-        console.log('[LiveDashboard] After portfolio filter:', arr.length)
+        logger.log('[LiveDashboard] After portfolio filter:', arr.length)
       } else {
         // Show empty state if no portfolio data loaded yet
         arr = []
       }
     } else if (source === 'monitor') {
-      console.log('[LiveDashboard] Monitor filter - data:', monitorData)
+      logger.log('[LiveDashboard] Monitor filter - data:', monitorData)
       if (monitorData.length > 0) {
         arr = arr.filter(r => monitorData.includes(r.ticker))
-        console.log('[LiveDashboard] After monitor filter:', arr.length)
+        logger.log('[LiveDashboard] After monitor filter:', arr.length)
       } else {
         arr = []
       }
     } else if (source === 'earnings') {
-      console.log('[LiveDashboard] Earnings filter - data:', earningsData)
+      logger.log('[LiveDashboard] Earnings filter - data:', earningsData)
       if (earningsData.length > 0) {
         arr = arr.filter(r => earningsData.includes(r.ticker))
-        console.log('[LiveDashboard] After earnings filter:', arr.length)
+        logger.log('[LiveDashboard] After earnings filter:', arr.length)
       } else {
         // Show empty state if no earnings data loaded yet
         arr = []
@@ -225,7 +256,7 @@ export default function LiveDashboard({
     } else if (source === 'favorites') {
       // Favorites would need to be passed as prop or fetched from API
       // For now, filter by diamond stocks as placeholder
-      arr = arr.filter(r => Math.abs(r.percent_change ?? 0) >= 5)
+      arr = arr.filter(r => Math.abs(r.percent_change ?? 0) >= THRESHOLDS.DIAMOND_PERCENT)
     }
     // 'all' and 'stock_list' show everything (stock_list filtered by sector below)
 
@@ -233,11 +264,29 @@ export default function LiveDashboard({
 
     // Sector filter — only for stock_list / all sources
     if (sector && sector !== 'all' && (source === 'stock_list' || source === 'all')) {
-      // DEBUG: log unique sector values (remove once confirmed matching)
-      const uniqueSectors = [...new Set(Array.from(tickers.values()).map(r => r.sector))]
-      console.log('[NexRadar] Sector values in WS data:', uniqueSectors)
-      console.log('[NexRadar] Filtering by sector:', sector)
-      arr = arr.filter(r => (r.sector ?? '').trim().toLowerCase() === sector.trim().toLowerCase())
+      // DEBUG: log unique sector values to identify mismatches
+      const uniqueSectors = [...new Set(Array.from(tickers.values()).map(r => r.sector).filter(Boolean))]
+      logger.log('[LiveDashboard] All unique sectors in data:', uniqueSectors)
+      logger.log('[LiveDashboard] Filtering by sector:', sector)
+      logger.log('[LiveDashboard] Before sector filter:', arr.length)
+      
+      // Normalize both database sectors and filter sector for comparison
+      const normalizedFilterSector = normalizeSector(sector);
+      logger.log('[LiveDashboard] Normalized filter sector:', normalizedFilterSector)
+      
+      arr = arr.filter(r => {
+        const normalizedDbSector = normalizeSector(r.sector);
+        return normalizedDbSector.toUpperCase() === normalizedFilterSector.toUpperCase();
+      });
+      
+      logger.log('[LiveDashboard] After sector filter:', arr.length)
+      
+      if (arr.length === 0) {
+        logger.warn('[LiveDashboard] No stocks found for sector:', sector)
+        logger.warn('[LiveDashboard] Normalized to:', normalizedFilterSector)
+        logger.warn('[LiveDashboard] Available sectors:', uniqueSectors)
+        logger.warn('[LiveDashboard] Normalized available:', uniqueSectors.map(s => normalizeSector(s)))
+      }
     }
 
     // Active filter card
@@ -245,7 +294,7 @@ export default function LiveDashboard({
     else if (activeFilter === 'gap_play')     arr = arr.filter(r => r.is_gap_play)
     else if (activeFilter === 'ah_momentum')  arr = arr.filter(r => r.ah_momentum)
     else if (activeFilter === 'earnings_gap') arr = arr.filter(r => r.is_earnings_gap_play)
-    else if (activeFilter === 'diamond')      arr = arr.filter(r => Math.abs(r.percent_change ?? 0) >= 5)
+    else if (activeFilter === 'diamond')      arr = arr.filter(r => Math.abs(r.percent_change ?? 0) >= THRESHOLDS.DIAMOND_PERCENT)
 
     // Min change filter
     if (minChange > 0) arr = arr.filter(r => Math.abs(r.change_value ?? 0) >= minChange)
@@ -257,7 +306,7 @@ export default function LiveDashboard({
     if (cfFlags.includes('Gap Play'))    arr = arr.filter(r => r.is_gap_play)
     if (cfFlags.includes('AH Momentum')) arr = arr.filter(r => r.ah_momentum)
     if (cfFlags.includes('Turned Positive')) arr = arr.filter(r => r.went_positive === 1)
-    if (cfFlags.includes('Diamond'))     arr = arr.filter(r => Math.abs(r.percent_change ?? 0) >= 5)
+    if (cfFlags.includes('Diamond'))     arr = arr.filter(r => Math.abs(r.percent_change ?? 0) >= THRESHOLDS.DIAMOND_PERCENT)
 
     arr.sort((a, b) => (b[sortKey] ?? 0) - (a[sortKey] ?? 0))
     return arr
@@ -279,7 +328,7 @@ export default function LiveDashboard({
   const loadMore = () => {
     setIsLoadingMore(true)
     setTimeout(() => {
-      setDisplayCount(prev => Math.min(prev + 50, rows.length))
+      setDisplayCount(prev => Math.min(prev + DISPLAY_SETTINGS.LOAD_MORE_INCREMENT, rows.length))
       setIsLoadingMore(false)
     }, 300)
   }
@@ -289,7 +338,7 @@ export default function LiveDashboard({
     const handleScroll = () => {
       if (isLoadingMore || !hasMore) return
       const scrollPosition = window.innerHeight + window.scrollY
-      const threshold = document.documentElement.scrollHeight - 200
+      const threshold = document.documentElement.scrollHeight - DISPLAY_SETTINGS.SCROLL_THRESHOLD_PX
       if (scrollPosition >= threshold) {
         loadMore()
       }
@@ -383,7 +432,7 @@ export default function LiveDashboard({
               {(source === 'portfolio' || source === 'monitor') && (
                 <span className="flex items-center gap-1 text-[10px]">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                  Auto-refresh: 3s
+                  Auto-refresh: {REFRESH_INTERVALS.PORTFOLIO / 1000}s
                 </span>
               )}
             </div>

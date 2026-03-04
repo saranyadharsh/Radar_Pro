@@ -24,9 +24,8 @@
 
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import MiniSparkline from './MiniSparkline';
-
-const API    = import.meta.env.VITE_API_BASE || "";
-const WS_URL = import.meta.env.VITE_WS_URL  || "ws://localhost:8000/ws/live";
+import { API_BASE, WS_URL, REFRESH_INTERVALS } from '../config';
+import logger from '../utils/logger';
 
 // ─── TOKENS ──────────────────────────────────────────────────────────────────
 const DARK = {
@@ -55,44 +54,54 @@ const fmtK = n => n>=1e9?`$${(n/1e9).toFixed(1)}B`:n>=1e6?`$${(n/1e6).toFixed(0)
 
 const SECTOR_LIST = ["TECHNOLOGY","CONSUMER","BANKING","BIO","BM & UENE","REALCOM","INDUSTRIALS"];
 
-// ─── MINI CANDLE CHART ───────────────────────────────────────────────────────
-function CandleChart({ symbol }) {
-  const seed = (symbol?.charCodeAt(0)||78)+(symbol?.charCodeAt(1)||86);
-  const candles = useMemo(()=>Array.from({length:40},(_,i)=>{
-    const base=100+Math.sin((i+seed)*0.3)*20+i*0.5;
-    const o=base+(Math.random()-0.5)*8,c=base+(Math.random()-0.5)*8+1;
-    return{o,c,h:Math.max(o,c)+Math.random()*4,l:Math.min(o,c)-Math.random()*4,vol:30+Math.random()*50};
-  }),[symbol]);
-  const allV=candles.flatMap(c=>[c.h,c.l]);
-  const minV=Math.min(...allV),maxV=Math.max(...allV),rng=maxV-minV||1;
-  const W=460,H=150,VH=36,cw=W/candles.length;
-  const sy=v=>H-((v-minV)/rng)*(H-8)-4;
-  const maxVol=Math.max(...candles.map(c=>c.vol));
-  const vwap=candles.map((c,i)=>`${i===0?"M":"L"}${i*cw+cw/2},${sy(minV+rng*(0.45+Math.sin(i*0.15)*0.08))}`).join(" ");
-  const ema=candles.map((c,i)=>`${i===0?"M":"L"}${i*cw+cw/2},${sy(minV+rng*(0.5+Math.sin(i*0.2+1)*0.1))}`).join(" ");
-  return(
-    <svg width="100%" viewBox={`0 0 ${W} ${H+VH+8}`} preserveAspectRatio="none"
-      style={{position:"absolute",inset:0,width:"100%",height:"100%"}}>
-      {[0.25,0.5,0.75].map(f=><line key={f} x1={0} y1={sy(minV+rng*f)} x2={W} y2={sy(minV+rng*f)} stroke="rgba(255,255,255,0.05)" strokeWidth="1"/>)}
-      <path d={vwap} fill="none" stroke={C.amber} strokeWidth="1.2" strokeDasharray="4,3" opacity="0.7"/>
-      <path d={ema}  fill="none" stroke={C.violet} strokeWidth="1"   opacity="0.6"/>
-      {candles.map((c,i)=>{
-        const x=i*cw+cw*0.2,bw=cw*0.6,bull=c.c>=c.o;
-        const top=sy(Math.max(c.o,c.c)),bot=sy(Math.min(c.o,c.c)),bh=Math.max(bot-top,1);
-        return(<g key={i}>
-          <line x1={x+bw/2} y1={sy(c.h)} x2={x+bw/2} y2={sy(c.l)} stroke={bull?C.green:C.red} strokeWidth="0.8"/>
-          <rect x={x} y={top} width={bw} height={bh} rx="0.5" fill={bull?C.green:C.red} opacity={bull?0.75:0.7}/>
-        </g>);
-      })}
-      {candles.map((c,i)=>{
-        const x=i*cw+cw*0.2,bw=cw*0.6,bull=c.c>=c.o,bh=(c.vol/maxVol)*VH;
-        return<rect key={`v${i}`} x={x} y={H+8+(VH-bh)} width={bw} height={bh} fill={bull?C.green:C.red} opacity="0.3"/>;
-      })}
-      <rect x={2} y={2} width={6} height={3} fill={C.amber}/>
-      <text x={12} y={7} fontSize="7" fill={C.amber} opacity="0.8">VWAP</text>
-      <rect x={46} y={2} width={6} height={3} fill={C.violet}/>
-      <text x={56} y={7} fontSize="7" fill={C.violet} opacity="0.8">EMA21</text>
-    </svg>
+// ─── TRADINGVIEW CHART WIDGET ────────────────────────────────────────────────
+function TradingViewChart({ symbol, darkMode }) {
+  const containerRef = useRef(null);
+  
+  useEffect(() => {
+    if (!symbol || !containerRef.current) return;
+    
+    // Clear previous widget
+    containerRef.current.innerHTML = '';
+    
+    const script = document.createElement('script');
+    script.src = 'https://s3.tradingview.com/tv.js';
+    script.async = true;
+    script.onload = () => {
+      if (window.TradingView) {
+        new window.TradingView.widget({
+          autosize: true,
+          symbol: `NASDAQ:${symbol}`,
+          interval: '5',
+          timezone: 'America/New_York',
+          theme: darkMode ? 'dark' : 'light',
+          style: '1',
+          locale: 'en',
+          toolbar_bg: darkMode ? '#0c1828' : '#f1f5f9',
+          enable_publishing: false,
+          hide_top_toolbar: false,
+          hide_legend: true,
+          save_image: false,
+          container_id: containerRef.current.id,
+          studies: ['MASimple@tv-basicstudies', 'Volume@tv-basicstudies'],
+        });
+      }
+    };
+    document.head.appendChild(script);
+    
+    return () => {
+      if (script.parentNode) {
+        script.parentNode.removeChild(script);
+      }
+    };
+  }, [symbol, darkMode]);
+  
+  return (
+    <div 
+      ref={containerRef} 
+      id={`tradingview_${symbol}`}
+      style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
+    />
   );
 }
 
@@ -361,10 +370,21 @@ export default function NexRadarDashboard({
   const[activeTab,setTab]  =useState("DASHBOARD");
   const[activeAlertFilter,setAlertFilter]=useState(null); // For alert card filtering
 
-  // Sync with parent props
-  useEffect(()=>{setDark(darkModeProp)},[darkModeProp]);
-  useEffect(()=>{setDS(sourceProp)},[sourceProp]);
-  useEffect(()=>{setSector(sectorProp)},[sectorProp]);
+  // Sync with parent props - FIXED: Ensure data source changes are reflected
+  useEffect(()=>{
+    logger.log('[NexRadar] darkMode prop changed:', darkModeProp);
+    setDark(darkModeProp);
+  },[darkModeProp]);
+  
+  useEffect(()=>{
+    logger.log('[NexRadar] source prop changed:', sourceProp, '-> setting dataSource');
+    setDS(sourceProp);
+  },[sourceProp]);
+  
+  useEffect(()=>{
+    logger.log('[NexRadar] sector prop changed:', sectorProp);
+    setSector(sectorProp);
+  },[sectorProp]);
 
   const T=darkMode?DARK:LIGHT;
   const wsRef=useRef(null),retryTimer=useRef(null),retryDelay=useRef(1000);
@@ -434,38 +454,49 @@ export default function NexRadarDashboard({
   // We only need to know WHICH tickers are in monitor/portfolio to filter.
   useEffect(()=>{
     const fetchSets=()=>{
+      logger.log('[NexRadar] Fetching monitor and portfolio data...');
       // monitor tickers
-      fetch(`${API}/api/monitor`)
+      fetch(`${API_BASE}/api/monitor`)
         .then(r=>r.json())
         .then(data=>{
-          const rows=Array.isArray(data)?data:(data.data??[]);
-          setMonitorSet(new Set(rows.map(r=>r.ticker)));
-        }).catch(()=>{});
+          logger.log('[NexRadar] Monitor API response:', data);
+          const rows=Array.isArray(data)?data:(data.tickers??data.data??[]);
+          const tickers = Array.isArray(rows) ? rows.map(r => typeof r === 'string' ? r : r.ticker) : [];
+          logger.log('[NexRadar] Monitor tickers:', tickers);
+          setMonitorSet(new Set(tickers));
+        }).catch(err => {
+          logger.error('[NexRadar] Monitor fetch error:', err);
+        });
       // portfolio tickers (also stored for P&L page)
-      fetch(`${API}/api/portfolio`)
+      fetch(`${API_BASE}/api/portfolio`)
         .then(r=>r.json())
         .then(data=>{
-          const rows=Array.isArray(data)?data:(data.data??[]);
-          setPortfolioSet(new Set(rows.map(r=>r.ticker)));
+          logger.log('[NexRadar] Portfolio API response:', data);
+          const rows=Array.isArray(data)?data:(data.tickers??data.data??[]);
+          const tickers = Array.isArray(rows) ? rows.map(r => typeof r === 'string' ? r : r.ticker) : [];
+          logger.log('[NexRadar] Portfolio tickers:', tickers);
+          setPortfolioSet(new Set(tickers));
           setPortfolio(rows);
-        }).catch(()=>{});
+        }).catch(err => {
+          logger.error('[NexRadar] Portfolio fetch error:', err);
+        });
     };
     fetchSets();
-    const id=setInterval(fetchSets,10000); // refresh every 10s (watchlist changes less often)
+    const id=setInterval(fetchSets, REFRESH_INTERVALS.PORTFOLIO); // refresh every 30s
     return()=>clearInterval(id);
   },[]);
 
   // ── REST polls (fast-changing data) ────────────────────────────────────────
   useEffect(()=>{
     const fetchAll=()=>{
-      fetch(`${API}/api/metrics`).then(r=>r.json()).then(setMetrics).catch(()=>{});
-      fetch(`${API}/api/signals?limit=500`).then(r=>r.json()).then(d=>setSignals(Array.isArray(d)?d:d.data??[])).catch(()=>{});
+      fetch(`${API_BASE}/api/metrics`).then(r=>r.json()).then(setMetrics).catch(()=>{});
+      fetch(`${API_BASE}/api/signals?limit=500`).then(r=>r.json()).then(d=>setSignals(Array.isArray(d)?d:d.data??[])).catch(()=>{});
       const today=new Date().toISOString().slice(0,10);
       const next7=new Date(Date.now()+7*86400000).toISOString().slice(0,10);
-      fetch(`${API}/api/earnings?start=${today}&end=${next7}`).then(r=>r.json()).then(d=>setEarnings(Array.isArray(d)?d:d.data??[])).catch(()=>{});
+      fetch(`${API_BASE}/api/earnings?start=${today}&end=${next7}`).then(r=>r.json()).then(d=>setEarnings(Array.isArray(d)?d:d.data??[])).catch(()=>{});
     };
     fetchAll();
-    const id=setInterval(fetchAll,5000);
+    const id=setInterval(fetchAll, REFRESH_INTERVALS.SIGNALS); // Poll every 10s
     return()=>clearInterval(id);
   },[]);
 
@@ -484,6 +515,7 @@ export default function NexRadarDashboard({
   }),[allRows]);
 
   const filtered=useMemo(()=>{
+    logger.log('[NexRadar] Filtering - dataSource:', dataSource, 'portfolioSet size:', portfolioSet.size, 'monitorSet size:', monitorSet.size);
     let rows=[...allRows];
 
     // Alert filter (from alert cards)
@@ -495,8 +527,16 @@ export default function NexRadarDashboard({
     if(activeAlertFilter==="earnings_gap") rows=rows.filter(r=>r.is_earnings_gap_play);
 
     // Data source filter — uses Set for O(1) lookup
-    if(dataSource==="monitor")   rows=rows.filter(r=>monitorSet.has(r.ticker));
-    if(dataSource==="portfolio") rows=rows.filter(r=>portfolioSet.has(r.ticker));
+    if(dataSource==="monitor") {
+      logger.log('[NexRadar] Filtering by MONITOR - before:', rows.length);
+      rows=rows.filter(r=>monitorSet.has(r.ticker));
+      logger.log('[NexRadar] Filtering by MONITOR - after:', rows.length, 'tickers:', Array.from(monitorSet).slice(0, 5));
+    }
+    if(dataSource==="portfolio") {
+      logger.log('[NexRadar] Filtering by PORTFOLIO - before:', rows.length);
+      rows=rows.filter(r=>portfolioSet.has(r.ticker));
+      logger.log('[NexRadar] Filtering by PORTFOLIO - after:', rows.length, 'tickers:', Array.from(portfolioSet).slice(0, 5));
+    }
     // "all" → no filter
 
     // Sector filter — works because backend sends sector with every row
@@ -509,6 +549,7 @@ export default function NexRadarDashboard({
     }
 
     rows.sort((a,b)=>sortDir*((a[sortBy]||0)-(b[sortBy]||0)));
+    logger.log('[NexRadar] Final filtered count:', rows.length);
     return rows;
   },[allRows,dataSource,activeSector,search,sortBy,sortDir,monitorSet,portfolioSet,activeAlertFilter]);
 
@@ -625,7 +666,7 @@ export default function NexRadarDashboard({
                   </div>
                 </div>
                 <div style={{position:"relative",height:194,borderRadius:6,overflow:"hidden",background:T.panel2,marginBottom:8}}>
-                  <CandleChart symbol={stock.ticker}/>
+                  <TradingViewChart symbol={stock.ticker} darkMode={darkMode}/>
                 </div>
                 <div style={{display:"flex",gap:3,marginBottom:8}}>
                   {["1","5","15","60","D"].map(tf=>(
