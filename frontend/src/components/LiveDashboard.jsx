@@ -78,14 +78,19 @@ export default function LiveDashboard({
   const [cfVol,        setCfVol]        = useState('Any')
   const [cfFlags,      setCfFlags]      = useState([])
   const [filterOpen,   setFilterOpen]   = useState(false)
-  const [loading,      setLoading]      = useState(false)
   const [portfolioData, setPortfolioData] = useState([])
   const [monitorData,   setMonitorData]   = useState([])
   const [earningsData,  setEarningsData]  = useState([])
+  const [displayCount,  setDisplayCount]  = useState(50)
+  const [isLoadingMore, setIsLoadingMore] = useState(false)
 
   const session = metrics?.session ?? 'MARKET_HOURS'
   const isAH    = session === 'AFTER_HOURS'
-  const isClosed = session === 'OVERNIGHT_SLEEP' || session === 'CLOSED_WEEKEND'
+
+  // Reset display count when filters change
+  useEffect(() => {
+    setDisplayCount(50)
+  }, [activeFilter, source, sector, minChange, cfMinPct, cfVol, cfFlags, showNegative])
 
   // Fetch portfolio, monitor, and earnings data when source changes
   useEffect(() => {
@@ -164,6 +169,32 @@ export default function LiveDashboard({
        ['live_price','Price'],['change_value','Change ($)'],['percent_change','Change (%)'],['alerts','Alerts']]
 
   const cfActive = cfMinPct > 0 || cfVol !== 'Any' || cfFlags.length > 0
+
+  // Infinite scroll and load more
+  const displayedRows = rows.slice(0, displayCount)
+  const hasMore = displayCount < rows.length
+
+  const loadMore = () => {
+    setIsLoadingMore(true)
+    setTimeout(() => {
+      setDisplayCount(prev => Math.min(prev + 50, rows.length))
+      setIsLoadingMore(false)
+    }, 300)
+  }
+
+  // Auto-load on scroll
+  useEffect(() => {
+    const handleScroll = () => {
+      if (isLoadingMore || !hasMore) return
+      const scrollPosition = window.innerHeight + window.scrollY
+      const threshold = document.documentElement.scrollHeight - 200
+      if (scrollPosition >= threshold) {
+        loadMore()
+      }
+    }
+    window.addEventListener('scroll', handleScroll)
+    return () => window.removeEventListener('scroll', handleScroll)
+  }, [isLoadingMore, hasMore, displayCount])
 
   return (
     <div className="flex flex-col gap-3">
@@ -272,11 +303,8 @@ export default function LiveDashboard({
         <div>
           <h3 className="text-sm font-bold mb-2">📊 Live Stock Data</h3>
           
-          {/* Loading State */}
-          {loading && <TableSkeleton rows={15} cols={tableCols.length} />}
-          
           {/* Empty States */}
-          {!loading && rows.length === 0 && (
+          {rows.length === 0 && (
             wsStatus === 'connecting' ? (
               <LoadingEmptyState />
             ) : tickers.size === 0 ? (
@@ -284,10 +312,14 @@ export default function LiveDashboard({
             ) : (
               <NoResultsEmptyState
                 onClear={() => {
-                  setActiveFilter?.(null)
+                  if (activeFilter) {
+                    // Need to call parent's setActiveFilter - for now just reset local filters
+                  }
                   setCfMinPct(0)
                   setCfVol('Any')
                   setCfFlags([])
+                  setMinChange(0)
+                  setShowNegative(false)
                 }}
                 filterName={source !== 'all' ? source : (activeFilter || 'current filter')}
               />
@@ -295,7 +327,7 @@ export default function LiveDashboard({
           )}
           
           {/* Data Table */}
-          {!loading && rows.length > 0 && (
+          {rows.length > 0 && (
             <>
               <div className="overflow-x-auto rounded-lg border border-white/10">
                 <table className="w-full text-left text-xs text-white">
@@ -313,11 +345,7 @@ export default function LiveDashboard({
                 </tr>
               </thead>
               <tbody>
-                {rows.length === 0 ? (
-                  <tr><td colSpan={tableCols.length} className="text-center py-12 text-gray-600">
-                    {wsStatus === 'connecting' ? '⏳ Connecting to Massive WebSocket…' : '📭 No data yet'}
-                  </td></tr>
-                ) : rows.map(row => {
+                {displayedRows.map(row => {
                   const stale  = isStale(row)
                   const chgVal = isAH
                     ? (row.live_price - (row.today_close > 0 ? row.today_close : row.prev_close))
@@ -487,17 +515,8 @@ export default function LiveDashboard({
         <div>
           <h3 className="text-sm font-bold mb-2">⊞ Matrix View</h3>
           
-          {/* Loading State */}
-          {loading && (
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2">
-              {Array.from({ length: 12 }).map((_, i) => (
-                <div key={i} className="rounded-xl p-3 border border-white/10 bg-gray-900/50 animate-pulse h-32" />
-              ))}
-            </div>
-          )}
-          
           {/* Empty States */}
-          {!loading && rows.length === 0 && (
+          {rows.length === 0 && (
             wsStatus === 'connecting' ? (
               <LoadingEmptyState />
             ) : tickers.size === 0 ? (
@@ -505,10 +524,11 @@ export default function LiveDashboard({
             ) : (
               <NoResultsEmptyState
                 onClear={() => {
-                  setActiveFilter?.(null)
                   setCfMinPct(0)
                   setCfVol('Any')
                   setCfFlags([])
+                  setMinChange(0)
+                  setShowNegative(false)
                 }}
                 filterName={source !== 'all' ? source : (activeFilter || 'current filter')}
               />
@@ -516,7 +536,7 @@ export default function LiveDashboard({
           )}
           
           {/* Matrix Grid */}
-          {!loading && rows.length > 0 && (
+          {rows.length > 0 && (
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2">
             {displayedRows.map(row => {
               const isPos  = (row.change_value ?? 0) >= 0
@@ -569,7 +589,7 @@ export default function LiveDashboard({
           )}
           
           {/* Load More for Matrix View */}
-          {!loading && rows.length > 0 && hasMore && (
+          {rows.length > 0 && hasMore && (
             <div className="mt-4 flex flex-col items-center gap-3">
               <button
                 onClick={loadMore}
@@ -605,7 +625,7 @@ export default function LiveDashboard({
             </div>
           )}
           
-          {!loading && rows.length > 0 && (
+          {rows.length > 0 && (
             <p className="text-[10px] text-gray-600 mt-3">
               Showing {displayCount} of {rows.length} stocks | Matrix View
               {sector && sector !== 'all' ? ` | 🔵 ${sector}` : ''}

@@ -519,54 +519,28 @@ export default function NexRadarDashboard(){
         .fup{animation:flashUp 0.4s ease}.fdn{animation:flashDn 0.4s ease}
       `}</style>
 
-      {/* ── NAV ── */}
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
-                   padding:"0 16px",height:42,background:T.panel,
-                   borderBottom:`1px solid ${T.line2}`,position:"sticky",top:0,zIndex:100}}>
-        <div style={{display:"flex",alignItems:"center",gap:10}}>
-          <div style={{fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:18,color:C.amber,letterSpacing:".1em"}}>
-            NEX<span style={{color:T.text}}>RADAR</span></div>
-          <div style={{fontSize:8,color:T.muted,letterSpacing:".12em",marginTop:2}}>REAL-TIME MARKET INTELLIGENCE</div>
-        </div>
-        <div style={{display:"flex",gap:4}}>
-          {["DASHBOARD","SIGNALS","EARNINGS","PORTFOLIO"].map(t=>(
-            <button key={t} onClick={()=>setTab(t)} style={{
-              background:activeTab===t?`rgba(245,158,11,0.12)`:"transparent",
-              color:activeTab===t?C.amber:T.muted,
-              border:`1px solid ${activeTab===t?C.amber:"transparent"}`,
-              borderRadius:4,padding:"3px 10px",fontSize:9,
-              fontFamily:"'Rajdhani',sans-serif",fontWeight:700,cursor:"pointer",letterSpacing:".1em"}}>
-              {t}</button>
-          ))}
-        </div>
-        <div style={{display:"flex",alignItems:"center",gap:12}}>
-          <div style={{fontSize:9,color:wsColor}}>{wsIcon} {wsStatus.toUpperCase()}</div>
-          <div style={{fontSize:9,color:T.muted}}>TICK <span style={{color:C.cyan}}>{heartbeat}</span></div>
-          <div style={{fontSize:9,color:T.muted}}>
-            LIVE <span style={{color:C.amber,fontWeight:700}}>{liveCount.toLocaleString()}</span>
-            <span style={{color:T.muted}}> / {totalCount.toLocaleString()}</span>
-          </div>
-          <button onClick={()=>setDark(d=>!d)} style={{background:"transparent",border:`1px solid ${T.line2}`,
-            borderRadius:4,padding:"2px 7px",fontSize:10,color:T.muted,cursor:"pointer"}}>
-            {darkMode?"☀":"🌙"}</button>
-        </div>
-      </div>
-
       {/* ── ALERT STRIP ── */}
       <div style={{display:"flex",gap:6,padding:"5px 16px",background:T.bg2,
                    borderBottom:`1px solid ${T.line}`,overflowX:"auto"}}>
-        {[{label:"VOL SPIKES",val:volSpikes,color:C.amber},
-          {label:"GAP PLAYS",val:gapPlays,color:C.cyan},
-          {label:"DIAMONDS 💎",val:diamonds,color:C.violet},
-          {label:"AH MOMENTUM",val:ahMomt,color:C.green2},
-          {label:"GAINERS",val:posCount,color:C.green2},
-          {label:"EARNINGS GAPS",val:earningsGaps,color:C.amber2}].map(({label,val,color})=>(
-          <div key={label} style={{display:"flex",alignItems:"center",gap:5,
+        {[{label:"VOL SPIKES",val:volSpikes,color:C.amber,filter:"volume_spike"},
+          {label:"GAP PLAYS",val:gapPlays,color:C.cyan,filter:"gap_play"},
+          {label:"DIAMONDS 💎",val:diamonds,color:C.violet,filter:"diamond"},
+          {label:"AH MOMENTUM",val:ahMomt,color:C.green2,filter:"ah_momentum"},
+          {label:"GAINERS",val:posCount,color:C.green2,filter:"gainers"},
+          {label:"EARNINGS GAPS",val:earningsGaps,color:C.amber2,filter:"earnings_gap"}].map(({label,val,color,filter})=>(
+          <button key={label} onClick={()=>{
+            // Filter the data based on the clicked alert type
+            if(filter==="volume_spike") setDS("all"); // Reset to show all, then filter will apply
+            // Note: Actual filtering would need to be implemented in the data filtering logic
+          }} style={{display:"flex",alignItems:"center",gap:5,
             background:T.panel,border:`1px solid ${T.line2}`,borderRadius:5,
-            padding:"3px 10px",whiteSpace:"nowrap"}}>
+            padding:"3px 10px",whiteSpace:"nowrap",cursor:"pointer",
+            transition:"all 0.15s",outline:"none"}}
+            onMouseEnter={e=>{e.currentTarget.style.background=T.panel2;e.currentTarget.style.borderColor=color;}}
+            onMouseLeave={e=>{e.currentTarget.style.background=T.panel;e.currentTarget.style.borderColor=T.line2;}}>
             <span style={{fontSize:8,color:T.muted,letterSpacing:".1em"}}>{label}</span>
             <span style={{fontFamily:"'Rajdhani',sans-serif",fontSize:16,fontWeight:700,color}}>{val}</span>
-          </div>
+          </button>
         ))}
       </div>
 
