@@ -124,7 +124,8 @@ class WSEngine:
         self._monitor_tickers: Set[str]       = set()
         self._portfolio_tickers: Set[str]     = set()
         self._last_portfolio_refresh          = 0.0
-        self._PORTFOLIO_REFRESH_INTERVAL      = 30.0
+        # Refresh interval: 3s for responsive updates (matches SQLite local behavior)
+        self._PORTFOLIO_REFRESH_INTERVAL      = float(os.getenv("PORTFOLIO_REFRESH_INTERVAL", "3.0"))
 
         # ── WebSocket state ────────────────────────────────────────────────────
         self.ws_health_status    = "connecting"
@@ -564,7 +565,7 @@ class WSEngine:
     def _refresh_portfolio_monitor(self):
         """
         Fetch portfolio and monitor tickers from database.
-        Called on startup and periodically every 30 seconds.
+        Called on startup and periodically every 3 seconds (configurable).
         """
         try:
             portfolio_rows = self.db.get_portfolio()
@@ -579,7 +580,7 @@ class WSEngine:
                 if r.get("ticker")
             }
             
-            logger.info(
+            logger.debug(
                 f"Refreshed portfolio/monitor: "
                 f"{len(self._portfolio_tickers)} portfolio, "
                 f"{len(self._monitor_tickers)} monitor tickers"

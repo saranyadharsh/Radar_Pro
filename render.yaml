@@ -11,6 +11,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: PORTFOLIO_REFRESH_INTERVAL
+        value: "3.0"
       - key: MASSIVE_API_KEY
         sync: false          # set in Render dashboard
       - key: SUPABASE_URL

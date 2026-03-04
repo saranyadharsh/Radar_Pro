@@ -84,9 +84,39 @@ export default function LiveDashboard({
   const [displayCount,  setDisplayCount]  = useState(50)
   const [isLoadingMore, setIsLoadingMore] = useState(false)
   const [isLoadingSource, setIsLoadingSource] = useState(false)
+  const [lastRefreshTime, setLastRefreshTime] = useState(Date.now())
 
   const session = metrics?.session ?? 'MARKET_HOURS'
   const isAH    = session === 'AFTER_HOURS'
+
+  // Auto-refresh portfolio/monitor data every 3 seconds when viewing those sources
+  useEffect(() => {
+    if (source !== 'portfolio' && source !== 'monitor') {
+      return // Only auto-refresh for portfolio and monitor
+    }
+
+    const refreshInterval = setInterval(() => {
+      console.log(`[LiveDashboard] Auto-refreshing ${source} data`)
+      setLastRefreshTime(Date.now())
+      
+      const endpoint = source === 'portfolio' ? '/api/portfolio' : '/api/monitor'
+      fetch(`${API}${endpoint}`)
+        .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
+        .then(data => {
+          const tickers = data.tickers || data || []
+          if (source === 'portfolio') {
+            setPortfolioData(tickers)
+          } else {
+            setMonitorData(tickers)
+          }
+        })
+        .catch(err => {
+          console.error(`[LiveDashboard] ${source} auto-refresh error:`, err)
+        })
+    }, 3000) // Refresh every 3 seconds to match backend
+
+    return () => clearInterval(refreshInterval)
+  }, [source])
 
   // Reset display count when filters change
   useEffect(() => {
@@ -95,63 +125,69 @@ export default function LiveDashboard({
 
   // Fetch portfolio, monitor, and earnings data when source changes
   useEffect(() => {
-    setIsLoadingSource(true)
-    
-    if (source === 'portfolio') {
-      fetch(`${API}/api/portfolio`)
-        .then(r => {
-          if (!r.ok) throw new Error(`HTTP ${r.status}`)
-          return r.json()
-        })
-        .then(data => {
-          console.log('[LiveDashboard] Portfolio data:', data)
-          setPortfolioData(data.tickers || data || [])
-        })
-        .catch(err => {
-          console.error('[LiveDashboard] Portfolio fetch error:', err)
-          setPortfolioData([])
-        })
-        .finally(() => setIsLoadingSource(false))
-    } else if (source === 'monitor') {
-      fetch(`${API}/api/monitor`)
-        .then(r => {
-          if (!r.ok) throw new Error(`HTTP ${r.status}`)
-          return r.json()
-        })
-        .then(data => {
-          console.log('[LiveDashboard] Monitor data:', data)
-          setMonitorData(data.tickers || data || [])
-        })
-        .catch(err => {
-          console.error('[LiveDashboard] Monitor fetch error:', err)
-          setMonitorData([])
-        })
-        .finally(() => setIsLoadingSource(false))
-    } else if (source === 'earnings') {
-      const start = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)
-      const end   = new Date(Date.now() + 60 * 86400000).toISOString().slice(0, 10)
-      fetch(`${API}/api/earnings?start=${start}&end=${end}`)
-        .then(r => {
-          if (!r.ok) throw new Error(`HTTP ${r.status}`)
-          return r.json()
-        })
-        .then(data => {
-          console.log('[LiveDashboard] Earnings data:', data)
-          const tickers = Array.isArray(data) ? data.map(e => e.ticker) : []
-          setEarningsData(tickers)
-        })
-        .catch(err => {
-          console.error('[LiveDashboard] Earnings fetch error:', err)
-          setEarningsData([])
-        })
-        .finally(() => setIsLoadingSource(false))
-    } else {
-      // Reset when switching to 'all' or other sources
-      setPortfolioData([])
-      setMonitorData([])
-      setEarningsData([])
-      setIsLoadingSource(false)
-    }
+    // Debounce: wait 300ms before fetching to avoid rapid API calls
+    const timeoutId = setTimeout(() => {
+      setIsLoadingSource(true)
+      
+      if (source === 'portfolio') {
+        fetch(`${API}/api/portfolio`)
+          .then(r => {
+            if (!r.ok) throw new Error(`HTTP ${r.status}`)
+            return r.json()
+          })
+          .then(data => {
+            console.log('[LiveDashboard] Portfolio data:', data)
+            setPortfolioData(data.tickers || data || [])
+          })
+          .catch(err => {
+            console.error('[LiveDashboard] Portfolio fetch error:', err)
+            setPortfolioData([])
+          })
+          .finally(() => setIsLoadingSource(false))
+      } else if (source === 'monitor') {
+        fetch(`${API}/api/monitor`)
+          .then(r => {
+            if (!r.ok) throw new Error(`HTTP ${r.status}`)
+            return r.json()
+          })
+          .then(data => {
+            console.log('[LiveDashboard] Monitor data:', data)
+            setMonitorData(data.tickers || data || [])
+          })
+          .catch(err => {
+            console.error('[LiveDashboard] Monitor fetch error:', err)
+            setMonitorData([])
+          })
+          .finally(() => setIsLoadingSource(false))
+      } else if (source === 'earnings') {
+        const start = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)
+        const end   = new Date(Date.now() + 60 * 86400000).toISOString().slice(0, 10)
+        fetch(`${API}/api/earnings?start=${start}&end=${end}`)
+          .then(r => {
+            if (!r.ok) throw new Error(`HTTP ${r.status}`)
+            return r.json()
+          })
+          .then(data => {
+            console.log('[LiveDashboard] Earnings data:', data)
+            const tickers = Array.isArray(data) ? data.map(e => e.ticker) : []
+            setEarningsData(tickers)
+          })
+          .catch(err => {
+            console.error('[LiveDashboard] Earnings fetch error:', err)
+            setEarningsData([])
+          })
+          .finally(() => setIsLoadingSource(false))
+      } else {
+        // Reset when switching to 'all' or other sources
+        setPortfolioData([])
+        setMonitorData([])
+        setEarningsData([])
+        setIsLoadingSource(false)
+      }
+    }, 300) // 300ms debounce delay
+
+    // Cleanup: cancel pending fetch if source changes again
+    return () => clearTimeout(timeoutId)
   }, [source])
 
   const rows = useMemo(() => {
@@ -342,7 +378,15 @@ export default function LiveDashboard({
               Loading {source}...
             </span>
           ) : (
-            <span>{rows.length} stocks shown</span>
+            <div className="flex items-center gap-3">
+              <span>{rows.length} stocks shown</span>
+              {(source === 'portfolio' || source === 'monitor') && (
+                <span className="flex items-center gap-1 text-[10px]">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                  Auto-refresh: 3s
+                </span>
+              )}
+            </div>
           )}
         </div>
       </div>
