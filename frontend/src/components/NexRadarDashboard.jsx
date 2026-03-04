@@ -23,6 +23,7 @@
  */
 
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import MiniSparkline from './MiniSparkline';
 
 const API    = import.meta.env.VITE_API_BASE || "";
 const WS_URL = import.meta.env.VITE_WS_URL  || "ws://localhost:8000/ws/live";
@@ -326,8 +327,9 @@ function PortfolioPage({portfolio,tickers,T,onSelect}){
 }
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
-export default function NexRadarDashboard(){
+export default function NexRadarDashboard({darkMode:darkModeProp=true}){
   const[tickers,        setTickers]       =useState(new Map()); // Map<ticker, live_row> from WS
+  const[priceHistory,   setPriceHistory]  =useState(new Map()); // Map<ticker, price[]> for sparklines
   const[monitorSet,     setMonitorSet]    =useState(new Set()); // Set<ticker> from monitor table
   const[portfolioSet,   setPortfolioSet]  =useState(new Set()); // Set<ticker> from portfolio table
   const[signals,        setSignals]       =useState([]);
@@ -344,13 +346,17 @@ export default function NexRadarDashboard(){
   const[activeSector,setSector]=useState("ALL");
   const[viewMode,setView]  =useState("TABLE");
   const[search,  setSearch]=useState("");
-  const[darkMode,setDark]  =useState(true);
+  const[darkMode,setDark]  =useState(darkModeProp); // Use prop as initial value
   const[tvCount, setTvCount]=useState(5);
   const[bulkTarget,setBulkT]=useState("tradingview");
   const[heartbeat,setHB]   =useState(nowT());
   const[flashMap, setFlash]=useState({});
   const[wsStatus, setWsStatus]=useState("connecting");
   const[activeTab,setTab]  =useState("DASHBOARD");
+  const[activeAlertFilter,setAlertFilter]=useState(null); // For alert card filtering
+
+  // Sync with parent darkMode prop
+  useEffect(()=>{setDark(darkModeProp)},[darkModeProp]);
 
   const T=darkMode?DARK:LIGHT;
   const wsRef=useRef(null),retryTimer=useRef(null),retryDelay=useRef(1000);
@@ -367,14 +373,32 @@ export default function NexRadarDashboard(){
           const msg=JSON.parse(text);
           if(msg.type==="snapshot"){
             const m=new Map();
-            for(const row of msg.data??[])m.set(row.ticker,row);
+            const hist=new Map();
+            for(const row of msg.data??[]){
+              m.set(row.ticker,row);
+              // Initialize price history with current price (20 points)
+              const price=row.live_price||0;
+              hist.set(row.ticker,Array(20).fill(price));
+            }
             setTickers(m);
+            setPriceHistory(hist);
             const first=msg.data?.find(r=>r.is_positive);
             if(first)setSelected(s=>s||first.ticker);
           }else if(msg.type==="tick"){
             setTickers(prev=>{
               const next=new Map(prev);
               next.set(msg.ticker,{...(prev.get(msg.ticker)??{}),...msg.data});
+              return next;
+            });
+            // Update price history - keep last 20 prices
+            setPriceHistory(prev=>{
+              const next=new Map(prev);
+              const history=next.get(msg.ticker)||[];
+              const newPrice=msg.data?.live_price;
+              if(newPrice!=null){
+                const updated=[...history.slice(-19),newPrice]; // Keep last 19 + new = 20
+                next.set(msg.ticker,updated);
+              }
               return next;
             });
             setFlash(f=>({...f,[msg.ticker]:(msg.data?.change_value??0)>=0?"up":"dn"}));
@@ -454,6 +478,14 @@ export default function NexRadarDashboard(){
   const filtered=useMemo(()=>{
     let rows=[...allRows];
 
+    // Alert filter (from alert cards)
+    if(activeAlertFilter==="volume_spike") rows=rows.filter(r=>r.volume_spike);
+    if(activeAlertFilter==="gap_play") rows=rows.filter(r=>(r.gap_percent||0)>2);
+    if(activeAlertFilter==="diamond") rows=rows.filter(r=>Math.abs(r.percent_change||0)>=5);
+    if(activeAlertFilter==="ah_momentum") rows=rows.filter(r=>r.ah_momentum);
+    if(activeAlertFilter==="gainers") rows=rows.filter(r=>(r.change_value||0)>0);
+    if(activeAlertFilter==="earnings_gap") rows=rows.filter(r=>r.is_earnings_gap_play);
+
     // Data source filter — uses Set for O(1) lookup
     if(dataSource==="monitor")   rows=rows.filter(r=>monitorSet.has(r.ticker));
     if(dataSource==="portfolio") rows=rows.filter(r=>portfolioSet.has(r.ticker));
@@ -470,7 +502,7 @@ export default function NexRadarDashboard(){
 
     rows.sort((a,b)=>sortDir*((a[sortBy]||0)-(b[sortBy]||0)));
     return rows;
-  },[allRows,dataSource,activeSector,search,sortBy,sortDir,monitorSet,portfolioSet]);
+  },[allRows,dataSource,activeSector,search,sortBy,sortDir,monitorSet,portfolioSet,activeAlertFilter]);
 
   const top10=useMemo(()=>[...filtered].sort((a,b)=>(b.change_value||0)-(a.change_value||0)).slice(0,10),[filtered]);
   const stock=selectedTicker?(allRows.find(r=>r.ticker===selectedTicker)||null):(top10[0]||null);
@@ -529,17 +561,18 @@ export default function NexRadarDashboard(){
           {label:"GAINERS",val:posCount,color:C.green2,filter:"gainers"},
           {label:"EARNINGS GAPS",val:earningsGaps,color:C.amber2,filter:"earnings_gap"}].map(({label,val,color,filter})=>(
           <button key={label} onClick={()=>{
-            // Filter the data based on the clicked alert type
-            if(filter==="volume_spike") setDS("all"); // Reset to show all, then filter will apply
-            // Note: Actual filtering would need to be implemented in the data filtering logic
+            // Toggle filter on/off
+            setAlertFilter(f=>f===filter?null:filter);
           }} style={{display:"flex",alignItems:"center",gap:5,
-            background:T.panel,border:`1px solid ${T.line2}`,borderRadius:5,
+            background:T.panel,border:`1px solid ${activeAlertFilter===filter?color:T.line2}`,borderRadius:5,
             padding:"3px 10px",whiteSpace:"nowrap",cursor:"pointer",
-            transition:"all 0.15s",outline:"none"}}
+            transition:"all 0.15s",outline:"none",
+            boxShadow:activeAlertFilter===filter?`0 0 8px ${color}44`:"none"}}
             onMouseEnter={e=>{e.currentTarget.style.background=T.panel2;e.currentTarget.style.borderColor=color;}}
-            onMouseLeave={e=>{e.currentTarget.style.background=T.panel;e.currentTarget.style.borderColor=T.line2;}}>
+            onMouseLeave={e=>{e.currentTarget.style.background=T.panel;e.currentTarget.style.borderColor=activeAlertFilter===filter?color:T.line2;}}>
             <span style={{fontSize:8,color:T.muted,letterSpacing:".1em"}}>{label}</span>
             <span style={{fontFamily:"'Rajdhani',sans-serif",fontSize:16,fontWeight:700,color}}>{val}</span>
+            {activeAlertFilter===filter&&<span style={{fontSize:10,color}}>✓</span>}
           </button>
         ))}
       </div>
@@ -708,6 +741,8 @@ export default function NexRadarDashboard(){
                   <thead style={{position:"sticky",top:0,background:T.panel2,zIndex:2}}>
                     <tr>
                       <Th label="TICKER"  col="ticker"/>
+                      <th style={{padding:"6px 8px",fontSize:9,color:T.muted,letterSpacing:".08em",
+                        textTransform:"uppercase",borderBottom:`1px solid ${T.line}`,fontWeight:600}}>TREND</th>
                       <Th label="PRICE"   col="live_price"/>
                       <Th label="CHG $"   col="change_value"/>
                       <Th label="CHG %"   col="percent_change"/>
@@ -734,6 +769,18 @@ export default function NexRadarDashboard(){
                           <td style={{padding:"5px 8px",borderBottom:`1px solid ${T.line}`}}>
                             <span style={{fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:12}}>{r.ticker}</span>
                             <div style={{fontSize:8,color:T.muted,maxWidth:100,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.company_name}</div>
+                          </td>
+                          {/* Sparkline */}
+                          <td style={{padding:"5px 8px",borderBottom:`1px solid ${T.line}`}}>
+                            <MiniSparkline
+                              data={priceHistory.get(r.ticker)||[r.live_price||0]}
+                              width={60}
+                              height={24}
+                              color={r.change_value >= 0 ? C.green : C.red}
+                              isPositive={r.change_value >= 0}
+                              showTooltip={false}
+                              ticker={r.ticker}
+                            />
                           </td>
                           {/* live_price — always shown irrespective of AH/AM */}
                           <td style={{padding:"5px 8px",borderBottom:`1px solid ${T.line}`,fontFamily:"'Rajdhani',sans-serif",fontSize:13,fontWeight:600}}>

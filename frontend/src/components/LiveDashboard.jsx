@@ -105,9 +105,9 @@ export default function LiveDashboard({
         .then(data => setMonitorData(data.tickers || []))
         .catch(() => setMonitorData([]))
     } else if (source === 'earnings') {
-      const today = new Date().toISOString().slice(0, 10)
-      const end   = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10)
-      fetch(`${API}/api/earnings?start=${today}&end=${end}`)
+      const start = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)
+      const end   = new Date(Date.now() + 60 * 86400000).toISOString().slice(0, 10)
+      fetch(`${API}/api/earnings?start=${start}&end=${end}`)
         .then(r => r.json())
         .then(data => setEarningsData((data || []).map(e => e.ticker)))
         .catch(() => setEarningsData([]))
@@ -133,9 +133,13 @@ export default function LiveDashboard({
 
     if (!showNegative) arr = arr.filter(r => r.is_positive)
 
-    // Sector filter (only meaningful when source === 'stock_list')
-    if (sector && sector !== 'all') {
-      arr = arr.filter(r => (r.sector ?? '').toLowerCase() === sector.toLowerCase())
+    // Sector filter — only for stock_list / all sources
+    if (sector && sector !== 'all' && (source === 'stock_list' || source === 'all')) {
+      // DEBUG: log unique sector values (remove once confirmed matching)
+      const uniqueSectors = [...new Set(Array.from(tickers.values()).map(r => r.sector))]
+      console.log('[NexRadar] Sector values in WS data:', uniqueSectors)
+      console.log('[NexRadar] Filtering by sector:', sector)
+      arr = arr.filter(r => (r.sector ?? '').trim().toLowerCase() === sector.trim().toLowerCase())
     }
 
     // Active filter card
@@ -197,7 +201,10 @@ export default function LiveDashboard({
   }, [isLoadingMore, hasMore, displayCount])
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className={clsx(
+      'flex flex-col gap-3 rounded-lg p-4',
+      darkMode ? 'bg-[#0a0f1a]' : 'bg-white'
+    )}>
 
       {/* Closed warnings */}
       {session === 'OVERNIGHT_SLEEP' && (
@@ -306,9 +313,9 @@ export default function LiveDashboard({
           {/* Empty States */}
           {rows.length === 0 && (
             wsStatus === 'connecting' ? (
-              <LoadingEmptyState />
+              <LoadingEmptyState darkMode={darkMode} />
             ) : tickers.size === 0 ? (
-              <NoDataEmptyState onRetry={() => window.location.reload()} />
+              <NoDataEmptyState onRetry={() => window.location.reload()} darkMode={darkMode} />
             ) : (
               <NoResultsEmptyState
                 onClear={() => {
@@ -322,6 +329,7 @@ export default function LiveDashboard({
                   setShowNegative(false)
                 }}
                 filterName={source !== 'all' ? source : (activeFilter || 'current filter')}
+                darkMode={darkMode}
               />
             )
           )}
@@ -518,9 +526,9 @@ export default function LiveDashboard({
           {/* Empty States */}
           {rows.length === 0 && (
             wsStatus === 'connecting' ? (
-              <LoadingEmptyState />
+              <LoadingEmptyState darkMode={darkMode} />
             ) : tickers.size === 0 ? (
-              <NoDataEmptyState onRetry={() => window.location.reload()} />
+              <NoDataEmptyState onRetry={() => window.location.reload()} darkMode={darkMode} />
             ) : (
               <NoResultsEmptyState
                 onClear={() => {
@@ -531,6 +539,7 @@ export default function LiveDashboard({
                   setShowNegative(false)
                 }}
                 filterName={source !== 'all' ? source : (activeFilter || 'current filter')}
+                darkMode={darkMode}
               />
             )
           )}
