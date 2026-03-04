@@ -35,8 +35,8 @@ from typing import Set, List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from supabase_db import SupabaseDB
-from ws_engine    import WSEngine
+from backend.supabase_db import SupabaseDB
+from backend.ws_engine    import WSEngine
 
 
 import yfinance as _yf
