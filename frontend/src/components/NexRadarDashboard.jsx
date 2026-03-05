@@ -809,15 +809,18 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
                 const isLong = (ticker.percent_change || 0) > 0;
                 return (
                   <div key={i} style={{ 
-                    display:"grid",
-                    gridTemplateColumns:"80px 60px 1fr",
+                    display:"flex",
+                    justifyContent: "flex-start",
                     alignItems:"center",
                     padding:"10px 0", 
                     borderBottom:i<4?`1px solid ${T.border}`:"none",
-                    gap:10
+                    gap: "16px"
                   }}>
-                    <span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:400 }}>{ticker.ticker}</span>
+                    <span style={{ width: "55px", color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:400 }}>
+                      {ticker.ticker}
+                    </span>
                     <span style={{ 
+                      width: "50px",
                       color: isLong ? T.green : T.red, 
                       fontSize:9, 
                       fontFamily:T.font, 
@@ -829,7 +832,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
                     }}>
                       {isLong ? "LONG" : "SHORT"}
                     </span>
-                    <span style={{ color: isLong ? T.green : T.red, fontSize:12, fontFamily:T.font, fontWeight:700, textAlign:"right" }}>
+                    <span style={{ color: isLong ? T.green : T.red, fontSize:12, fontFamily:T.font, fontWeight:700 }}>
                       {pct(ticker.percent_change)}
                     </span>
                   </div>
@@ -857,7 +860,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
               
               if (topGainers.length === 0) {
                 return Array(5).fill(0).map((_,i)=>(
-                  <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                  <div key={i} style={{ display:"flex", justifyContent:"flex-start", gap:"24px", alignItems:"center", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
                     <Shimmer w={44} h={11} />
                     <Shimmer w={55} h={11} opacity={0.5} />
                   </div>
@@ -865,8 +868,8 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
               }
               
               return topGainers.map((ticker, i) => (
-                <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
-                  <span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{ticker.ticker}</span>
+                <div key={i} style={{ display:"flex", justifyContent:"flex-start", gap:"24px", alignItems:"center", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                  <span style={{ width:"55px", color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{ticker.ticker}</span>
                   <span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{pct(ticker.percent_change)}</span>
                 </div>
               ));
@@ -889,16 +892,16 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
               
               if (topLosers.length === 0) {
                 return Array(5).fill(0).map((_,i)=>(
-                  <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                  <div key={i} style={{ display:"flex", justifyContent:"flex-start", gap:"24px", alignItems:"center", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
                     <Shimmer w={44} h={11} />
                     <Shimmer w={55} h={11} opacity={0.5} />
                   </div>
                 ));
               }
-              
+
               return topLosers.map((ticker, i) => (
-                <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
-                  <span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{ticker.ticker}</span>
+                <div key={i} style={{ display:"flex", justifyContent:"flex-start", gap:"24px", alignItems:"center", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                  <span style={{ width:"55px", color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{ticker.ticker}</span>
                   <span style={{ color:T.red, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{pct(ticker.percent_change)}</span>
                 </div>
               ));
@@ -1201,7 +1204,7 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
 
   // MH column definitions - SYMBOL column includes star + symbol + company name stacked
   const MH_COLS = [
-    { key:"symbol",   label:"SYMBOL",      w:"minmax(220px, 2fr)" },
+    { key:"symbol",   label:"SYMBOL",      w:"160px" }, // Fixed width to pull OPEN closer
     { key:"open",     label:"OPEN",        w:"90px" },
     { key:"price",    label:"PRICE",       w:"90px" },
     { key:"change",   label:"$ CHG",       w:"90px" },
@@ -1211,17 +1214,15 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
     { key:"rsi",      label:"RSI",         w:"70px" },
     { key:"signal",   label:"SIGNAL",      w:"100px" },
   ];
-
   // AH column definitions
   const AH_COLS = [
-    { key:"symbol",     label:"SYMBOL",        w:"minmax(220px, 2fr)" },
+    { key:"symbol",     label:"SYMBOL",        w:"160px" }, // Fixed width to pull PREV CLOSE closer
     { key:"prev_close", label:"PREV CLOSE",    w:"100px"  },
     { key:"today_close",label:"TODAY CLOSE",   w:"110px"  },
     { key:"live_price", label:"LIVE PRICE",    w:"100px"  },
     { key:"change",     label:"$ CHG",         w:"90px"  },
     { key:"pct",        label:"% CHG",         w:"90px"},
   ];
-
   const cols = subMode === "MH" ? MH_COLS : AH_COLS;
   const gridCols = cols.map(c => c.w).join(" ");
 
