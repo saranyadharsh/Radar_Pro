@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Test</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #1a1a1a; color: #00ff00; }
+        #log { white-space: pre-wrap; }
+        .error { color: #ff0000; }
+        .success { color: #00ff00; }
+        .info { color: #00d4ff; }
+    </style>
+</head>
+<body>
+    <h1>NexRadar WebSocket Connection Test</h1>
+    <div id="status">Status: <span id="statusText">Connecting...</span></div>
+    <div id="log"></div>
+    
+    <script>
+        const log = document.getElementById('log');
+        const statusText = document.getElementById('statusText');
+        
+        function addLog(message, className = 'info') {
+            const time = new Date().toLocaleTimeString();
+            log.innerHTML += `<div class="${className}">[${time}] ${message}</div>`;
+            log.scrollTop = log.scrollHeight;
+        }
+        
+        addLog('Attempting to connect to ws://localhost:8000/ws/live');
+        
+        const ws = new WebSocket('ws://localhost:8000/ws/live');
+        
+        ws.onopen = () => {
+            statusText.textContent = 'Connected ✓';
+            statusText.className = 'success';
+            addLog('✓ WebSocket connected successfully!', 'success');
+        };
+        
+        ws.onmessage = async (event) => {
+            try {
+                let data = event.data;
+                if (data instanceof Blob) {
+                    data = await data.text();
+                }
+                const msg = JSON.parse(data);
+                
+                if (msg.type === 'snapshot') {
+                    addLog(`✓ Received snapshot with ${msg.data?.length || 0} tickers`, 'success');
+                } else if (msg.type === 'tick') {
+                    addLog(`✓ Tick: ${msg.ticker} = $${msg.data?.live_price?.toFixed(2)} (${msg.data?.percent_change?.toFixed(2)}%)`, 'info');
+                } else if (msg.type === 'ping') {
+                    addLog('← Server ping received', 'info');
+                    ws.send(JSON.stringify({ type: 'pong' }));
+                    addLog('→ Pong sent', 'info');
+                } else {
+                    addLog(`✓ Message: ${JSON.stringify(msg).substring(0, 100)}`, 'info');
+                }
+            } catch (err) {
+                addLog(`✗ Parse error: ${err.message}`, 'error');
+            }
+        };
+        
+        ws.onerror = (error) => {
+            statusText.textContent = 'Error ✗';
+            statusText.className = 'error';
+            addLog(`✗ WebSocket error: ${error}`, 'error');
+        };
+        
+        ws.onclose = (event) => {
+            statusText.textContent = 'Disconnected ✗';
+            statusText.className = 'error';
+            addLog(`✗ WebSocket closed: Code ${event.code}, Reason: ${event.reason || 'No reason'}`, 'error');
+        };
+        
+        // Send heartbeat every 30 seconds
+        setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'ping' }));
+                addLog('→ Client ping sent', 'info');
+            }
+        }, 30000);
+    </script>
+</body>
+</html>

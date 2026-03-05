@@ -419,25 +419,22 @@ function TVChart({ symbol, height=220, T }) {
       if (window.TradingView && ref.current) {
         new window.TradingView.widget({
           autosize: true,
-          symbol: symbol,
+          symbol: `NASDAQ:${symbol}`,
           interval: "5",
           timezone: "America/New_York",
           theme: "dark",
           style: "1",
           locale: "en",
           enable_publishing: false,
-          hide_top_toolbar: false,
+          hide_top_toolbar: true,
           hide_legend: true,
           hide_side_toolbar: true,
-          allow_symbol_change: true,
+          allow_symbol_change: false,
           save_image: false,
-          studies: [],
+          studies: [], // NO indicators — clean chart
           container_id: ref.current.id,
           backgroundColor: bg1,
           gridColor: border,
-          session: "extended",
-          enabled_features: ["pre_post_market_data","show_trading_sessions_on_chart"],
-          disabled_features: ["use_localstorage_for_settings"],
         });
       }
     };
@@ -452,7 +449,7 @@ function TVChart({ symbol, height=220, T }) {
 
 // ─── Sector Multi-Select Pills with count + cap logic ────────────────────────
 // Supports multi-select. If combined count > 1500, snaps to 1500 and ignores rest.
-function SectorPills({ selectedSectors, onChange, showCounts=false, T }) {
+function SectorPills({ selectedSectors, onChange, showCounts=false, actualCount=null, T }) {
   const handleClick = (id) => {
     if (id === "ALL") { onChange(["ALL"]); return; }
     // Remove ALL if it was there
@@ -475,7 +472,7 @@ function SectorPills({ selectedSectors, onChange, showCounts=false, T }) {
     onChange(next);
   };
 
-  const combinedCount = computeSectorTotal(selectedSectors);
+  const combinedCount = actualCount !== null ? actualCount : computeSectorTotal(selectedSectors);
   const isAll = selectedSectors.includes("ALL") || selectedSectors.length === 0;
 
   return (
@@ -532,19 +529,48 @@ function SectorPills({ selectedSectors, onChange, showCounts=false, T }) {
 // Market Breadth now includes EARNINGS tile with real-time sector performance
 function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerformance = {}, tickers, T }) {
   const sectorTiles = SECTORS.filter(s => s.id !== "ALL");
-
-  const [scalpSignals, setScalpSignals] = React.useState([]);
-  const [scalpFilter,  setScalpFilter]  = React.useState("ALL");
-  React.useEffect(() => {
-    const poll = () => fetch(`${API_BASE}/api/signals?limit=50`)
-      .then(r=>r.json()).then(d=>setScalpSignals(Array.isArray(d)?d:[])).catch(()=>{});
-    poll(); const id=setInterval(poll,5000); return ()=>clearInterval(id);
-  }, []);
-  const [earningsToday, setEarningsToday] = React.useState(null);
-  React.useEffect(() => {
-    const today=new Date().toISOString().slice(0,10);
+  
+  // Fetch earnings data for Earnings Today widget
+  const [earnings, setEarnings] = useState([]);
+  const [earningsLoading, setEarningsLoading] = useState(true);
+  
+  // Fetch watchlist for prioritizing earnings
+  const [watchlist, setWatchlist] = useState(new Set());
+  
+  // Market Breadth timeframe state
+  const [breadthTimeframe, setBreadthTimeframe] = useState("1D");
+  
+  // Scalp Signals filter state
+  const [scalpFilter, setScalpFilter] = useState("ALL");
+  
+  useEffect(() => {
+    // Fetch watchlist
+    fetch(`${API_BASE}/api/watchlist`)
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(data => setWatchlist(new Set(data.watchlist ?? [])))
+      .catch(err => console.warn('[NexRadar Dashboard] Failed to load watchlist:', err));
+    
+    // Fetch only today's earnings
+    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
     fetch(`${API_BASE}/api/earnings?start=${today}&end=${today}`)
-      .then(r=>r.json()).then(d=>setEarningsToday(Array.isArray(d)?d:[])).catch(()=>setEarningsToday([]));
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(data => {
+        // Backend returns array directly, not wrapped in object
+        const earningsArray = Array.isArray(data) ? data : [];
+        // Map backend field names to frontend expected names
+        const mappedEarnings = earningsArray.map(e => ({
+          ticker: e.ticker,
+          company_name: e.company_name,
+          date: e.earnings_date,
+          time: e.earnings_time
+        }));
+        setEarnings(mappedEarnings);
+        setEarningsLoading(false);
+      })
+      .catch(err => {
+        console.error('[NexRadar Dashboard] Failed to load earnings:', err);
+        setEarningsLoading(false);
+      });
   }, []);
 
   return (
@@ -553,8 +579,28 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
       <div style={{ display:"flex", gap:18, flexWrap:"wrap" }}>
         <div className="card card-glow" style={{ flex:2, minWidth:340 }}>
           <SectionHeader title="Market Breadth" T={T}>
-            <button className="btn-ghost" style={{ fontSize:9 }}>1D</button>
-            <button className="btn-ghost" style={{ fontSize:9 }}>1W</button>
+            <button 
+              className="btn-ghost" 
+              style={{ 
+                fontSize:9, 
+                background: breadthTimeframe === "1D" ? T.cyan+"20" : "transparent",
+                color: breadthTimeframe === "1D" ? T.cyan : T.text2
+              }}
+              onClick={() => setBreadthTimeframe("1D")}
+            >
+              1D
+            </button>
+            <button 
+              className="btn-ghost" 
+              style={{ 
+                fontSize:9,
+                background: breadthTimeframe === "1W" ? T.cyan+"20" : "transparent",
+                color: breadthTimeframe === "1W" ? T.cyan : T.text2
+              }}
+              onClick={() => setBreadthTimeframe("1W")}
+            >
+              1W
+            </button>
           </SectionHeader>
           <div style={{ padding:14, display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(115px,1fr))", gap:8 }}>
             {sectorTiles.map(s => {
@@ -565,29 +611,112 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
 
               return (
                 <div key={s.id} onClick={() => { onSectorChange([s.id]); onNavigate("live"); }}
-                  style={{ background: active ? s.color+"12" : T.bg2, border:`1px solid ${active ? s.color+"40" : T.border}`,
-                    borderRadius:10, padding:"14px 16px", cursor:"pointer", transition:"all 0.2s ease",
-                    borderTop: s.id === "EARNINGS" ? `2px solid ${T.gold}50` : undefined }}
-                  onMouseEnter={e=>{ e.currentTarget.style.borderColor=s.color+"50"; e.currentTarget.style.background=s.color+"0e"; }}
-                  onMouseLeave={e=>{ e.currentTarget.style.borderColor=active?s.color+"40":T.border; e.currentTarget.style.background=active?s.color+"12":T.bg2; }}>
+                  style={{ 
+                    background: active ? s.color+"12" : T.bg2, 
+                    borderLeft:`1px solid ${active ? s.color+"40" : T.border}`,
+                    borderRight:`1px solid ${active ? s.color+"40" : T.border}`,
+                    borderBottom:`1px solid ${active ? s.color+"40" : T.border}`,
+                    borderTop: s.id === "EARNINGS" ? `2px solid ${T.gold}50` : `1px solid ${active ? s.color+"40" : T.border}`,
+                    borderRadius:10, 
+                    padding:"14px 16px", 
+                    cursor:"pointer", 
+                    transition:"all 0.2s ease"
+                  }}
+                  onMouseEnter={e=>{ 
+                    e.currentTarget.style.borderLeft=s.color+"50"; 
+                    e.currentTarget.style.borderRight=s.color+"50"; 
+                    e.currentTarget.style.borderBottom=s.color+"50"; 
+                    e.currentTarget.style.borderTop=s.id === "EARNINGS" ? `2px solid ${T.gold}50` : s.color+"50";
+                    e.currentTarget.style.background=s.color+"0e"; 
+                  }}
+                  onMouseLeave={e=>{ 
+                    e.currentTarget.style.borderLeft=active?s.color+"40":T.border; 
+                    e.currentTarget.style.borderRight=active?s.color+"40":T.border; 
+                    e.currentTarget.style.borderBottom=active?s.color+"40":T.border; 
+                    e.currentTarget.style.borderTop=s.id === "EARNINGS" ? `2px solid ${T.gold}50` : (active?s.color+"40":T.border);
+                    e.currentTarget.style.background=active?s.color+"12":T.bg2; 
+                  }}>
                   <div style={{ color:s.color, fontSize:11, letterSpacing:0.8, fontFamily:T.font, marginBottom:10, opacity:0.9, fontWeight:700 }}>
                     {s.id === "EARNINGS" ? "◎ " : ""}{s.label}
                   </div>
                   
                   {/* Real-time sector performance */}
-                  {s.id !== "EARNINGS" && hasData ? (
-                    <div style={{ 
-                      fontFamily:T.font, 
-                      fontSize:24, 
-                      fontWeight:800, 
-                      color: isPositive ? T.green : T.red,
-                      letterSpacing:0.5,
-                      marginBottom:8
-                    }}>
-                      {pct(perf.avgReturn)}
-                    </div>
-                  ) : s.id === "EARNINGS" ? (
-                    <Shimmer w="75%" h={20} />
+                  {s.id === "EARNINGS" ? (
+                    (() => {
+                      // Calculate performance for earnings stocks (today only)
+                      const tickerArray = Array.from(tickers.values());
+                      
+                      // Get tickers with earnings today from our earnings list
+                      const earningsTodaySet = new Set(earnings.map(e => e.ticker));
+                      
+                      const earningsStocks = tickerArray.filter(t => 
+                        t.is_earnings_gap_play || earningsTodaySet.has(t.ticker)
+                      );
+                      
+                      if (earningsStocks.length === 0) {
+                        return (
+                          <div style={{ 
+                            fontFamily:T.font, 
+                            fontSize:24, 
+                            fontWeight:800, 
+                            color: T.text2,
+                            letterSpacing:0.5,
+                            marginBottom:8
+                          }}>
+                            —%
+                          </div>
+                        );
+                      }
+                      
+                      const avgReturn = earningsStocks.reduce((sum, t) => sum + (t.percent_change || 0), 0) / earningsStocks.length;
+                      const gainers = earningsStocks.filter(t => (t.percent_change || 0) > 0).length;
+                      const losers = earningsStocks.filter(t => (t.percent_change || 0) < 0).length;
+                      const isPositive = avgReturn >= 0;
+                      
+                      return (
+                        <>
+                          <div style={{ 
+                            fontFamily:T.font, 
+                            fontSize:24, 
+                            fontWeight:800, 
+                            color: isPositive ? T.green : T.red,
+                            letterSpacing:0.5,
+                            marginBottom:8
+                          }}>
+                            {pct(avgReturn)}
+                          </div>
+                          <div style={{ color:T.text2, fontSize:11, marginTop:6, fontFamily:T.font, display:"flex", justifyContent:"space-between", alignItems:"center", fontWeight:500 }}>
+                            <span>{earningsStocks.length} stocks</span>
+                            <span>
+                              <span style={{ color:T.green, fontWeight:600 }}>{gainers}↑</span>
+                              {" "}
+                              <span style={{ color:T.red, fontWeight:600 }}>{losers}↓</span>
+                            </span>
+                          </div>
+                        </>
+                      );
+                    })()
+                  ) : hasData ? (
+                    <>
+                      <div style={{ 
+                        fontFamily:T.font, 
+                        fontSize:24, 
+                        fontWeight:800, 
+                        color: isPositive ? T.green : T.red,
+                        letterSpacing:0.5,
+                        marginBottom:8
+                      }}>
+                        {pct(perf.avgReturn)}
+                      </div>
+                      <div style={{ color:T.text2, fontSize:11, marginTop:6, fontFamily:T.font, display:"flex", justifyContent:"space-between", alignItems:"center", fontWeight:500 }}>
+                        <span>{perf.count} stocks</span>
+                        <span>
+                          <span style={{ color:T.green, fontWeight:600 }}>{perf.gainers}↑</span>
+                          {" "}
+                          <span style={{ color:T.red, fontWeight:600 }}>{perf.losers}↓</span>
+                        </span>
+                      </div>
+                    </>
                   ) : (
                     <div style={{ 
                       fontFamily:T.font, 
@@ -602,16 +731,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
                   )}
 
                   {/* Stock count and gainers/losers */}
-                  {s.id !== "EARNINGS" && hasData ? (
-                    <div style={{ color:T.text2, fontSize:11, marginTop:6, fontFamily:T.font, display:"flex", justifyContent:"space-between", alignItems:"center", fontWeight:500 }}>
-                      <span>{perf.count} stocks</span>
-                      <span>
-                        <span style={{ color:T.green, fontWeight:600 }}>{perf.gainers}↑</span>
-                        {" "}
-                        <span style={{ color:T.red, fontWeight:600 }}>{perf.losers}↓</span>
-                      </span>
-                    </div>
-                  ) : (
+                  {s.id === "EARNINGS" ? null : hasData ? null : (
                     <div style={{ color:T.text2, fontSize:11, marginTop:6, fontFamily:T.font, fontWeight:500 }}>
                       {s.count ? `${s.count.toLocaleString()} stocks` : "— stocks"}
                     </div>
@@ -625,37 +745,97 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
         {/* Scalp Signals */}
         <div className="card" style={{ flex:1, minWidth:200 }}>
           <SectionHeader title="Scalp Signals" T={T}>
-            {[["ALL",T.text1],["LONG",T.green],["SHORT",T.red]].map(([f,c])=>(
-              <button key={f} onClick={()=>setScalpFilter(f)} style={{
-                background:scalpFilter===f?c+"18":"none", border:`1px solid ${scalpFilter===f?c+"50":T.border}`,
-                color:scalpFilter===f?c:T.text2, borderRadius:4, padding:"3px 8px",
-                cursor:"pointer", fontFamily:T.font, fontSize:9, letterSpacing:1 }}>{f}</button>
-            ))}
+            <button 
+              className="btn-ghost" 
+              style={{ 
+                fontSize:9, 
+                background: scalpFilter === "ALL" ? T.cyan+"20" : "transparent",
+                color: scalpFilter === "ALL" ? T.cyan : T.text2,
+                padding:"4px 8px",
+                borderRadius:4
+              }}
+              onClick={() => setScalpFilter("ALL")}
+            >
+              ALL
+            </button>
+            <button 
+              className="btn-ghost" 
+              style={{ 
+                fontSize:9,
+                background: scalpFilter === "LONG" ? T.green+"20" : "transparent",
+                color: scalpFilter === "LONG" ? T.green : T.text2,
+                padding:"4px 8px",
+                borderRadius:4
+              }}
+              onClick={() => setScalpFilter("LONG")}
+            >
+              LONG
+            </button>
+            <button 
+              className="btn-ghost" 
+              style={{ 
+                fontSize:9,
+                background: scalpFilter === "SHORT" ? T.red+"20" : "transparent",
+                color: scalpFilter === "SHORT" ? T.red : T.text2,
+                padding:"4px 8px",
+                borderRadius:4
+              }}
+              onClick={() => setScalpFilter("SHORT")}
+            >
+              SHORT
+            </button>
           </SectionHeader>
-          <div style={{ maxHeight:220, overflowY:"auto", padding:"8px 14px" }}>
-            {(()=>{
-              const fl=scalpFilter==="ALL"?scalpSignals:scalpSignals.filter(s=>s.direction===scalpFilter);
-              if(!fl.length) return <div style={{color:T.text2,fontSize:11,fontFamily:T.font,textAlign:"center",padding:"30px 0"}}>
-                {scalpSignals.length===0?"⏳ Waiting for signals…":`No ${scalpFilter} signals`}</div>;
-              return fl.slice(0,8).map((sig,i)=>{
-                const isLong=sig.direction==="LONG",c=isLong?T.green:T.red;
-                return(<div key={sig.id||i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
-                  padding:"8px 0",borderBottom:i<fl.length-1?`1px solid ${T.border}`:"none"}}>
-                  <div style={{display:"flex",alignItems:"center",gap:7}}>
-                    <span style={{color:c,fontSize:12,fontWeight:700}}>{isLong?"▲":"▼"}</span>
-                    <div><div style={{color:T.cyan,fontSize:12,fontFamily:T.font,fontWeight:700}}>{sig.symbol}</div>
-                      <div style={{color:T.text2,fontSize:9,fontFamily:T.font}}>{sig.strength}</div></div>
+          <div style={{ padding:"8px 14px" }}>
+            {(() => {
+              const tickerArray = Array.from(tickers.values());
+              let topSignals = tickerArray
+                .filter(t => Math.abs(t.percent_change || 0) > 1)
+                .sort((a, b) => Math.abs(b.percent_change || 0) - Math.abs(a.percent_change || 0));
+              
+              // Apply filter
+              if (scalpFilter === "LONG") {
+                topSignals = topSignals.filter(t => (t.percent_change || 0) > 0);
+              } else if (scalpFilter === "SHORT") {
+                topSignals = topSignals.filter(t => (t.percent_change || 0) < 0);
+              }
+              
+              topSignals = topSignals.slice(0, 5);
+              
+              if (topSignals.length === 0) {
+                return <EmptyState icon="◉" label="NO SIGNALS" sub="Market is closed or no significant movements" h={160} T={T} />;
+              }
+              
+              return topSignals.map((ticker, i) => {
+                const isLong = (ticker.percent_change || 0) > 0;
+                return (
+                  <div key={i} style={{ 
+                    display:"grid",
+                    gridTemplateColumns:"80px 60px 1fr",
+                    alignItems:"center",
+                    padding:"10px 0", 
+                    borderBottom:i<4?`1px solid ${T.border}`:"none",
+                    gap:10
+                  }}>
+                    <span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:400 }}>{ticker.ticker}</span>
+                    <span style={{ 
+                      color: isLong ? T.green : T.red, 
+                      fontSize:9, 
+                      fontFamily:T.font, 
+                      fontWeight:700,
+                      padding:"2px 6px",
+                      borderRadius:4,
+                      background: isLong ? T.green+"15" : T.red+"15",
+                      textAlign:"center"
+                    }}>
+                      {isLong ? "LONG" : "SHORT"}
+                    </span>
+                    <span style={{ color: isLong ? T.green : T.red, fontSize:12, fontFamily:T.font, fontWeight:700, textAlign:"right" }}>
+                      {pct(ticker.percent_change)}
+                    </span>
                   </div>
-                  <div style={{textAlign:"right"}}>
-                    <div style={{color:c,fontSize:11,fontFamily:T.font,fontWeight:700}}>${(sig.entry_price||0).toFixed(2)}</div>
-                    <div style={{color:T.text2,fontSize:9,fontFamily:T.font}}>R:R 1:{sig.risk_reward}</div>
-                  </div></div>);
+                );
               });
             })()}
-          </div>
-          <div style={{padding:"8px 14px",borderTop:`1px solid ${T.border}`,display:"flex",justifyContent:"space-between"}}>
-            <span style={{color:T.text2,fontSize:9,fontFamily:T.font}}>{scalpSignals.length} total</span>
-            <button className="btn-ghost" style={{fontSize:9}} onClick={()=>onNavigate("signals")}>VIEW ALL →</button>
           </div>
         </div>
       </div>
@@ -677,7 +857,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
               
               if (topGainers.length === 0) {
                 return Array(5).fill(0).map((_,i)=>(
-                  <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                  <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
                     <Shimmer w={44} h={11} />
                     <Shimmer w={55} h={11} opacity={0.5} />
                   </div>
@@ -685,7 +865,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
               }
               
               return topGainers.map((ticker, i) => (
-                <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
                   <span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{ticker.ticker}</span>
                   <span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{pct(ticker.percent_change)}</span>
                 </div>
@@ -709,7 +889,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
               
               if (topLosers.length === 0) {
                 return Array(5).fill(0).map((_,i)=>(
-                  <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                  <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
                     <Shimmer w={44} h={11} />
                     <Shimmer w={55} h={11} opacity={0.5} />
                   </div>
@@ -717,7 +897,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
               }
               
               return topLosers.map((ticker, i) => (
-                <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
                   <span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{ticker.ticker}</span>
                   <span style={{ color:T.red, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{pct(ticker.percent_change)}</span>
                 </div>
@@ -727,41 +907,119 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
         </div>
 
         {/* Earnings Today */}
-        <div className="card" style={{ flex:1, minWidth:200 }}>
+        <div className="card" style={{ flex:1, minWidth:280 }}>
           <SectionHeader title="Earnings Today" T={T}>
-            <button className="btn-ghost" style={{ fontSize:8 }} onClick={()=>onNavigate("earnings")}>VIEW ALL</button>
+            <button className="btn-ghost" style={{ fontSize:8 }} onClick={() => onNavigate("earnings")}>VIEW ALL</button>
           </SectionHeader>
           <div style={{ padding:"8px 14px" }}>
-            {earningsToday===null
-              ? Array(5).fill(0).map((_,i)=>(
-                  <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
-                    padding:"8px 0",borderBottom:i<4?`1px solid ${T.border}`:"none"}}>
-                    <Shimmer w={44} h={11}/><Shimmer w={55} h={11} opacity={0.5}/>
-                  </div>))
-              : earningsToday.length===0
-              ? <div style={{color:T.text2,fontSize:11,fontFamily:T.font,textAlign:"center",padding:"20px 0"}}>No earnings today</div>
-              : earningsToday.slice(0,8).map((e,i)=>{
-                  const live=tickers.get(e.ticker);
-                  const cp=live?.percent_change;
-                  return(<div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
-                    padding:"8px 0",borderBottom:i<earningsToday.length-1?`1px solid ${T.border}`:"none"}}>
-                    <div>
-                      <div style={{color:T.cyan,fontSize:12,fontFamily:T.font,fontWeight:700}}>{e.ticker}</div>
-                      <div style={{color:T.text2,fontSize:9,fontFamily:T.font}}>
-                        {e.earnings_time==="BMO"?"🌅 Before Open":e.earnings_time==="AMC"?"🌙 After Close":e.earnings_time||"—"}
-                      </div>
-                    </div>
-                    <div style={{textAlign:"right"}}>
-                      {cp!=null&&<div style={{color:cp>=0?T.green:T.red,fontSize:11,fontFamily:T.font,fontWeight:700}}>{cp>=0?"+":""}{cp.toFixed(2)}%</div>}
-                      {live?.live_price>0&&<div style={{color:T.text1,fontSize:9,fontFamily:T.font}}>${fmt2(live.live_price)}</div>}
-                    </div>
-                  </div>);
+            {earningsLoading ? (
+              Array(5).fill(0).map((_,i)=>(
+                <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
+                  <Shimmer w={44} h={11} />
+                  <Shimmer w={55} h={11} opacity={0.5} />
+                </div>
+              ))
+            ) : (() => {
+              // Get today's date in "Mar 5" format
+              const today = new Date();
+              const todayStr = today.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+              
+              // Sort by priority: Watchlist first, then by time (BMO → AMC → TNS)
+              const timeOrder = { 'BMO': 1, 'AMC': 2, 'TNS': 3 };
+              const todayEarnings = earnings
+                .sort((a, b) => {
+                  // First priority: Watchlist stocks come first
+                  const aInWatchlist = watchlist.has(a.ticker);
+                  const bInWatchlist = watchlist.has(b.ticker);
+                  if (aInWatchlist && !bInWatchlist) return -1;
+                  if (!aInWatchlist && bInWatchlist) return 1;
+                  
+                  // Second priority: Sort by time (BMO → AMC → TNS)
+                  return (timeOrder[a.time] || 999) - (timeOrder[b.time] || 999);
                 })
-            }
+                .slice(0, 10);
+              
+              if (todayEarnings.length === 0) {
+                return <EmptyState icon="◎" label="NO EARNINGS TODAY" sub="Check back tomorrow for upcoming earnings" h={160} T={T} />;
+              }
+              
+              // Table with header
+              return (
+                <div>
+                  <div style={{ 
+                    display:"grid", 
+                    gridTemplateColumns:"1fr 0.8fr 0.6fr 0.8fr", 
+                    gap:8, 
+                    padding:"8px 0", 
+                    borderBottom:`2px solid ${T.border}`,
+                    fontSize:9,
+                    fontFamily:T.font,
+                    fontWeight:700,
+                    color:T.text2,
+                    textTransform:"uppercase",
+                    letterSpacing:0.5
+                  }}>
+                    <span>SYMBOL</span>
+                    <span>DATE</span>
+                    <span>TIME</span>
+                    <span>PRICE</span>
+                  </div>
+                  {todayEarnings.map((earning, i) => {
+                    const ticker = tickers.get(earning.ticker);
+                    const livePrice = ticker?.live_price || 0;
+                    const isWatchlist = watchlist.has(earning.ticker);
+                    
+                    return (
+                      <div key={i} style={{ 
+                        display:"grid", 
+                        gridTemplateColumns:"1fr 0.8fr 0.6fr 0.8fr", 
+                        gap:8, 
+                        alignItems:"center", 
+                        padding:"10px 0", 
+                        borderBottom:i<todayEarnings.length-1?`1px solid ${T.border}`:"none",
+                        background: isWatchlist ? T.cyan+"08" : "transparent"
+                      }}>
+                        <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                          {isWatchlist && <span style={{ color:T.cyan, fontSize:14 }}>★</span>}
+                          <a 
+                            href={`https://finance.yahoo.com/quote/${earning.ticker}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{ 
+                              color:T.text0, 
+                              fontSize:12, 
+                              fontFamily:T.font, 
+                              fontWeight:400,
+                              textDecoration:"none",
+                              cursor:"pointer"
+                            }}
+                            onMouseEnter={e => e.currentTarget.style.color = T.cyan}
+                            onMouseLeave={e => e.currentTarget.style.color = T.text0}
+                          >
+                            {earning.ticker}
+                          </a>
+                        </div>
+                        <span style={{ color:T.text2, fontSize:11, fontFamily:T.font, fontWeight:400 }}>
+                          {todayStr}
+                        </span>
+                        <span style={{ 
+                          color: earning.time === 'BMO' ? T.gold : earning.time === 'AMC' ? T.purple : T.text2, 
+                          fontSize:10, 
+                          fontFamily:T.font, 
+                          fontWeight:400 
+                        }}>
+                          {earning.time}
+                        </span>
+                        <span style={{ color:T.cyan, fontSize:11, fontFamily:T.font, fontWeight:400 }}>
+                          ${livePrice.toFixed(2)}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
           </div>
-          {earningsToday?.length>8&&<div style={{padding:"5px 14px",borderTop:`1px solid ${T.border}`}}>
-            <span style={{color:T.text2,fontSize:9,fontFamily:T.font}}>+{earningsToday.length-8} more</span>
-          </div>}
         </div>
       </div>
     </div>
@@ -775,7 +1033,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
 // • AH cols: SYMBOL+name | PREV CLOSE | TODAY CLOSE | LIVE PRICE | CHANGE | %CHG
 // • Source: ALL / WATCHLIST / (Yahoo Finance | TradingView) replaces PORTFOLIO
 // • Matrix view: top 50 clean TradingView charts
-function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", sparkHistory = { current: {} }, T }) {
+function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", wsWatchlistRef = null, T }) {
   const [viewMode,   setViewMode]   = useState("TABLE");
   const autoSubMode = SESSION_META[marketSession]?.subMode ?? "MH";
   const [subModeOverride, setSubModeOverride] = useState(null);
@@ -790,21 +1048,79 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
   const [currentPage, setCurrentPage] = useState(1);
   const [selectedSymbol, setSelectedSymbol] = useState(null); // For chart panel
   const [chartOpenCount, setChartOpenCount] = useState(5); // How many charts to open
-  const [watchlist, setWatchlist] = useState(new Set()); // User's watchlist
+  const [watchlist, setWatchlist] = useState(new Set()); // ★ Persisted signal watchlist
   const tableScrollRef = useRef(null); // Ref for scroll-to-top on page change
   const ITEMS_PER_PAGE = 50;
+  
+  // Fetch earnings for EARNINGS sector filter
+  const [earningsTickers, setEarningsTickers] = useState(new Set());
+  
+  useEffect(() => {
+    // Fetch only today's earnings
+    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
+    fetch(`${API_BASE}/api/earnings?start=${today}&end=${today}`)
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(data => {
+        const earningsArray = Array.isArray(data) ? data : [];
+        // Get all tickers with earnings today
+        const todayEarningsTickers = new Set(
+          earningsArray.map(e => e.ticker)
+        );
+        setEarningsTickers(todayEarningsTickers);
+      })
+      .catch(err => console.warn('[NexRadar Live Table] Failed to load earnings:', err));
+  }, []);
 
-  // Toggle watchlist
-  const toggleWatchlist = (symbol) => {
+  // ── Load watchlist from backend on mount ─────────────────────────────────
+  useEffect(() => {
+    fetch(`${API_BASE}/api/watchlist`)
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(data => setWatchlist(new Set(data.watchlist ?? [])))
+      .catch(err => console.warn('[NexRadar] Failed to load watchlist:', err));
+  }, []);
+
+  // ── Register setter into root ref so WS watchlist_update events reach here ─
+  // The root onmessage handler calls wsWatchlistRef.current(newSet) when
+  // another tab stars/unstars a ticker, keeping all tabs in sync.
+  useEffect(() => {
+    if (wsWatchlistRef) {
+      wsWatchlistRef.current = setWatchlist;
+    }
+    return () => {
+      if (wsWatchlistRef) wsWatchlistRef.current = null;
+    };
+  }, [wsWatchlistRef]);
+
+  // ── Toggle watchlist — calls backend, optimistic UI update ───────────────
+  const toggleWatchlist = async (symbol) => {
+    const isWatched = watchlist.has(symbol);
+    const endpoint  = isWatched
+      ? `${API_BASE}/api/watchlist/remove`
+      : `${API_BASE}/api/watchlist/add`;
+
+    // Optimistic update — instant ★ feedback, no waiting for round-trip
     setWatchlist(prev => {
       const next = new Set(prev);
-      if (next.has(symbol)) {
-        next.delete(symbol);
-      } else {
-        next.add(symbol);
-      }
+      isWatched ? next.delete(symbol) : next.add(symbol);
       return next;
     });
+
+    try {
+      const res = await fetch(endpoint, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ ticker: symbol }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      // Rollback on failure — revert the optimistic update
+      console.error('[NexRadar] Watchlist toggle failed, rolling back:', err);
+      setWatchlist(prev => {
+        const next = new Set(prev);
+        isWatched ? next.add(symbol) : next.delete(symbol);
+        return next;
+      });
+    }
   };
 
   // Convert tickers Map to array and filter by sector
@@ -820,9 +1136,9 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
     // Filter by selected sectors
     if (!selectedSectors.includes("ALL")) {
       filtered = filtered.filter(ticker => {
-        // EARNINGS is a special pseudo-sector — matches is_earnings_gap_play flag
+        // EARNINGS is a special pseudo-sector — matches tickers with earnings today
         if (selectedSectors.includes("EARNINGS")) {
-          if (ticker.is_earnings_gap_play) return true;
+          if (ticker.is_earnings_gap_play || earningsTickers.has(ticker.ticker)) return true;
         }
         const tickerSector = normalizeSector(ticker.sector);
         return tickerSector && selectedSectors.some(s => tickerSector === s && s !== "EARNINGS");
@@ -830,7 +1146,7 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
     }
 
     return filtered;
-  }, [tickers, selectedSectors, source, watchlist]);
+  }, [tickers, selectedSectors, source, watchlist, earningsTickers]);
 
   // Filter by minimum delta
   const filteredTickers = useMemo(() => {
@@ -861,7 +1177,7 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
   };
 
   const activeLabel = selectedSectors.includes("ALL") ? "ALL" : selectedSectors.join(" + ");
-  const tickerCount = filteredTickers.length;
+  const tickerCount = tickerArray.length; // Use tickerArray (after sector filter) not filteredTickers (after minDelta filter)
 
   // Placeholders for top 50 symbols for matrix
   const matrixSymbols = useMemo(() => {
@@ -877,55 +1193,37 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
     const topSymbols = filteredTickers.slice(0, chartOpenCount).map(t => t.ticker);
     topSymbols.forEach(sym => {
       const url = extLink === "TradingView"
-        ? `https://www.tradingview.com/chart/?symbol=${sym}&session=extended`
+        ? `https://www.tradingview.com/chart/?symbol=NASDAQ:${sym}`
         : `https://finance.yahoo.com/quote/${sym}/chart`;
       window.open(url, "_blank");
     });
   };
 
-  const Sparkline = ({ ticker: sym }) => {
-    const prices = sparkHistory.current[sym] || [];
-    if (prices.length < 2) return <span style={{ width:42, display:"inline-block" }}/>;
-    const W=42,H=16,pad=1;
-    const mn=Math.min(...prices),mx=Math.max(...prices),range=mx-mn||mn*0.001||0.01;
-    const pts=prices.map((p,i)=>{
-      const x=((i/(prices.length-1))*(W-pad*2)+pad).toFixed(1);
-      const y=(H-pad-((p-mn)/range)*(H-pad*2)).toFixed(1);
-      return `${x},${y}`;
-    }).join(" ");
-    const isUp=prices[prices.length-1]>=prices[0];
-    const color=isUp?T.green:T.red;
-    const last=pts.split(" ").pop().split(",");
-    return(
-      <svg width={W} height={H} style={{display:"block",flexShrink:0,overflow:"visible"}}>
-        <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5"
-          strokeLinecap="round" strokeLinejoin="round" opacity={0.9}/>
-        <circle cx={last[0]} cy={last[1]} r="2" fill={color}/>
-      </svg>);
-  };
-
+  // MH column definitions - SYMBOL column includes star + symbol + company name stacked
   const MH_COLS = [
-    { key:"symbol",  label:"SYMBOL",  w:"minmax(200px,2fr)" },
-    { key:"spark",   label:"TREND",   w:"56px"  },
-    { key:"open",    label:"OPEN",    w:"80px"  },
-    { key:"price",   label:"PRICE",   w:"86px"  },
-    { key:"change",  label:"$ CHG",   w:"86px"  },
-    { key:"pct",     label:"% CHG",   w:"86px"  },
-    { key:"volume",  label:"VOLUME",  w:"100px" },
-    { key:"vwap",    label:"VWAP",    w:"80px"  },
-    { key:"signal",  label:"SIGNAL",  w:"170px" },
+    { key:"symbol",   label:"SYMBOL",      w:"minmax(220px, 2fr)" },
+    { key:"open",     label:"OPEN",        w:"90px" },
+    { key:"price",    label:"PRICE",       w:"90px" },
+    { key:"change",   label:"$ CHG",       w:"90px" },
+    { key:"pct",      label:"% CHG",       w:"90px" },
+    { key:"volume",   label:"VOLUME",      w:"110px"   },
+    { key:"vwap",     label:"VWAP",        w:"90px" },
+    { key:"rsi",      label:"RSI",         w:"70px" },
+    { key:"signal",   label:"SIGNAL",      w:"100px" },
   ];
+
+  // AH column definitions
   const AH_COLS = [
-    { key:"symbol",      label:"SYMBOL",       w:"minmax(200px,2fr)" },
-    { key:"spark",       label:"TREND",        w:"56px"  },
-    { key:"prev_close",  label:"PREV CLOSE",   w:"100px" },
-    { key:"today_close", label:"TODAY CLOSE",  w:"110px" },
-    { key:"live_price",  label:"LIVE PRICE",   w:"100px" },
-    { key:"change",      label:"$ CHG",        w:"86px"  },
-    { key:"pct",         label:"% CHG",        w:"86px"  },
+    { key:"symbol",     label:"SYMBOL",        w:"minmax(220px, 2fr)" },
+    { key:"prev_close", label:"PREV CLOSE",    w:"100px"  },
+    { key:"today_close",label:"TODAY CLOSE",   w:"110px"  },
+    { key:"live_price", label:"LIVE PRICE",    w:"100px"  },
+    { key:"change",     label:"$ CHG",         w:"90px"  },
+    { key:"pct",        label:"% CHG",         w:"90px"},
   ];
+
   const cols = subMode === "MH" ? MH_COLS : AH_COLS;
-  const gridCols = cols.map(c=>c.w).join(" ");
+  const gridCols = cols.map(c => c.w).join(" ");
 
   return (
     <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:12 }}>
@@ -936,7 +1234,7 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
           <span style={{ color:T.text0, fontSize:13, letterSpacing:0.5, fontFamily:T.font, whiteSpace:"nowrap", marginTop:6, fontWeight:700 }}>
             SECTOR FILTER
           </span>
-          <SectorPills selectedSectors={selectedSectors} onChange={onSectorChange} showCounts={false} T={T} />
+          <SectorPills selectedSectors={selectedSectors} onChange={onSectorChange} showCounts={false} actualCount={tickerArray.length} T={T} />
         </div>
       </div>
 
@@ -1104,78 +1402,30 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
                             </div>
                           </div>
                         </div>
-                        {/* TREND */}
-                        <div style={{padding:"8px 6px",display:"flex",alignItems:"center",justifyContent:"center"}}>
-                          <Sparkline ticker={ticker.ticker}/>
-                        </div>
                         {/* Open */}
-                        <div style={{padding:"10px 10px",color:T.text1,fontFamily:T.font,fontSize:12,textAlign:"right"}}>
-                          {ticker.open>0?`$${fmt2(ticker.open)}`:"—"}
-                        </div>
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.open || 0)}</div>
                         {/* Price */}
-                        <div style={{padding:"10px 10px",color:T.text0,fontFamily:T.font,fontSize:12,fontWeight:700,textAlign:"right"}}>
-                          ${fmt2(ticker.live_price||0)}
+                        <div style={{ padding:"10px 14px", color:T.text0, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price || 0)}</div>
+                        {/* Change */}
+                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+                          {isPositive ? '+' : ''}{fmt2(ticker.change_value || 0)}
                         </div>
-                        {/* $ CHG */}
-                        <div style={{padding:"10px 10px",color:changeColor,fontFamily:T.font,fontSize:12,fontWeight:600,textAlign:"right"}}>
-                          {isPositive?"+":""}{fmt2(ticker.change_value||0)}
-                        </div>
-                        {/* % CHG */}
-                        <div style={{padding:"10px 10px",color:changeColor,fontFamily:T.font,fontSize:12,fontWeight:700,textAlign:"right"}}>
-                          {pct(ticker.percent_change||0)}
+                        {/* %CHG */}
+                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+                          {pct(ticker.percent_change || 0)}
                         </div>
                         {/* Volume */}
-                        <div style={{padding:"10px 10px",fontFamily:T.font,fontSize:12,textAlign:"right",
-                          color:ticker.volume_spike_level==="high"?T.orange:ticker.volume_spike?T.gold:T.text1}}>
-                          {fmtVol(ticker.volume||0)}{ticker.volume_spike&&<span style={{marginLeft:3,fontSize:8}}>{ticker.volume_spike_level==="high"?"▲▲":"▲"}</span>}
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+                          {fmtVol(ticker.volume || 0)}
                         </div>
                         {/* VWAP */}
-                        <div style={{padding:"10px 10px",color:T.text2,fontFamily:T.font,fontSize:12,textAlign:"right"}}>—</div>
-                        {/* SIGNAL */}
-                        <div style={{padding:"7px 8px",display:"flex",alignItems:"center",gap:3,flexWrap:"wrap"}}>
-                          {ticker.pullback_state==="neutral"&&ticker.hwm>0&&ticker.live_price>=ticker.hwm*0.999&&(
-                            <span title={`Intraday high $${fmt2(ticker.hwm)}`}
-                              style={{background:"#00e67612",border:"1px solid #00e67640",color:T.green,
-                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>▲HWM</span>
-                          )}
-                          {ticker.pullback_state==="tsl_alert"&&(
-                            <span title={`${(ticker.pullback_pct||0).toFixed(1)}% off HWM — TSL alert`}
-                              style={{background:"#ff244412",border:"1px solid #ff244440",color:T.red,
-                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>
-                              ⚠{(ticker.pullback_pct||0).toFixed(1)}%↓</span>
-                          )}
-                          {ticker.pullback_state==="pulling_back"&&(
-                            <span title={`Pulling back ${(ticker.pullback_pct||0).toFixed(1)}% from HWM $${fmt2(ticker.hwm||0)}`}
-                              style={{background:"#ffc40012",border:"1px solid #ffc40040",color:T.gold,
-                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>
-                              ↘{(ticker.pullback_pct||0).toFixed(1)}%</span>
-                          )}
-                          {ticker.went_positive===1&&(
-                            <span title="Just turned positive"
-                              style={{background:"#00e67610",border:"1px solid #00e67640",color:T.green,
-                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>⚡+</span>
-                          )}
-                          {ticker.volume_spike&&(
-                            <span title={`${(ticker.volume_ratio||1).toFixed(1)}× avg volume`}
-                              style={{background:"#ff6d0014",border:"1px solid #ff6d0050",color:T.orange,
-                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>
-                              VOL{ticker.volume_spike_level==="high"?"▲▲":"▲"}</span>
-                          )}
-                          {ticker.is_gap_play&&(
-                            <span title={`Gap ${ticker.gap_direction==="up"?"up":"down"} ${(ticker.gap_percent||0).toFixed(1)}%`}
-                              style={{background:"#b388ff14",border:"1px solid #b388ff50",color:T.purple,
-                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>
-                              GAP{ticker.gap_direction==="up"?"↑":"↓"}</span>
-                          )}
-                          {ticker.ah_momentum&&(
-                            <span title="After-hours momentum"
-                              style={{background:"#00bcd414",border:"1px solid #00bcd450",color:"#00bcd4",
-                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>AHM</span>
-                          )}
-                          {ticker.is_earnings_gap_play&&(
-                            <span title="Earnings gap play"
-                              style={{background:"#ffc40014",border:"1px solid #ffc40050",color:T.gold,
-                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>EARN</span>
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>—</div>
+                        {/* RSI */}
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>—</div>
+                        {/* Signal */}
+                        <div style={{ padding:"10px 14px", display:"flex", alignItems:"center" }}>
+                          {ticker.volume_spike && (
+                            <span style={{ color:T.orange, fontSize:10, fontFamily:T.font, background:T.orangeDim, padding:"3px 8px", borderRadius:4, fontWeight:600 }}>VOL</span>
                           )}
                         </div>
                       </>
@@ -1236,29 +1486,19 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
                             </div>
                           </div>
                         </div>
-                        {/* TREND */}
-                        <div style={{padding:"8px 6px",display:"flex",alignItems:"center",justifyContent:"center"}}>
-                          <Sparkline ticker={ticker.ticker}/>
-                        </div>
                         {/* Prev Close */}
-                        <div style={{padding:"10px 10px",color:T.text1,fontFamily:T.font,fontSize:12,textAlign:"right"}}>
-                          {ticker.prev_close>0?`$${fmt2(ticker.prev_close)}`:"—"}
-                        </div>
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.prev_close || 0)}</div>
                         {/* Today Close */}
-                        <div style={{padding:"10px 10px",color:T.text1,fontFamily:T.font,fontSize:12,textAlign:"right"}}>
-                          {ticker.today_close>0?`$${fmt2(ticker.today_close)}`:"—"}
-                        </div>
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.today_close || 0)}</div>
                         {/* Live Price */}
-                        <div style={{padding:"10px 10px",color:T.cyan,fontFamily:T.font,fontSize:12,fontWeight:700,textAlign:"right"}}>
-                          ${fmt2(ticker.live_price||0)}
+                        <div style={{ padding:"10px 14px", color:T.cyan, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price || 0)}</div>
+                        {/* Change */}
+                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+                          {isPositive ? '+' : ''}{fmt2(ticker.change_value || 0)}
                         </div>
-                        {/* $ CHG */}
-                        <div style={{padding:"10px 10px",color:changeColor,fontFamily:T.font,fontSize:12,fontWeight:600,textAlign:"right"}}>
-                          {isPositive?"+":""}{fmt2(ticker.change_value||0)}
-                        </div>
-                        {/* % CHG */}
-                        <div style={{padding:"10px 10px",color:changeColor,fontFamily:T.font,fontSize:12,fontWeight:700,textAlign:"right"}}>
-                          {pct(ticker.percent_change||0)}
+                        {/* %CHG */}
+                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+                          {pct(ticker.percent_change || 0)}
                         </div>
                       </>
                     )}
@@ -1400,7 +1640,7 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
               <div key={sym} className="card" style={{ overflow:"hidden" }}>
                 <div style={{ padding:"7px 12px", borderBottom:`1px solid ${T.border}`, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
                   <span style={{ color:T.text0, fontFamily:T.font, fontSize:12, fontWeight:700 }}>{sym}</span>
-                  <a href={`https://www.tradingview.com/chart/?symbol=${sym}&session=extended`} target="_blank" rel="noreferrer"
+                  <a href={`https://www.tradingview.com/chart/?symbol=${sym}`} target="_blank" rel="noreferrer"
                     style={{ color:T.text2, fontSize:8.5, textDecoration:"none", fontFamily:T.font }}>↗ TV</a>
                 </div>
                 <TVChart symbol={sym} height={180} />
@@ -2297,24 +2537,69 @@ function PagePortfolio({ tickers = new Map(), marketSession = "market", T }) {
 
 // ─── App Shell ────────────────────────────────────────────────────────────────
 export default function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp = 'all', sector: sectorProp = 'ALL', onSourceChange, onSectorChange, onThemeChange, currentTheme = 'auto' }) {
-  const [page,          setPage]         = useState("dashboard");
+  // Active page state - persisted in localStorage
+  const [page, setPage] = useState(() => {
+    try {
+      const saved = localStorage.getItem('nexradar_active_page');
+      if (saved) {
+        return saved;
+      }
+    } catch (err) {
+      console.warn('[NexRadar] Failed to load saved page:', err);
+    }
+    return "dashboard";
+  });
+  
+  // Save active page to localStorage whenever it changes
+  useEffect(() => {
+    try {
+      localStorage.setItem('nexradar_active_page', page);
+    } catch (err) {
+      console.warn('[NexRadar] Failed to save page:', err);
+    }
+  }, [page]);
+  
   const [sideCollapsed, setSideCollapsed]= useState(false);
   const [headerPanel,   setHeaderPanel]  = useState(null); // "notifications" | "settings" | "signals" | null
   
   // Get theme-aware design tokens
   const T = useMemo(() => getThemeTokens(darkModeProp), [darkModeProp]);
   
-  // Multi-sector selection — default ALL or from props
+  // Multi-sector selection — default ALL or from props, persisted in localStorage
   const [selectedSectors, setSelectedSectors] = useState(() => {
+    // Check localStorage first
+    try {
+      const saved = localStorage.getItem('nexradar_selected_sectors');
+      if (saved) {
+        return JSON.parse(saved);
+      }
+    } catch (err) {
+      console.warn('[NexRadar] Failed to load saved sectors:', err);
+    }
+    
+    // Fall back to prop or default
     if (sectorProp && sectorProp !== 'ALL') {
       return [sectorProp.toUpperCase()];
     }
     return ["ALL"];
   });
+  
+  // Save selectedSectors to localStorage whenever it changes
+  useEffect(() => {
+    try {
+      localStorage.setItem('nexradar_selected_sectors', JSON.stringify(selectedSectors));
+    } catch (err) {
+      console.warn('[NexRadar] Failed to save sectors:', err);
+    }
+  }, [selectedSectors]);
 
   // WebSocket state for live ticker data
   const [tickers, setTickers] = useState(new Map());
   const wsRef = useRef(null);
+  // Ref that carries the PageLiveTable watchlist setter into the WS closure.
+  // The WS handler is created once on mount; without a ref it would capture a
+  // stale setWatchlistFromWS that does nothing.
+  const wsWatchlistRef = useRef(null);
 
   // Market session — rechecked every 30s; drives auto-subMode + sidebar chip
   const [marketSession, setMarketSession] = useState(getMarketSession);
@@ -2336,8 +2621,7 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
   // trigger a full Map copy on every message. A throttled interval flushes
   // the ref into React state at most once every 250 ms, keeping the UI
   // responsive without copying 1 500+ entries on every price update.
-  const tickerCacheRef  = useRef(new Map());
-  const sparkHistoryRef = useRef({});   // {ticker:[p1,p2,...]} last 20 prices
+  const tickerCacheRef = useRef(new Map());
 
   // ── Live Notifications ────────────────────────────────────────────────────
   // Accumulates real alerts fired by WS ticks. Capped at 50 entries (ring buffer).
@@ -2415,6 +2699,17 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
           // Ignore our own pong echo if server reflects it back
           if (msg.type === 'pong') return;
 
+          // ── Watchlist sync across tabs ─────────────────────────────────
+          // Backend broadcasts this when any tab adds/removes a ★ ticker.
+          // All open tabs update their star state without a page reload.
+          if (msg.type === 'watchlist_update') {
+            // msg.watchlist is the full sorted list from the backend
+            if (wsWatchlistRef.current) {
+              wsWatchlistRef.current(new Set(msg.watchlist ?? []));
+            }
+            return;
+          }
+
           if (msg.type === "snapshot") {
             // Snapshot: replace entire cache and push straight to state
             const m = new Map();
@@ -2431,12 +2726,6 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
             const prev  = cache.get(msg.ticker) ?? {};
             const next  = { ...prev, ...msg.data };
             cache.set(msg.ticker, next);
-            if (msg.data?.live_price) {
-              const h = sparkHistoryRef.current;
-              if (!h[msg.ticker]) h[msg.ticker] = [];
-              h[msg.ticker].push(+msg.data.live_price);
-              if (h[msg.ticker].length > 20) h[msg.ticker].shift();
-            }
 
             // ── Live alert detection ──────────────────────────────────────
             const d      = msg.data;
@@ -2572,7 +2861,7 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
   const renderPage = () => {
     switch (page) {
       case "dashboard": return <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange} onNavigate={setPage} sectorPerformance={sectorPerformance} tickers={tickers} T={T} />;
-      case "live":      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} sparkHistory={sparkHistoryRef} T={T} />;
+      case "live":      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} T={T} />;
       case "chart":     return <PageChart T={T} />;
       case "signals":   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} T={T} />;
       case "earnings":  return <PageEarnings T={T} />;

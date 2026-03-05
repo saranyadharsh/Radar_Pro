@@ -4,6 +4,7 @@
  */
 
 import { useState, useEffect } from 'react'
+import { getTradingViewSymbol } from '../utils/tradingview.js'
 
 const API = import.meta.env.VITE_API_BASE || ''
 
@@ -173,7 +174,7 @@ export default function TickerDetailDrawer({ ticker, onClose, onOpenChart, darkM
                 onOpenChart(ticker)
                 onClose()
               } else {
-                window.open(`https://www.tradingview.com/chart/?symbol=${ticker}`, '_blank')
+                window.open(`https://www.tradingview.com/chart/?symbol=${getTradingViewSymbol(ticker)}`, '_blank')
               }
             }}
             className="flex-1 py-3 rounded-lg bg-gradient-to-r from-blue-600 to-cyan-600 

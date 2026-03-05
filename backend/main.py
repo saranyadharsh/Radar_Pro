@@ -263,28 +263,66 @@ async def get_stock_list():
         return []
 
 
-# ── Signal Watchlist ───────────────────────────────────────────────────────────
+# ── Signal Watchlist (dynamic — persisted to Supabase) ────────────────────────
+# Frontend ★ star button calls POST /api/watchlist/add or /api/watchlist/remove.
+# GET /api/watchlist returns the current list for initial ★ render on page load.
+
+from pydantic import BaseModel
+
+class WatchlistBody(BaseModel):
+    ticker: str
+
+@app.get("/api/watchlist")
+async def watchlist_get():
+    """GET current starred tickers. Called on page load to render ★ state."""
+    if not engine:
+        return {"watchlist": [], "count": 0}
+    return engine.get_signal_watchlist()
+
+
+@app.post("/api/watchlist/add")
+async def watchlist_add(body: WatchlistBody):
+    """Star a ticker — persists to DB + activates live signal engine immediately."""
+    if not engine:
+        return {"ok": False, "error": "engine not ready"}
+    return engine.add_signal_ticker(body.ticker)
+
+
+@app.post("/api/watchlist/remove")
+async def watchlist_remove(body: WatchlistBody):
+    """Un-star a ticker — removes from DB + deactivates + clears stale indicator bars."""
+    if not engine:
+        return {"ok": False, "error": "engine not ready"}
+    return engine.remove_signal_ticker(body.ticker)
+
+
+# ── Legacy signal-watchlist routes (bulk set — kept for backward compat) ───────
 @app.get("/api/signal-watchlist")
 async def get_signal_watchlist():
+    """Legacy bulk GET — returns same data as /api/watchlist."""
     if not engine:
-        return {"symbols": []}
+        return {"symbols": [], "count": 0, "max": 50}
+    wl = engine.get_signal_watchlist()
     return {
-        "symbols": sorted(engine._signal_watcher.watched),
-        "count":   len(engine._signal_watcher.watched),
+        "symbols": wl["watchlist"],
+        "count":   wl["count"],
         "max":     50,
     }
 
 
 @app.post("/api/signal-watchlist")
 async def set_signal_watchlist(payload: dict):
+    """Legacy bulk POST — replaces entire watchlist. Persists each ticker to DB."""
     if not engine:
         return {"error": "not ready"}
-
     symbols = payload.get("symbols", [])
     corrections = {"ORACL": "ORCL", "TESLA": "TSLA"}
     symbols = [corrections.get(s.upper(), s.upper()) for s in symbols]
+    # Persist each ticker to DB so it survives restart
+    for ticker in symbols:
+        db.add_signal_watchlist(ticker)
     accepted = engine._signal_watcher.set_watchlist(symbols)
-    logger.info(f"Signal watchlist updated via API: {len(accepted)} symbols")
+    logger.info(f"Signal watchlist bulk-set via legacy API: {len(accepted)} symbols")
     return {"accepted": accepted, "count": len(accepted)}
 
 
@@ -307,19 +345,35 @@ async def ws_live(websocket: WebSocket):
     try:
         if engine:
             import orjson
-            snapshot = engine.get_live_snapshot()
-            await websocket.send_bytes(orjson.dumps({
-                "type": "snapshot",
-                "data": snapshot,
-            }))
+            try:
+                snapshot = engine.get_live_snapshot()
+                ticker_count = len(snapshot)
+                logger.info(f"Sending snapshot with {ticker_count} tickers")
+                await websocket.send_bytes(orjson.dumps({
+                    "type": "snapshot",
+                    "data": snapshot,
+                }))
+                logger.info("Snapshot sent successfully")
+                
+                # If snapshot is empty, it means historical data is still loading
+                # The engine will broadcast updates via _broadcast() once data arrives
+                if ticker_count == 0:
+                    logger.info("Snapshot empty - historical data still loading, client will receive updates via broadcast")
+            except Exception as snap_err:
+                logger.error(f"Error sending snapshot: {snap_err}", exc_info=True)
+                # Send empty snapshot on error
+                await websocket.send_bytes(orjson.dumps({
+                    "type": "snapshot",
+                    "data": [],
+                }))
 
         while True:
             await websocket.receive_text()
 
     except WebSocketDisconnect:
-        pass
+        logger.info("WS client disconnected normally")
     except Exception as e:
-        logger.debug(f"WS error: {e}")
+        logger.error(f"WS error: {e}", exc_info=True)
     finally:
         async with _clients_lock:
             _clients.discard(websocket)

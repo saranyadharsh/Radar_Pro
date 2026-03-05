@@ -9,6 +9,7 @@
 import { useState, useEffect } from 'react'
 import clsx from 'clsx'
 import SectorFilter from './SectorFilter'
+import { getTradingViewSymbol } from '../utils/tradingview.js'
 
 const API = import.meta.env.VITE_API_BASE || ''
 
@@ -114,7 +115,7 @@ export default function Sidebar({
 
     rows.forEach(r => {
       if (bulkTarget === 'tradingview') {
-        window.open(`https://www.tradingview.com/chart/?symbol=${r.ticker}`, '_blank')
+        window.open(`https://www.tradingview.com/chart/?symbol=${getTradingViewSymbol(r.ticker)}`, '_blank')
       } else {
         window.open(`https://finance.yahoo.com/quote/${r.ticker}/`, '_blank')
       }

@@ -3,6 +3,7 @@
  * Theme follows darkMode prop (mirrors Radar_Production.py dark_mode toggle)
  */
 import { useEffect, useRef } from 'react'
+import { getTradingViewSymbol } from '../utils/tradingview.js'
 
 export default function ChartPanel({ ticker, interval = 'D', darkMode = true }) {
   const ref = useRef(null)
@@ -22,7 +23,7 @@ export default function ChartPanel({ ticker, interval = 'D', darkMode = true }) 
       // eslint-disable-next-line no-undef
       new TradingView.widget({
         autosize: true,
-        symbol: ticker,
+        symbol: getTradingViewSymbol(ticker),
         interval,
         timezone: 'America/New_York',
         theme: darkMode ? 'dark' : 'light',

@@ -29,6 +29,34 @@ FIXES APPLIED (v2):
   FIX-14 _last_broadcast_ts purged every 10 min
   FIX-15 db_write_queue.task_done() called after each batch
   FIX-16 AH close refresh updates historical_data only; no full alert recompute
+
+DYNAMIC WATCHLIST (v3):
+  Replaced static DEFAULT_SIGNAL_WATCHLIST with a fully dynamic system backed
+  by the `signal_watchlist` Supabase table.
+
+  User flow:
+    Frontend live table has a ★ star button per row (first or last column).
+    Clicking ★ calls POST /api/watchlist/add   {"ticker": "AAPL"}
+    Clicking ★ again calls POST /api/watchlist/remove {"ticker": "AAPL"}
+
+  Backend API routes call:
+    ws_engine.add_signal_ticker(ticker)    — persists to DB + activates live
+    ws_engine.remove_signal_ticker(ticker) — removes from DB + deactivates
+    ws_engine.get_signal_watchlist()       — returns current list for GET route
+
+  On startup, _load_signal_watchlist_from_db() reads the persisted list so
+  the watchlist survives server restarts.
+
+  Required supabase_db methods (add if not present):
+    db.get_signal_watchlist()          → List[Dict]  e.g. [{"ticker":"AAPL"}, ...]
+    db.add_signal_watchlist(ticker)    → None  (upsert, ignore duplicates)
+    db.remove_signal_watchlist(ticker) → None  (delete, ignore missing)
+
+  Supabase table DDL:
+    CREATE TABLE signal_watchlist (
+      ticker TEXT PRIMARY KEY,
+      added_at TIMESTAMPTZ DEFAULT now()
+    );
 """
 
 import os
@@ -86,12 +114,6 @@ WS_BACKOFF_BASE_DELAY        = 1.0
 WS_BACKOFF_MAX_DELAY         = 60.0
 _SESSION_CACHE_TTL           = 60.0   # FIX-11
 _BROADCAST_PURGE_SEC         = 600.0  # FIX-14
-
-DEFAULT_SIGNAL_WATCHLIST = [
-    "AAPL","LITE","GOOGL","LMT","SNDK","WDC","ORCL","MU","NVDA","SPOT",
-    "SHOP","AMD","TSLA","GRMN","META","RKLB","STX","CHTR","AMZN","DE",
-    "TER","IDCC","MSFT","MDB","AVGO",
-]
 
 # ── FIX-11: module-level session cache ────────────────────────────────────────
 _session_cache:    str   = "closed"
@@ -188,7 +210,9 @@ class WSEngine:
         # ── Scalping Signal Engine ────────────────────────────────────────────
         self._signal_engine  = ScalpingSignalEngine()
         self._signal_watcher = SignalWatchlistManager(self._signal_engine)
-        self._signal_watcher.set_watchlist(DEFAULT_SIGNAL_WATCHLIST)
+        # Dynamic watchlist — loaded from DB in start(); star button adds/removes
+        # tickers at runtime via add_signal_ticker() / remove_signal_ticker().
+        # No hardcoded list here — DB is the single source of truth.
         self._signal_engine.on_signal(self._on_signal)
 
         # ── Source stats ──────────────────────────────────────────────────────
@@ -254,6 +278,10 @@ class WSEngine:
 
         self._refresh_earning_date_map()
 
+        # Load persisted signal watchlist from DB — survives server restarts.
+        # Must run before seed_history_from_rest() so only watched tickers get seeded.
+        self._load_signal_watchlist_from_db()
+
         # FIX-5: seed signal bar history at startup (Scalping_Signal FIX-3 integration)
         # This: (a) warms up indicators immediately so signals fire from bar 1
         #       (b) enables AH signals — Polygon A.* stops at 4pm without seeded bars
@@ -314,6 +342,148 @@ class WSEngine:
                 logger.error(f"_session_reset_loop: {e}")
 
             time.sleep(30)
+
+    # ── DYNAMIC SIGNAL WATCHLIST ──────────────────────────────────────────────
+
+    def _load_signal_watchlist_from_db(self):
+        """
+        Reads the persisted signal_watchlist table from Supabase and activates
+        those tickers in the live SignalWatchlistManager.
+        Called once in start() — restores user's watchlist after server restart.
+        Safe to call again at any time (idempotent: set_watchlist replaces all).
+
+        Required supabase_db method:
+            db.get_signal_watchlist() -> List[Dict[str, str]]
+            e.g. [{"ticker": "AAPL"}, {"ticker": "NVDA"}, ...]
+        """
+        try:
+            rows    = self.db.get_signal_watchlist()
+            tickers = [r["ticker"] for r in rows if r.get("ticker")]
+            if tickers:
+                self._signal_watcher.set_watchlist(tickers)
+                logger.info(f"Signal watchlist loaded from DB: {len(tickers)} tickers — {tickers}")
+            else:
+                logger.info("Signal watchlist is empty — user has not starred any tickers yet")
+        except Exception as e:
+            logger.error(f"_load_signal_watchlist_from_db: {e} — starting with empty watchlist")
+
+    def add_signal_ticker(self, ticker: str) -> Dict:
+        """
+        Called by the FastAPI POST /api/watchlist/add route when the user
+        clicks the ★ star button in the live table.
+
+        Persists to DB first (source of truth), then activates in the live
+        SignalWatchlistManager so signals start firing immediately — no restart.
+
+        Returns a status dict for the API response.
+
+        Required supabase_db method:
+            db.add_signal_watchlist(ticker: str) -> None
+            (upsert / INSERT OR IGNORE — safe to call for existing ticker)
+        """
+        ticker = ticker.upper().strip()
+        if not ticker:
+            return {"ok": False, "error": "ticker is required"}
+
+        try:
+            # Persist first — DB is the source of truth
+            self.db.add_signal_watchlist(ticker)
+
+            # Activate in live engine — get current list and append
+            current = list(self._signal_watcher.watched)
+            if ticker not in current:
+                current.append(ticker)
+                self._signal_watcher.set_watchlist(current)
+
+            logger.info(f"Signal watchlist: added {ticker} (total: {len(self._signal_watcher.watched)})")
+
+            # Broadcast watchlist_update so all open browser tabs sync ★ state
+            if self._broadcast_cb and self._loop:
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_cb({
+                        "type":    "watchlist_update",
+                        "action":  "add",
+                        "ticker":  ticker,
+                        "watchlist": sorted(self._signal_watcher.watched),
+                    }),
+                    self._loop,
+                )
+
+            return {"ok": True, "action": "add", "ticker": ticker,
+                    "watchlist_count": len(self._signal_watcher.watched)}
+
+        except Exception as e:
+            logger.error(f"add_signal_ticker({ticker}): {e}")
+            return {"ok": False, "error": str(e)}
+
+    def remove_signal_ticker(self, ticker: str) -> Dict:
+        """
+        Called by the FastAPI POST /api/watchlist/remove route when the user
+        un-stars a ticker in the live table.
+
+        Removes from DB first, then deactivates in the live engine.
+        Clears any buffered OHLCV bars for that ticker from the signal engine
+        so stale indicator state doesn't persist.
+
+        Returns a status dict for the API response.
+
+        Required supabase_db method:
+            db.remove_signal_watchlist(ticker: str) -> None
+            (DELETE WHERE ticker = ... — safe to call for non-existent ticker)
+        """
+        ticker = ticker.upper().strip()
+        if not ticker:
+            return {"ok": False, "error": "ticker is required"}
+
+        try:
+            # Remove from DB first
+            self.db.remove_signal_watchlist(ticker)
+
+            # Deactivate in live engine
+            current = list(self._signal_watcher.watched)
+            if ticker in current:
+                current.remove(ticker)
+                self._signal_watcher.set_watchlist(current)
+
+            # Clear stale indicator bars for this ticker from the signal engine
+            # so if the user re-adds it later, it starts fresh rather than
+            # resuming from potentially stale OHLCV state.
+            if ticker in self._signal_engine._calcs:
+                del self._signal_engine._calcs[ticker]
+                logger.debug(f"Cleared stale indicator bars for removed ticker {ticker}")
+
+            logger.info(f"Signal watchlist: removed {ticker} (total: {len(self._signal_watcher.watched)})")
+
+            # Broadcast watchlist_update so all open browser tabs sync ★ state
+            if self._broadcast_cb and self._loop:
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_cb({
+                        "type":    "watchlist_update",
+                        "action":  "remove",
+                        "ticker":  ticker,
+                        "watchlist": sorted(self._signal_watcher.watched),
+                    }),
+                    self._loop,
+                )
+
+            return {"ok": True, "action": "remove", "ticker": ticker,
+                    "watchlist_count": len(self._signal_watcher.watched)}
+
+        except Exception as e:
+            logger.error(f"remove_signal_ticker({ticker}): {e}")
+            return {"ok": False, "error": str(e)}
+
+    def get_signal_watchlist(self) -> Dict:
+        """
+        Called by the FastAPI GET /api/watchlist route.
+        Returns the live in-memory watchlist (already in sync with DB).
+        Frontend uses this to render ★ filled/unfilled state on page load.
+        """
+        tickers = sorted(self._signal_watcher.watched)
+        return {
+            "watchlist": tickers,
+            "count":     len(tickers),
+        }
 
     # ── EARNINGS DATE MAP ─────────────────────────────────────────────────────
 
@@ -778,6 +948,18 @@ class WSEngine:
             f"yf={self.source_stats['yfinance_success']}, "
             f"failed={self.source_stats['failed']})"
         )
+        
+        # Broadcast snapshot to all connected WebSocket clients after historical data loads
+        if self.broadcast_cb and total_seeded > 0:
+            logger.info(f"Broadcasting snapshot with {total_seeded} tickers to connected clients")
+            snapshot = self.get_live_snapshot(limit=5000, only_positive=False)
+            asyncio.run_coroutine_threadsafe(
+                self.broadcast_cb({
+                    "type": "snapshot",
+                    "data": snapshot,
+                }),
+                self.loop
+            )
 
     def _fetch_polygon_snapshot_bulk(self, tickers: List[str]) -> List[str]:
         """
@@ -1087,7 +1269,8 @@ class WSEngine:
                 "yfinance_success": self.source_stats.get("yfinance_success", 0),
                 "failed":           self.source_stats.get("failed",           0),
             },
-            "signal_watched": len(self._signal_watcher.watched),
-            "signal_count":   len(self._signal_engine.signal_history),
-            "signal_bars":    len(self._signal_engine._calcs),
+            "signal_watched":       len(self._signal_watcher.watched),
+            "signal_watchlist_count": len(self._signal_watcher.watched),  # alias for clarity
+            "signal_count":         len(self._signal_engine.signal_history),
+            "signal_bars":          len(self._signal_engine._calcs),
         }

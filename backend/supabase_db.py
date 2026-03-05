@@ -330,6 +330,47 @@ class SupabaseDB:
         logger.debug(f"get_portfolio: {len(rows)} rows")
         return rows
 
+    # ── Signal Watchlist ──────────────────────────────────────────────────────
+    # Persists the user's ★ starred tickers across server restarts.
+    # Table DDL (run once in Supabase):
+    #   CREATE TABLE IF NOT EXISTS signal_watchlist (
+    #     ticker    TEXT PRIMARY KEY,
+    #     added_at  TIMESTAMPTZ DEFAULT now()
+    #   );
+
+    def get_signal_watchlist(self) -> List[Dict]:
+        """Return all starred tickers: [{"ticker": "AAPL"}, ...]"""
+        try:
+            res = (
+                self.client.table("signal_watchlist")
+                .select("ticker")
+                .order("added_at", desc=False)
+                .execute()
+            )
+            return res.data or []
+        except Exception as e:
+            logger.error(f"get_signal_watchlist: {e}")
+            return []
+
+    def add_signal_watchlist(self, ticker: str) -> None:
+        """Upsert a ticker into signal_watchlist (safe to call for duplicates)."""
+        try:
+            self.client.table("signal_watchlist").upsert(
+                {"ticker": ticker.upper()},
+                on_conflict="ticker",
+            ).execute()
+        except Exception as e:
+            logger.error(f"add_signal_watchlist({ticker}): {e}")
+
+    def remove_signal_watchlist(self, ticker: str) -> None:
+        """Delete a ticker from signal_watchlist (safe to call for missing rows)."""
+        try:
+            self.client.table("signal_watchlist").delete().eq(
+                "ticker", ticker.upper()
+            ).execute()
+        except Exception as e:
+            logger.error(f"remove_signal_watchlist({ticker}): {e}")
+
     # ── Error log ─────────────────────────────────────────────────────────────
 
     def log_error(self, ticker: str, error_type: str, message: str):
