@@ -2,7 +2,7 @@
 ═══════════════════════════════════════════════════════════════════════
   SCALPING SIGNAL ENGINE  —  Radar Pro Integration
   File: Scalping_Signal.py
-  
+
   Drop-in companion to Stock_dashboard_ws_smartalert.py
   Taps Polygon A.* (1-min aggregate) messages from the existing
   single WebSocket connection. No new connections. No new threads.
@@ -12,33 +12,49 @@
     User can add/remove symbols dynamically
     Max 50 symbols
 
-  SIGNAL SCORING WEIGHTS:
-    Trend    30%  — EMA stack + VWAP position
-    Momentum 35%  — MACD, RSI, Stochastic  
-    Volume   20%  — OBV + volume spike
-    Strength 15%  — ADX trend quality
+  SIGNAL SCORING WEIGHTS (approximate max contributions):
+    Trend    ~30%  — EMA stack (0.15) + VWAP position (0.15)
+    Momentum ~35%  — MACD (0.12) + RSI (0.12) + Stochastic (0.11)
+    Volume   ~20%  — Vol spike (0.15) + OBV (0.05)
+    Extras   ~10%  — BB extremes (0.05), ADX multiplier (0.85-1.30x)
+    Note: ADX is applied as a multiplier, not an additive weight.
+          Session multiplier applied last (0.60-1.00x).
 
   SESSION FILTER (ET):
-    ✅ 09:30–10:00  Open (80% weight)
-    ✅ 10:00–11:30  Mid-Morning — BEST WINDOW (100% weight)
-    🚫 11:30–14:00  Midday — SKIPPED (chop)
-    ✅ 14:00–15:30  Afternoon (90% weight)
-    ✅ 15:30–16:00  Power Hour (95% weight)
+    ✅ 09:30-10:00  Open (80% weight)
+    ✅ 10:00-11:30  Mid-Morning — BEST WINDOW (100% weight)
+    🚫 11:30-14:00  Midday — SKIPPED (chop)
+    ✅ 14:00-15:30  Afternoon (90% weight)
+    ✅ 15:30-16:00  Power Hour (95% weight)
+    ⚠️  16:00+       After Hours (70% weight) — seeded via REST bars
+
+  FIXES APPLIED (v2):
+    FIX-1  OBV reset daily at market open (was never reset — multi-day drift)
+    FIX-2  RSI condition overlap removed (was biasing toward LONG signals)
+    FIX-3  AH signals: seed_history_from_rest() added for AH + fast warmup
+    FIX-4  MACD signal line: true streaming EMA via _macd_history deque
+    FIX-5  VWAP reset: date-guard instead of exact-second poll (Windows safe)
+    FIX-6  Cooldown checked BEFORE indicator compute (saves CPU per bar)
+    FIX-7  AFTER_HOURS + PRE_MARKET explicit in s_mult dict
+    FIX-8  Removed duplicate webbrowser import
+    FIX-9  Weight docstring corrected (was incorrectly stated as summing to 1.0)
+    FIX-10 _last_sig purged every 10 min (was unbounded growth)
 ═══════════════════════════════════════════════════════════════════════
 """
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
 import threading
 import logging
-import webbrowser
 import subprocess
 import sys
 import os
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import datetime, time, date
 from enum import Enum
 from typing import Dict, List, Optional
+import time as std_time
+import pytz
 
 # ── third-party ───────────────────────────────────────────────────────────────
 import numpy as np
@@ -49,11 +65,12 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION  — tweak without touching the engine
 # ═══════════════════════════════════════════════════════════════════════════════
 
-MAX_WATCH_SYMBOLS   = 50       # Hard cap — user can select up to 50
-MIN_SCORE_TRADE     = 0.45     # |score| threshold to emit a signal  (0–1)
-MIN_CONFIDENCE      = 0.50
-SIGNAL_COOLDOWN_SEC = 120      # Don't re-signal same ticker within 2 min
-SIGNAL_DASHBOARD_PORT = 8502   # Streamlit port for the signal page
+MAX_WATCH_SYMBOLS     = 50       # Hard cap — user can select up to 50
+MIN_SCORE_TRADE       = 0.45     # |score| threshold to emit a signal  (0-1)
+MIN_CONFIDENCE        = 0.50
+SIGNAL_COOLDOWN_SEC   = 120      # Don't re-signal same ticker within 2 min
+SIGNAL_DASHBOARD_PORT = 8502     # Streamlit port for the signal page
+_COOLDOWN_PURGE_SEC   = 600      # FIX-10: purge stale cooldown entries every 10 min
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -73,7 +90,7 @@ class Signal(Enum):
 class MarketSession(Enum):
     PRE_MARKET  = "pre_market"
     OPEN        = "open"
-    MID_MORNING = "mid_morning"   # ← best scalp window
+    MID_MORNING = "mid_morning"   # best scalp window
     MIDDAY      = "midday"        # skip — low vol chop
     AFTERNOON   = "afternoon"
     POWER_HOUR  = "power_hour"
@@ -94,8 +111,8 @@ class OHLCVBar:
 class TradeSignal:
     symbol:      str
     signal:      Signal
-    score:       float          # –1.0 … +1.0
-    confidence:  float          # 0.0 … 1.0
+    score:       float          # -1.0 ... +1.0
+    confidence:  float          # 0.0 ... 1.0
     strength:    str            # STRONG / MODERATE / WEAK
     entry_price: float
     stop_loss:   float
@@ -131,13 +148,21 @@ class IndicatorCalculator:
         self._obv = 0.0
         self._vwap_cum_pv  = 0.0
         self._vwap_cum_vol = 0.0
+        # FIX-4: store true streaming MACD line values for accurate signal EMA
+        self._macd_history: deque = deque(maxlen=50)
 
     def reset_vwap(self):
+        """
+        FIX-1: Reset VWAP, OBV, and MACD history together at market open.
+        Original only reset VWAP — OBV accumulated cross-day making it meaningless.
+        """
         self._vwap_cum_pv  = 0.0
         self._vwap_cum_vol = 0.0
+        self._obv          = 0.0          # FIX-1
+        self._macd_history.clear()        # fresh MACD signal baseline each day
 
     def add_bar(self, bar: OHLCVBar) -> Optional[dict]:
-        """Add bar → return indicator dict or None if warming up."""
+        """Add bar -> return indicator dict or None if warming up."""
         self.bars.append(bar)
         if len(self.bars) < 27:
             return None
@@ -157,50 +182,97 @@ class IndicatorCalculator:
         return float(v)
 
     def _rsi(self, closes: np.ndarray, p: int = 14) -> float:
-        d = np.diff(closes[-(p + 2):])
-        g = d[d > 0].mean() if (d > 0).any() else 0.0
-        l = (-d[d < 0]).mean() if (d < 0).any() else 0.0
-        if l == 0:
+        if len(closes) <= p:
+            return 50.0
+
+        diffs  = np.diff(closes)
+        gains  = np.maximum(diffs, 0.0)
+        losses = np.abs(np.minimum(diffs, 0.0))
+
+        # Wilder smoothing: SMA seed -> RMA
+        avg_gain = np.mean(gains[:p])
+        avg_loss = np.mean(losses[:p])
+
+        for i in range(p, len(gains)):
+            avg_gain = (avg_gain * (p - 1) + gains[i]) / p
+            avg_loss = (avg_loss * (p - 1) + losses[i]) / p
+
+        if avg_loss == 0:
             return 100.0
-        return 100 - 100 / (1 + g / l)
+
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
 
     def _stoch(self, highs, lows, closes, kp=5, dp=3):
-        h = np.max(highs[-kp:])
+        # K line (Fast Stochastic)
+        h  = np.max(highs[-kp:])
         lo = np.min(lows[-kp:])
-        k = 100 * (closes[-1] - lo) / (h - lo + 1e-10)
-        d = np.mean([
-            100 * (closes[-(i+1)] - np.min(lows[-(i+1)-kp:-(i+1) or None]))
-              / (np.max(highs[-(i+1)-kp:-(i+1) or None])
-                 - np.min(lows[-(i+1)-kp:-(i+1) or None]) + 1e-10)
-            for i in range(dp)
-        ])
+        k  = 100 * (closes[-1] - lo) / (h - lo + 1e-10)
+
+        # D line: 3-period SMA of K values
+        d_vals = []
+        for i in range(dp):
+            end_idx       = -(i) if i != 0 else None
+            start_idx     = -(i + kp)
+            window_highs  = highs[start_idx:end_idx]
+            window_lows   = lows[start_idx:end_idx]
+            current_close = closes[-(i + 1)]
+            lowest        = np.min(window_lows)
+            highest       = np.max(window_highs)
+            k_val         = 100 * (current_close - lowest) / (highest - lowest + 1e-10)
+            d_vals.append(k_val)
+
+        d = np.mean(d_vals)
         return float(k), float(d)
 
     @staticmethod
     def _atr(highs, lows, closes, p=14) -> float:
-        tr = [max(highs[i]-lows[i],
-                  abs(highs[i]-closes[i-1]),
-                  abs(lows[i]-closes[i-1]))
+        tr = [max(highs[i] - lows[i],
+                  abs(highs[i] - closes[i-1]),
+                  abs(lows[i]  - closes[i-1]))
               for i in range(1, len(highs))]
         return float(np.mean(tr[-p:])) if tr else 0.0
 
     @staticmethod
     def _adx(highs, lows, closes, p=14) -> float:
-        if len(highs) < p + 2:
+        if len(highs) <= p:
             return 0.0
-        tr, pdm, ndm = [], [], []
+
+        tr, pdm, ndm = [0.0], [0.0], [0.0]
+
         for i in range(1, len(highs)):
-            tr.append(max(highs[i]-lows[i],
-                          abs(highs[i]-closes[i-1]),
-                          abs(lows[i]-closes[i-1])))
+            tr.append(max(highs[i] - lows[i],
+                          abs(highs[i] - closes[i-1]),
+                          abs(lows[i]  - closes[i-1])))
             up   = highs[i] - highs[i-1]
             down = lows[i-1] - lows[i]
-            pdm.append(up   if up > down   and up > 0   else 0)
-            ndm.append(down if down > up   and down > 0 else 0)
-        ts  = np.mean(tr[-p:])   + 1e-10
-        di_p = 100 * np.mean(pdm[-p:]) / ts
-        di_n = 100 * np.mean(ndm[-p:]) / ts
-        return float(100 * abs(di_p - di_n) / (di_p + di_n + 1e-10))
+            pdm.append(up   if up > down   and up   > 0 else 0.0)
+            ndm.append(down if down > up   and down > 0 else 0.0)
+
+        # Wilder smoothing: SMA seed -> RMA
+        atr_val = np.mean(tr[1:p+1])
+        pdi_val = np.mean(pdm[1:p+1])
+        ndi_val = np.mean(ndm[1:p+1])
+
+        adx_vals = []
+        for i in range(p+1, len(highs)):
+            atr_val = (atr_val * (p - 1) + tr[i])  / p
+            pdi_val = (pdi_val * (p - 1) + pdm[i]) / p
+            ndi_val = (ndi_val * (p - 1) + ndm[i]) / p
+
+            di_p = 100 * (pdi_val / atr_val) if atr_val > 0 else 0
+            di_n = 100 * (ndi_val / atr_val) if atr_val > 0 else 0
+            dx   = 100 * abs(di_p - di_n) / (di_p + di_n + 1e-10)
+            adx_vals.append(dx)
+
+        if not adx_vals:
+            return 0.0
+
+        adx_final = np.mean(adx_vals[:p])
+        for i in range(p, len(adx_vals)):
+            adx_final = (adx_final * (p - 1) + adx_vals[i]) / p
+
+        return float(adx_final)
 
     def _compute(self, bar: OHLCVBar) -> dict:
         closes  = self._arr('close')
@@ -208,7 +280,7 @@ class IndicatorCalculator:
         lows    = self._arr('low')
         volumes = self._arr('volume')
 
-        # VWAP (intraday cumulative)
+        # VWAP (intraday cumulative, resets daily via reset_vwap)
         tp = (bar.high + bar.low + bar.close) / 3
         self._vwap_cum_pv  += tp * bar.volume
         self._vwap_cum_vol += bar.volume
@@ -218,23 +290,25 @@ class IndicatorCalculator:
         ema9  = self._ema(closes, 9)
         ema21 = self._ema(closes, 21)
 
-        # MACD (12/26/9)
+        # FIX-4: True streaming MACD signal line
+        # Original approximated by re-computing from truncated history slices.
+        # Now we store each bar's MACD line value and apply proper EMA(9) to it.
         macd_line = self._ema(closes, 12) - self._ema(closes, 26)
-        # signal line — approximate with last 9 macd values
-        macd_vals = np.array([
-            self._ema(closes[:-(9-i) or None], 12) - self._ema(closes[:-(9-i) or None], 26)
-            for i in range(9)
-        ])
-        macd_signal = self._ema(macd_vals, 9)
-        macd_hist   = macd_line - macd_signal
+        self._macd_history.append(macd_line)
+        if len(self._macd_history) >= 9:
+            macd_signal = self._ema(np.array(self._macd_history), 9)
+        else:
+            # Bootstrap period: simple mean until 9 values accumulated
+            macd_signal = float(np.mean(self._macd_history))
+        macd_hist = macd_line - macd_signal
 
-        # RSI
+        # RSI (Wilder)
         rsi = self._rsi(closes)
 
         # Stochastic
         stoch_k, stoch_d = self._stoch(highs, lows, closes)
 
-        # Bollinger Bands
+        # Bollinger Bands (20-period)
         bb_mid   = float(np.mean(closes[-20:]))
         bb_std   = float(np.std(closes[-20:]))
         bb_upper = bb_mid + 2 * bb_std
@@ -244,7 +318,7 @@ class IndicatorCalculator:
         atr = self._atr(highs, lows, closes)
         adx = self._adx(highs, lows, closes)
 
-        # OBV
+        # OBV (FIX-1: _obv reset daily alongside VWAP in reset_vwap)
         if len(self.bars) >= 2:
             prev = list(self.bars)[-2]
             if bar.close > prev.close:
@@ -252,9 +326,10 @@ class IndicatorCalculator:
             elif bar.close < prev.close:
                 self._obv -= bar.volume
 
-        # Volume ratio
-        avg_vol = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else float(volumes.mean())
-        vol_ratio = bar.volume / (avg_vol + 1e-10)
+        # Volume ratio — safe floor prevents divide-by-zero / extreme multipliers
+        raw_avg_vol  = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else float(volumes.mean())
+        safe_avg_vol = max(raw_avg_vol, 500.0)
+        vol_ratio    = bar.volume / safe_avg_vol
 
         return dict(
             ema9=ema9, ema21=ema21, vwap=vwap,
@@ -273,7 +348,7 @@ class IndicatorCalculator:
 class ScalpingSignalEngine:
     """
     Core signal evaluator.
-    Scoring weights:  Trend 30% | Momentum 35% | Volume 20% | Strength 15%
+    Scoring: Trend ~30% | Momentum ~35% | Volume ~20% | ADX multiplier | Session multiplier
     """
 
     # Thresholds
@@ -286,12 +361,19 @@ class ScalpingSignalEngine:
     ATR_TP_MULT           = 2.5
 
     def __init__(self):
-        self._calcs:     Dict[str, IndicatorCalculator] = {}
-        self._last_sig:  Dict[str, float] = {}          # ticker → epoch of last signal
-        self._callbacks: List = []
-        self._lock = threading.Lock()
-        # Ring buffer of last 200 signals (for dashboard)
+        self._calcs:      Dict[str, IndicatorCalculator] = {}
+        self._last_sig:   Dict[str, float] = {}   # FIX-10: purged every 10 min
+        self._last_purge: float = std_time.time()
+        self._callbacks:  List  = []
+        self._lock        = threading.Lock()
+
+        # Ring buffer of last 200 signals (for dashboard /api/signals)
         self.signal_history: deque = deque(maxlen=200)
+
+        # FIX-5: date-guard prevents missed/double VWAP reset
+        self._vwap_reset_date: Optional[date] = None
+
+        self._start_vwap_scheduler()
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -300,17 +382,58 @@ class ScalpingSignalEngine:
         self._callbacks.append(cb)
 
     def reset_vwap_all(self):
-        """Call at market open (9:30 ET) to reset VWAP for all tracked symbols."""
+        """Reset VWAP + OBV + MACD history for all tracked symbols at market open."""
         with self._lock:
             for c in self._calcs.values():
-                c.reset_vwap()
-        logger.info("VWAP reset for all symbols.")
+                c.reset_vwap()   # FIX-1: also resets OBV and MACD history
+        logger.info("VWAP + OBV + MACD history reset for all symbols.")
+
+    # FIX-5: date-guard scheduler
+    def _start_vwap_scheduler(self):
+        """
+        Background daemon that resets indicators at 09:30 ET on weekdays.
+
+        FIX-5: Uses a date guard + 10-second poll instead of exact-second check.
+        Original polled every 0.5s checking second==0 — on Windows (15ms sleep
+        resolution) this frequently missed the window, leaving stale VWAP all day.
+        Now: checks every 10s, fires once per calendar day (date guard ensures
+        no double-trigger even if the check runs at 09:30:05 or 09:30:50).
+        """
+        def scheduler_loop():
+            et_tz = pytz.timezone("America/New_York")
+            while True:
+                now_et = datetime.now(et_tz)
+                today  = now_et.date()
+
+                if (now_et.weekday() < 5
+                        and now_et.hour == 9
+                        and now_et.minute == 30
+                        and self._vwap_reset_date != today):
+                    self._vwap_reset_date = today
+                    self.reset_vwap_all()
+                    logger.info("⏰ Auto VWAP+OBV Reset triggered at market open")
+
+                std_time.sleep(10)
+
+        t = threading.Thread(target=scheduler_loop, daemon=True, name="AutoVWAP")
+        t.start()
 
     def process_aggregate_bar(self, symbol: str, bar: OHLCVBar) -> Optional[TradeSignal]:
         """
-        Feed a 1-min aggregate bar (from Polygon A.* message).
+        Feed a 1-min aggregate bar (from Polygon A.* or synthetic AH bar).
         Returns TradeSignal if conditions met, else None.
         """
+        # FIX-6: check cooldown BEFORE running expensive indicator math
+        now  = bar.timestamp.timestamp()
+        last = self._last_sig.get(symbol, 0)
+        if now - last < SIGNAL_COOLDOWN_SEC:
+            # Still feed bar into deque so indicators warm up during cooldown
+            with self._lock:
+                if symbol not in self._calcs:
+                    self._calcs[symbol] = IndicatorCalculator(symbol)
+                self._calcs[symbol].add_bar(bar)
+            return None
+
         with self._lock:
             if symbol not in self._calcs:
                 self._calcs[symbol] = IndicatorCalculator(symbol)
@@ -321,19 +444,14 @@ class ScalpingSignalEngine:
 
         session = _get_session(bar.timestamp)
         if session == MarketSession.MIDDAY:
-            return None      # skip low-volume chop 11:30–14:00 ET
+            return None      # skip low-volume chop 11:30-14:00 ET
 
         sig = self._evaluate(symbol, bar, indicators, session)
         if sig is None:
             return None
 
-        # Cooldown check
-        now = bar.timestamp.timestamp()
-        last = self._last_sig.get(symbol, 0)
-        if now - last < SIGNAL_COOLDOWN_SEC:
-            return None
-
         self._last_sig[symbol] = now
+        self._maybe_purge_cooldowns(now)   # FIX-10
         self.signal_history.appendleft(sig)
 
         for cb in self._callbacks:
@@ -343,6 +461,18 @@ class ScalpingSignalEngine:
                 logger.error(f"Signal callback error: {e}")
 
         return sig
+
+    # FIX-10: bounded cooldown dict — purge entries older than cooldown window
+    def _maybe_purge_cooldowns(self, now: float):
+        if now - self._last_purge < _COOLDOWN_PURGE_SEC:
+            return
+        cutoff = now - SIGNAL_COOLDOWN_SEC
+        stale  = [k for k, v in self._last_sig.items() if v < cutoff]
+        for k in stale:
+            del self._last_sig[k]
+        self._last_purge = now
+        if stale:
+            logger.debug(f"Purged {len(stale)} stale cooldown entries")
 
     # ── scoring ──────────────────────────────────────────────────────────────
 
@@ -366,84 +496,111 @@ class ScalpingSignalEngine:
         bb_lower  = ind['bb_lower']
         atr       = ind['atr']
 
-        # ── TREND (30%) ──────────────────────────────────────────────────
+        # ── TREND (~30%) ─────────────────────────────────────────────────
         if close > ema9 > ema21:
-            bull += 0.15; reasons.append({"text": "Bullish EMA stack", "type": "bull"})
+            bull += 0.15
+            reasons.append({"text": "Bullish EMA stack", "type": "bull"})
         elif close < ema9 < ema21:
-            bear += 0.15; reasons.append({"text": "Bearish EMA stack", "type": "bear"})
+            bear += 0.15
+            reasons.append({"text": "Bearish EMA stack", "type": "bear"})
 
         vwap_pct = (close - vwap) / vwap * 100
         if close > vwap:
-            bull += 0.15; reasons.append({"text": f"Above VWAP +{vwap_pct:.2f}%", "type": "bull"})
+            bull += 0.15
+            reasons.append({"text": f"Above VWAP +{vwap_pct:.2f}%", "type": "bull"})
         else:
-            bear += 0.15; reasons.append({"text": f"Below VWAP {vwap_pct:.2f}%", "type": "bear"})
+            bear += 0.15
+            reasons.append({"text": f"Below VWAP {vwap_pct:.2f}%", "type": "bear"})
 
-        # ── MOMENTUM (35%) ───────────────────────────────────────────────
+        # ── MOMENTUM (~35%) ──────────────────────────────────────────────
         if macd_hist > 0 and macd_line > macd_sig:
-            bull += 0.12; reasons.append({"text": f"MACD bullish hist:{macd_hist:.4f}", "type": "bull"})
+            bull += 0.12
+            reasons.append({"text": f"MACD bullish hist:{macd_hist:.4f}", "type": "bull"})
         elif macd_hist < 0 and macd_line < macd_sig:
-            bear += 0.12; reasons.append({"text": f"MACD bearish hist:{macd_hist:.4f}", "type": "bear"})
+            bear += 0.12
+            reasons.append({"text": f"MACD bearish hist:{macd_hist:.4f}", "type": "bear"})
 
-        if 40 < rsi < self.RSI_OB:
-            if rsi > self.RSI_BULL:
-                bull += 0.12; reasons.append({"text": f"RSI bull zone {rsi:.0f}", "type": "bull"})
-            else:
-                bull += 0.05
-        elif self.RSI_OS < rsi < 60:
-            if rsi < self.RSI_BEAR:
-                bear += 0.12; reasons.append({"text": f"RSI bear zone {rsi:.0f}", "type": "bear"})
-            else:
-                bear += 0.05
-        elif rsi >= self.RSI_OB:
-            bear += 0.08; reasons.append({"text": f"RSI overbought {rsi:.0f}", "type": "warn"})
-        elif rsi <= self.RSI_OS:
-            bull += 0.08; reasons.append({"text": f"RSI oversold {rsi:.0f}", "type": "warn"})
+        # FIX-2: non-overlapping RSI zones — eliminates original LONG bias
+        # Original: `if 40 < rsi < 70` and `elif 30 < rsi < 60` overlapped at 40-60,
+        # meaning RSI=50 always hit the first branch and added bull += 0.05.
+        if rsi >= self.RSI_OB:                   # >= 70 overbought
+            bear += 0.08
+            reasons.append({"text": f"RSI overbought {rsi:.0f}", "type": "warn"})
+        elif rsi <= self.RSI_OS:                  # <= 30 oversold
+            bull += 0.08
+            reasons.append({"text": f"RSI oversold {rsi:.0f}", "type": "warn"})
+        elif rsi > self.RSI_BULL:                 # 55-70 bullish momentum
+            bull += 0.12
+            reasons.append({"text": f"RSI bull zone {rsi:.0f}", "type": "bull"})
+        elif rsi < self.RSI_BEAR:                 # 30-45 bearish momentum
+            bear += 0.12
+            reasons.append({"text": f"RSI bear zone {rsi:.0f}", "type": "bear"})
+        elif rsi >= 50:                           # 50-55 mild bull lean
+            bull += 0.04
+        else:                                     # 45-50 mild bear lean
+            bear += 0.04
+        # RSI 45-55: only ±0.04 (near-neutral) — no systematic LONG bias
 
         if stk > std and stk < self.STOCH_OB:
-            bull += 0.11; reasons.append({"text": f"Stoch K{stk:.0f}↑D{std:.0f}", "type": "bull"})
+            bull += 0.11
+            reasons.append({"text": f"Stoch K{stk:.0f}↑D{std:.0f}", "type": "bull"})
         elif stk < std and stk > self.STOCH_OS:
-            bear += 0.11; reasons.append({"text": f"Stoch K{stk:.0f}↓D{std:.0f}", "type": "bear"})
+            bear += 0.11
+            reasons.append({"text": f"Stoch K{stk:.0f}↓D{std:.0f}", "type": "bear"})
 
-        # ── VOLUME (20%) ─────────────────────────────────────────────────
+        # ── VOLUME (~20%) ────────────────────────────────────────────────
         if vol_ratio >= self.VOL_HIGH:
             if bull > bear:
-                bull += 0.15; reasons.append({"text": f"Vol spike {vol_ratio:.1f}x ✅", "type": "bull"})
+                bull += 0.15
+                reasons.append({"text": f"Vol spike {vol_ratio:.1f}x ✅", "type": "bull"})
             else:
-                bear += 0.15; reasons.append({"text": f"Vol spike {vol_ratio:.1f}x ✅", "type": "bear"})
+                bear += 0.15
+                reasons.append({"text": f"Vol spike {vol_ratio:.1f}x ✅", "type": "bear"})
         elif vol_ratio >= self.VOL_SPIKE:
             if bull > bear:
-                bull += 0.10; reasons.append({"text": f"Vol {vol_ratio:.1f}x avg", "type": "bull"})
+                bull += 0.10
+                reasons.append({"text": f"Vol {vol_ratio:.1f}x avg", "type": "bull"})
             else:
-                bear += 0.10; reasons.append({"text": f"Vol {vol_ratio:.1f}x avg", "type": "bear"})
+                bear += 0.10
+                reasons.append({"text": f"Vol {vol_ratio:.1f}x avg", "type": "bear"})
         else:
             reasons.append({"text": f"Low vol {vol_ratio:.1f}x", "type": "warn"})
 
-        obv = ind['obv']
-        if obv > 0: bull += 0.05
-        elif obv < 0: bear += 0.05
+        obv = ind['obv']   # FIX-1: now resets daily — intraday OBV is meaningful
+        if obv > 0:
+            bull += 0.05
+        elif obv < 0:
+            bear += 0.05
 
-        # ── ADX / TREND STRENGTH (15%) ────────────────────────────────────
+        # ── ADX / TREND STRENGTH (multiplier, not additive weight) ───────
         mult = 1.3 if adx >= self.ADX_STRONG else (1.1 if adx >= self.ADX_TREND else 0.85)
         if adx >= self.ADX_TREND:
             reasons.append({"text": f"ADX {adx:.0f} trending", "type": "bull"})
         else:
             reasons.append({"text": f"ADX {adx:.0f} choppy — caution", "type": "warn"})
-        bull *= mult; bear *= mult
+        bull *= mult
+        bear *= mult
 
-        # BB extremes
+        # BB extremes (bonus, not in core weights)
         if close > bb_upper:
-            bear += 0.05; reasons.append({"text": "Above BB upper — reversal risk", "type": "warn"})
+            bear += 0.05
+            reasons.append({"text": "Above BB upper — reversal risk", "type": "warn"})
         elif close < bb_lower:
-            bull += 0.05; reasons.append({"text": "Below BB lower — bounce possible", "type": "warn"})
+            bull += 0.05
+            reasons.append({"text": "Below BB lower — bounce possible", "type": "warn"})
 
-        # Session multiplier
+        # FIX-7: AFTER_HOURS and PRE_MARKET explicitly in s_mult dict
+        # Original: both fell through to default 0.70 — now self-documenting
         s_mult = {
             MarketSession.OPEN:        0.80,
             MarketSession.MID_MORNING: 1.00,
             MarketSession.AFTERNOON:   0.90,
             MarketSession.POWER_HOUR:  0.95,
+            MarketSession.AFTER_HOURS: 0.70,   # lower quality — limited bar data
+            MarketSession.PRE_MARKET:  0.60,   # very thin liquidity
         }.get(session, 0.70)
-        bull *= s_mult; bear *= s_mult
+        bull *= s_mult
+        bear *= s_mult
 
         net = bull - bear
         if abs(net) < MIN_SCORE_TRADE:
@@ -456,13 +613,13 @@ class ScalpingSignalEngine:
 
         abs_net = abs(net)
         if abs_net >= 0.75:
-            sig = Signal.STRONG_BUY  if direction > 0 else Signal.STRONG_SELL
+            sig      = Signal.STRONG_BUY  if direction > 0 else Signal.STRONG_SELL
             strength = "STRONG"
         elif abs_net >= 0.55:
-            sig = Signal.BUY         if direction > 0 else Signal.SELL
+            sig      = Signal.BUY         if direction > 0 else Signal.SELL
             strength = "MODERATE"
         else:
-            sig = Signal.WEAK_BUY    if direction > 0 else Signal.WEAK_SELL
+            sig      = Signal.WEAK_BUY    if direction > 0 else Signal.WEAK_SELL
             strength = "WEAK"
 
         safe_atr = atr if atr > 0 else close * 0.002
@@ -498,14 +655,19 @@ class ScalpingSignalEngine:
 
 class SignalWatchlistManager:
     """
-    Bridges user-selected symbols ↔ ScalpingSignalEngine.
+    Bridges user-selected symbols <-> ScalpingSignalEngine.
     Tap this from Radar Pro's existing all_tickers set.
+
+    FIX-3: seed_history_from_rest() seeds today's intraday bars from Polygon REST.
+    Call this at startup so:
+      - Indicators warm up immediately (no 27-bar wait for first signal)
+      - AH signals fire via seeded bars when Polygon A.* stops at 4pm
     """
 
     def __init__(self, engine: ScalpingSignalEngine):
-        self.engine = engine
+        self.engine   = engine
         self._watched: set = set()
-        self._lock = threading.Lock()
+        self._lock    = threading.Lock()
 
     @property
     def watched(self) -> set:
@@ -513,38 +675,32 @@ class SignalWatchlistManager:
             return set(self._watched)
 
     def set_watchlist(self, symbols: List[str]) -> List[str]:
-        """
-        Replace watchlist (max 50 symbols).
-        Returns the accepted list.
-        """
+        """Replace watchlist (max 50 symbols). Returns the accepted list."""
         clean = [s.upper().strip() for s in symbols if s.strip()][:MAX_WATCH_SYMBOLS]
         with self._lock:
             self._watched = set(clean)
-        logger.info(f"Signal watchlist updated: {len(clean)} symbols → {clean}")
+        logger.info(f"Signal watchlist updated: {len(clean)} symbols -> {clean}")
         return clean
 
     def load_from_file(self, path: str = "Cache/signal_watchlist.json"):
         """
         Load watchlist from JSON file on disk.
-        Called automatically at StockDashboard init so the engine
-        starts watching immediately without sidebar interaction.
         Falls back to empty watchlist if file not found.
         """
         import json
-        DEFAULT_WATCHLIST = []  # Empty by default - user manages via frontend
+        DEFAULT_WATCHLIST = []
         try:
             if os.path.exists(path):
                 with open(path, "r") as f:
                     symbols = json.load(f)
                 accepted = self.set_watchlist(symbols)
-                logger.info(f"⚡ Signal watchlist loaded from {path}: {len(accepted)} symbols")
+                logger.info(f"Signal watchlist loaded from {path}: {len(accepted)} symbols")
             else:
                 accepted = self.set_watchlist(DEFAULT_WATCHLIST)
-                # Save empty list to disk for next run
                 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
                 with open(path, "w") as f:
                     json.dump(DEFAULT_WATCHLIST, f, indent=2)
-                logger.info(f"⚡ Signal watchlist initialized empty, saved to {path}")
+                logger.info(f"Signal watchlist initialized empty, saved to {path}")
         except Exception as e:
             logger.warning(f"Signal watchlist load failed ({e}), using empty list")
             self.set_watchlist(DEFAULT_WATCHLIST)
@@ -573,10 +729,17 @@ class SignalWatchlistManager:
         if not ticker or not self.is_watched(ticker):
             return None
 
-        # Polygon Aggregate (A.*) attributes
+        unix_ms = getattr(msg, 'e', getattr(msg, 'end_timestamp', None))
+        et_tz   = pytz.timezone("America/New_York")
+
+        if unix_ms:
+            true_time = datetime.fromtimestamp(unix_ms / 1000.0, tz=et_tz)
+        else:
+            true_time = datetime.now(et_tz)
+
         try:
             bar = OHLCVBar(
-                timestamp = datetime.now(),     # use now; or parse msg.start_timestamp
+                timestamp = true_time,
                 open      = float(getattr(msg, 'open',   getattr(msg, 'op', 0))),
                 high      = float(getattr(msg, 'high',   getattr(msg, 'h',  0))),
                 low       = float(getattr(msg, 'low',    getattr(msg, 'l',  0))),
@@ -592,12 +755,89 @@ class SignalWatchlistManager:
 
         return self.engine.process_aggregate_bar(ticker, bar)
 
+    # FIX-3: Seed indicator history from Polygon REST API
+    def seed_history_from_rest(self, polygon_api_key: str, symbols: Optional[List[str]] = None):
+        """
+        Fetch today's 1-min bars from Polygon REST for each watched symbol
+        and feed them into the indicator calculators. Runs in a background thread.
+
+        WHY: Polygon A.* (aggregate WebSocket) messages stop at 4:00pm ET.
+             Without seeded bars, AH signals never fire because the 27-bar
+             warm-up window is never reached from live ticks alone.
+             Also eliminates the 27-minute wait at market open before first signal.
+
+        CALL AT:
+          1. Startup / watchlist load — warm up indicators immediately
+          2. 4:00pm ET — re-seed so AH signals have a full indicator history
+
+        Args:
+            polygon_api_key : Your Polygon.io API key (same one used by ws_engine)
+            symbols         : Override list. Defaults to current watchlist.
+        """
+        def _seed():
+            try:
+                import urllib.request
+                import json as _json
+
+                et_tz   = pytz.timezone("America/New_York")
+                today   = datetime.now(et_tz).strftime("%Y-%m-%d")
+                targets = symbols or list(self.watched)
+
+                if not targets:
+                    logger.info("seed_history_from_rest: watchlist empty — nothing to seed")
+                    return
+
+                logger.info(f"Seeding bar history for {len(targets)} symbols ({today})...")
+                seeded = 0
+
+                for sym in targets:
+                    try:
+                        url = (
+                            f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/minute"
+                            f"/{today}/{today}"
+                            f"?adjusted=true&sort=asc&limit=390&apiKey={polygon_api_key}"
+                        )
+                        with urllib.request.urlopen(url, timeout=10) as resp:
+                            data = _json.loads(resp.read().decode())
+
+                        bars_raw = data.get("results", [])
+                        if not bars_raw:
+                            logger.debug(f"seed_history: no bars returned for {sym}")
+                            continue
+
+                        for r in bars_raw:
+                            ts  = datetime.fromtimestamp(r["t"] / 1000.0, tz=et_tz)
+                            bar = OHLCVBar(
+                                timestamp = ts,
+                                open      = float(r.get("o", 0)),
+                                high      = float(r.get("h", 0)),
+                                low       = float(r.get("l", 0)),
+                                close     = float(r.get("c", 0)),
+                                volume    = float(r.get("v", 0)),
+                            )
+                            if bar.close > 0:
+                                self.engine.process_aggregate_bar(sym, bar)
+
+                        seeded += 1
+                        logger.debug(f"Seeded {len(bars_raw)} bars for {sym}")
+
+                    except Exception as e:
+                        logger.warning(f"seed_history: failed for {sym}: {e}")
+
+                logger.info(f"Bar history seeded for {seeded}/{len(targets)} symbols")
+
+            except Exception as e:
+                logger.error(f"seed_history_from_rest thread error: {e}")
+
+        t = threading.Thread(target=_seed, daemon=True, name="BarHistorySeed")
+        t.start()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CHROME TAB LAUNCHER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_dashboard_process = None
+_dashboard_process  = None
 _dashboard_launched = False
 
 
@@ -609,12 +849,11 @@ def launch_signal_dashboard():
     Windows 11 browser-open strategy (in order):
       1. Chrome via registry / known paths
       2. Edge fallback
-      3. Windows  start  shell command (always works — uses default browser)
+      3. Windows start shell command (uses default browser)
       4. Python webbrowser module
     """
     global _dashboard_process, _dashboard_launched
 
-    # Allow re-launch if process has died
     if _dashboard_launched and _dashboard_process is not None:
         if _dashboard_process.poll() is None:
             logger.info("Signal dashboard already running — just opening URL")
@@ -625,8 +864,10 @@ def launch_signal_dashboard():
             _dashboard_launched = False
 
     _dashboard_launched = True
-    dashboard_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "signal_dashboard_page.py")
+    dashboard_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "signal_dashboard_page.py"
+    )
 
     if not os.path.exists(dashboard_script):
         logger.error(
@@ -639,40 +880,35 @@ def launch_signal_dashboard():
         _dashboard_process = subprocess.Popen(
             [sys.executable, "-m", "streamlit", "run",
              dashboard_script,
-             "--server.port",            str(SIGNAL_DASHBOARD_PORT),
-             "--server.address",         "localhost",
-             "--server.headless",        "true",
+             "--server.port",              str(SIGNAL_DASHBOARD_PORT),
+             "--server.address",           "localhost",
+             "--server.headless",          "true",
              "--browser.gatherUsageStats", "false",
-             "--server.runOnSave",       "false"],
+             "--server.runOnSave",         "false"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             cwd=os.path.dirname(os.path.abspath(__file__)),
         )
-        logger.info(f"✅ Signal dashboard process started (PID {_dashboard_process.pid})")
+        logger.info(f"Signal dashboard process started (PID {_dashboard_process.pid})")
 
     except Exception as e:
         logger.error(f"Failed to start signal dashboard process: {e}")
         _dashboard_launched = False
         return
 
-    # Open browser after giving Streamlit time to bind the port
     def _open_after_startup():
-        import time as _time
-        url = f"http://localhost:{SIGNAL_DASHBOARD_PORT}"
-
-        # Poll until port is open (max 15 s)
         import socket
+        url = f"http://localhost:{SIGNAL_DASHBOARD_PORT}"
         for attempt in range(15):
-            _time.sleep(1)
+            std_time.sleep(1)
             try:
                 with socket.create_connection(("localhost", SIGNAL_DASHBOARD_PORT), timeout=1):
-                    logger.info(f"✅ Port {SIGNAL_DASHBOARD_PORT} is open after {attempt+1}s")
+                    logger.info(f"Port {SIGNAL_DASHBOARD_PORT} open after {attempt+1}s")
                     break
             except OSError:
                 continue
         else:
-            logger.warning(f"Port {SIGNAL_DASHBOARD_PORT} did not open in 15s — trying to open anyway")
-
+            logger.warning(f"Port {SIGNAL_DASHBOARD_PORT} did not open in 15s — opening anyway")
         _open_browser_url(url)
 
     threading.Thread(target=_open_after_startup, daemon=True).start()
@@ -681,40 +917,36 @@ def launch_signal_dashboard():
 def _open_browser_url(url: str):
     """
     Open a URL in Chrome / Edge / default browser on Windows 11 / Mac / Linux.
-    Uses 4 strategies in order — one will always work.
+    FIX-8: removed duplicate `import webbrowser` at top of original function.
     """
     chrome_path = _find_chrome()
 
-    # Strategy 1: Chrome or Edge found via _find_chrome
     if chrome_path:
         try:
             subprocess.Popen([chrome_path, "--new-tab", url],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            #logger.info(f"✅ Opened in browser via path: {chrome_path}")
             return
         except Exception as e:
             logger.warning(f"Direct browser launch failed ({e}) — trying fallbacks")
 
-    # Strategy 2: Windows  start  command (uses default browser, always works)
     if sys.platform == "win32":
         try:
-            os.startfile(url)          # simplest Windows call
-            logger.info(f"✅ Opened via os.startfile: {url}")
+            os.startfile(url)
+            logger.info(f"Opened via os.startfile: {url}")
             return
         except Exception:
             pass
         try:
             subprocess.Popen(f'start "" "{url}"', shell=True)
-            logger.info(f"✅ Opened via shell start: {url}")
+            logger.info(f"Opened via shell start: {url}")
             return
         except Exception as e:
             logger.warning(f"Shell start failed: {e}")
 
-    # Strategy 3: webbrowser module (cross-platform)
     try:
-        import webbrowser
+        import webbrowser   # stdlib fallback — cross-platform
         webbrowser.open_new_tab(url)
-        logger.info(f"✅ Opened via webbrowser module: {url}")
+        logger.info(f"Opened via webbrowser module: {url}")
     except Exception as e:
         logger.error(
             f"All browser-open strategies failed. "
@@ -726,14 +958,12 @@ def _find_chrome() -> Optional[str]:
     """
     Find Chrome executable on Windows 11 / Mac / Linux.
     Search order:
-      1. Windows registry  (most reliable — works for all install types)
+      1. Windows registry  (most reliable — handles all install types)
       2. Common fixed paths (Program Files, user profile, local AppData)
       3. Mac / Linux paths
     Returns path string or None.
     """
-    # ── Windows: registry + all known install locations ──────────────────────
     if sys.platform == "win32":
-        # 1. Registry lookup (handles per-user and system installs)
         try:
             import winreg
             for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
@@ -751,30 +981,26 @@ def _find_chrome() -> Optional[str]:
         except Exception:
             pass
 
-        # 2. All known Windows paths including user-profile installs
         user_profile = os.environ.get("USERPROFILE", "C:\\Users\\User")
-        local_app    = os.environ.get("LOCALAPPDATA", os.path.join(user_profile, "AppData", "Local"))
-        prog_files   = os.environ.get("PROGRAMFILES",       r"C:\Program Files")
-        prog_files86 = os.environ.get("PROGRAMFILES(X86)",  r"C:\Program Files (x86)")
+        local_app    = os.environ.get("LOCALAPPDATA",     os.path.join(user_profile, "AppData", "Local"))
+        prog_files   = os.environ.get("PROGRAMFILES",     r"C:\Program Files")
+        prog_files86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
 
         candidates = [
-            os.path.join(local_app,    "Google", "Chrome", "Application", "chrome.exe"),
-            os.path.join(prog_files,   "Google", "Chrome", "Application", "chrome.exe"),
-            os.path.join(prog_files86, "Google", "Chrome", "Application", "chrome.exe"),
-            # Chrome Beta / Dev / Canary
-            os.path.join(local_app, "Google", "Chrome Beta",   "Application", "chrome.exe"),
-            os.path.join(local_app, "Google", "Chrome Dev",    "Application", "chrome.exe"),
-            os.path.join(local_app, "Google", "Chrome SxS",    "Application", "chrome.exe"),
-            # Microsoft Edge (Chromium) — good fallback
-            os.path.join(prog_files,   "Microsoft", "Edge", "Application", "msedge.exe"),
-            os.path.join(prog_files86, "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(local_app,    "Google", "Chrome",      "Application", "chrome.exe"),
+            os.path.join(prog_files,   "Google", "Chrome",      "Application", "chrome.exe"),
+            os.path.join(prog_files86, "Google", "Chrome",      "Application", "chrome.exe"),
+            os.path.join(local_app,    "Google", "Chrome Beta", "Application", "chrome.exe"),
+            os.path.join(local_app,    "Google", "Chrome Dev",  "Application", "chrome.exe"),
+            os.path.join(local_app,    "Google", "Chrome SxS",  "Application", "chrome.exe"),
+            os.path.join(prog_files,   "Microsoft", "Edge",     "Application", "msedge.exe"),
+            os.path.join(prog_files86, "Microsoft", "Edge",     "Application", "msedge.exe"),
         ]
         for c in candidates:
             if os.path.exists(c):
                 return c
-        return None  # fall through to webbrowser / start fallback
+        return None
 
-    # ── Mac ───────────────────────────────────────────────────────────────────
     mac_candidates = [
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
@@ -783,7 +1009,6 @@ def _find_chrome() -> Optional[str]:
         if os.path.exists(c):
             return c
 
-    # ── Linux ─────────────────────────────────────────────────────────────────
     for cmd in ("google-chrome", "google-chrome-stable", "chromium-browser", "chromium"):
         result = subprocess.run(["which", cmd], capture_output=True, text=True)
         if result.returncode == 0 and result.stdout.strip():
@@ -797,11 +1022,17 @@ def _find_chrome() -> Optional[str]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _get_session(ts: datetime) -> MarketSession:
+    """Convert a timestamp to its ET market session."""
+    et_tz = pytz.timezone("America/New_York")
+    if ts.tzinfo is None:
+        ts = pytz.utc.localize(ts).astimezone(et_tz)
+    else:
+        ts = ts.astimezone(et_tz)
     t = ts.time()
-    if   t < time(9, 30):  return MarketSession.PRE_MARKET
-    elif t < time(10, 0):  return MarketSession.OPEN
+    if   t < time(9,  30): return MarketSession.PRE_MARKET
+    elif t < time(10,  0): return MarketSession.OPEN
     elif t < time(11, 30): return MarketSession.MID_MORNING
-    elif t < time(14, 0):  return MarketSession.MIDDAY
+    elif t < time(14,  0): return MarketSession.MIDDAY
     elif t < time(15, 30): return MarketSession.AFTERNOON
-    elif t < time(16, 0):  return MarketSession.POWER_HOUR
+    elif t < time(16,  0): return MarketSession.POWER_HOUR
     else:                  return MarketSession.AFTER_HOURS

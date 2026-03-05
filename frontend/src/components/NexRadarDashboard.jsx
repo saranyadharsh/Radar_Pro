@@ -419,22 +419,25 @@ function TVChart({ symbol, height=220, T }) {
       if (window.TradingView && ref.current) {
         new window.TradingView.widget({
           autosize: true,
-          symbol: `NASDAQ:${symbol}`,
+          symbol: symbol,
           interval: "5",
           timezone: "America/New_York",
           theme: "dark",
           style: "1",
           locale: "en",
           enable_publishing: false,
-          hide_top_toolbar: true,
+          hide_top_toolbar: false,
           hide_legend: true,
           hide_side_toolbar: true,
-          allow_symbol_change: false,
+          allow_symbol_change: true,
           save_image: false,
-          studies: [], // NO indicators — clean chart
+          studies: [],
           container_id: ref.current.id,
           backgroundColor: bg1,
           gridColor: border,
+          session: "extended",
+          enabled_features: ["pre_post_market_data","show_trading_sessions_on_chart"],
+          disabled_features: ["use_localstorage_for_settings"],
         });
       }
     };
@@ -530,6 +533,20 @@ function SectorPills({ selectedSectors, onChange, showCounts=false, T }) {
 function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerformance = {}, tickers, T }) {
   const sectorTiles = SECTORS.filter(s => s.id !== "ALL");
 
+  const [scalpSignals, setScalpSignals] = React.useState([]);
+  const [scalpFilter,  setScalpFilter]  = React.useState("ALL");
+  React.useEffect(() => {
+    const poll = () => fetch(`${API_BASE}/api/signals?limit=50`)
+      .then(r=>r.json()).then(d=>setScalpSignals(Array.isArray(d)?d:[])).catch(()=>{});
+    poll(); const id=setInterval(poll,5000); return ()=>clearInterval(id);
+  }, []);
+  const [earningsToday, setEarningsToday] = React.useState(null);
+  React.useEffect(() => {
+    const today=new Date().toISOString().slice(0,10);
+    fetch(`${API_BASE}/api/earnings?start=${today}&end=${today}`)
+      .then(r=>r.json()).then(d=>setEarningsToday(Array.isArray(d)?d:[])).catch(()=>setEarningsToday([]));
+  }, []);
+
   return (
     <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:18 }}>
       {/* Market Breadth (includes Earnings) + Scalp Signals */}
@@ -608,11 +625,38 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
         {/* Scalp Signals */}
         <div className="card" style={{ flex:1, minWidth:200 }}>
           <SectionHeader title="Scalp Signals" T={T}>
-            <Chip color={T.cyan}>ALL</Chip>
-            <Chip color={T.green}>LONG</Chip>
-            <Chip color={T.red}>SHORT</Chip>
+            {[["ALL",T.text1],["LONG",T.green],["SHORT",T.red]].map(([f,c])=>(
+              <button key={f} onClick={()=>setScalpFilter(f)} style={{
+                background:scalpFilter===f?c+"18":"none", border:`1px solid ${scalpFilter===f?c+"50":T.border}`,
+                color:scalpFilter===f?c:T.text2, borderRadius:4, padding:"3px 8px",
+                cursor:"pointer", fontFamily:T.font, fontSize:9, letterSpacing:1 }}>{f}</button>
+            ))}
           </SectionHeader>
-          <EmptyState icon="◉" label="NO SIGNALS" sub="Connect backend to receive live signal feed" h={200} T={T} />
+          <div style={{ maxHeight:220, overflowY:"auto", padding:"8px 14px" }}>
+            {(()=>{
+              const fl=scalpFilter==="ALL"?scalpSignals:scalpSignals.filter(s=>s.direction===scalpFilter);
+              if(!fl.length) return <div style={{color:T.text2,fontSize:11,fontFamily:T.font,textAlign:"center",padding:"30px 0"}}>
+                {scalpSignals.length===0?"⏳ Waiting for signals…":`No ${scalpFilter} signals`}</div>;
+              return fl.slice(0,8).map((sig,i)=>{
+                const isLong=sig.direction==="LONG",c=isLong?T.green:T.red;
+                return(<div key={sig.id||i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                  padding:"8px 0",borderBottom:i<fl.length-1?`1px solid ${T.border}`:"none"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:7}}>
+                    <span style={{color:c,fontSize:12,fontWeight:700}}>{isLong?"▲":"▼"}</span>
+                    <div><div style={{color:T.cyan,fontSize:12,fontFamily:T.font,fontWeight:700}}>{sig.symbol}</div>
+                      <div style={{color:T.text2,fontSize:9,fontFamily:T.font}}>{sig.strength}</div></div>
+                  </div>
+                  <div style={{textAlign:"right"}}>
+                    <div style={{color:c,fontSize:11,fontFamily:T.font,fontWeight:700}}>${(sig.entry_price||0).toFixed(2)}</div>
+                    <div style={{color:T.text2,fontSize:9,fontFamily:T.font}}>R:R 1:{sig.risk_reward}</div>
+                  </div></div>);
+              });
+            })()}
+          </div>
+          <div style={{padding:"8px 14px",borderTop:`1px solid ${T.border}`,display:"flex",justifyContent:"space-between"}}>
+            <span style={{color:T.text2,fontSize:9,fontFamily:T.font}}>{scalpSignals.length} total</span>
+            <button className="btn-ghost" style={{fontSize:9}} onClick={()=>onNavigate("signals")}>VIEW ALL →</button>
+          </div>
         </div>
       </div>
 
@@ -685,16 +729,39 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
         {/* Earnings Today */}
         <div className="card" style={{ flex:1, minWidth:200 }}>
           <SectionHeader title="Earnings Today" T={T}>
-            <button className="btn-ghost" style={{ fontSize:8 }} onClick={() => onNavigate("earnings")}>VIEW ALL</button>
+            <button className="btn-ghost" style={{ fontSize:8 }} onClick={()=>onNavigate("earnings")}>VIEW ALL</button>
           </SectionHeader>
           <div style={{ padding:"8px 14px" }}>
-            {Array(5).fill(0).map((_,i)=>(
-              <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}>
-                <Shimmer w={44} h={11} />
-                <Shimmer w={55} h={11} opacity={0.5} />
-              </div>
-            ))}
+            {earningsToday===null
+              ? Array(5).fill(0).map((_,i)=>(
+                  <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                    padding:"8px 0",borderBottom:i<4?`1px solid ${T.border}`:"none"}}>
+                    <Shimmer w={44} h={11}/><Shimmer w={55} h={11} opacity={0.5}/>
+                  </div>))
+              : earningsToday.length===0
+              ? <div style={{color:T.text2,fontSize:11,fontFamily:T.font,textAlign:"center",padding:"20px 0"}}>No earnings today</div>
+              : earningsToday.slice(0,8).map((e,i)=>{
+                  const live=tickers.get(e.ticker);
+                  const cp=live?.percent_change;
+                  return(<div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                    padding:"8px 0",borderBottom:i<earningsToday.length-1?`1px solid ${T.border}`:"none"}}>
+                    <div>
+                      <div style={{color:T.cyan,fontSize:12,fontFamily:T.font,fontWeight:700}}>{e.ticker}</div>
+                      <div style={{color:T.text2,fontSize:9,fontFamily:T.font}}>
+                        {e.earnings_time==="BMO"?"🌅 Before Open":e.earnings_time==="AMC"?"🌙 After Close":e.earnings_time||"—"}
+                      </div>
+                    </div>
+                    <div style={{textAlign:"right"}}>
+                      {cp!=null&&<div style={{color:cp>=0?T.green:T.red,fontSize:11,fontFamily:T.font,fontWeight:700}}>{cp>=0?"+":""}{cp.toFixed(2)}%</div>}
+                      {live?.live_price>0&&<div style={{color:T.text1,fontSize:9,fontFamily:T.font}}>${fmt2(live.live_price)}</div>}
+                    </div>
+                  </div>);
+                })
+            }
           </div>
+          {earningsToday?.length>8&&<div style={{padding:"5px 14px",borderTop:`1px solid ${T.border}`}}>
+            <span style={{color:T.text2,fontSize:9,fontFamily:T.font}}>+{earningsToday.length-8} more</span>
+          </div>}
         </div>
       </div>
     </div>
@@ -708,7 +775,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
 // • AH cols: SYMBOL+name | PREV CLOSE | TODAY CLOSE | LIVE PRICE | CHANGE | %CHG
 // • Source: ALL / WATCHLIST / (Yahoo Finance | TradingView) replaces PORTFOLIO
 // • Matrix view: top 50 clean TradingView charts
-function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", T }) {
+function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", sparkHistory = { current: {} }, T }) {
   const [viewMode,   setViewMode]   = useState("TABLE");
   const autoSubMode = SESSION_META[marketSession]?.subMode ?? "MH";
   const [subModeOverride, setSubModeOverride] = useState(null);
@@ -810,37 +877,55 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
     const topSymbols = filteredTickers.slice(0, chartOpenCount).map(t => t.ticker);
     topSymbols.forEach(sym => {
       const url = extLink === "TradingView"
-        ? `https://www.tradingview.com/chart/?symbol=NASDAQ:${sym}`
+        ? `https://www.tradingview.com/chart/?symbol=${sym}&session=extended`
         : `https://finance.yahoo.com/quote/${sym}/chart`;
       window.open(url, "_blank");
     });
   };
 
-  // MH column definitions - SYMBOL column includes star + symbol + company name stacked
+  const Sparkline = ({ ticker: sym }) => {
+    const prices = sparkHistory.current[sym] || [];
+    if (prices.length < 2) return <span style={{ width:42, display:"inline-block" }}/>;
+    const W=42,H=16,pad=1;
+    const mn=Math.min(...prices),mx=Math.max(...prices),range=mx-mn||mn*0.001||0.01;
+    const pts=prices.map((p,i)=>{
+      const x=((i/(prices.length-1))*(W-pad*2)+pad).toFixed(1);
+      const y=(H-pad-((p-mn)/range)*(H-pad*2)).toFixed(1);
+      return `${x},${y}`;
+    }).join(" ");
+    const isUp=prices[prices.length-1]>=prices[0];
+    const color=isUp?T.green:T.red;
+    const last=pts.split(" ").pop().split(",");
+    return(
+      <svg width={W} height={H} style={{display:"block",flexShrink:0,overflow:"visible"}}>
+        <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5"
+          strokeLinecap="round" strokeLinejoin="round" opacity={0.9}/>
+        <circle cx={last[0]} cy={last[1]} r="2" fill={color}/>
+      </svg>);
+  };
+
   const MH_COLS = [
-    { key:"symbol",   label:"SYMBOL",      w:"minmax(220px, 2fr)" },
-    { key:"open",     label:"OPEN",        w:"90px" },
-    { key:"price",    label:"PRICE",       w:"90px" },
-    { key:"change",   label:"$ CHG",       w:"90px" },
-    { key:"pct",      label:"% CHG",       w:"90px" },
-    { key:"volume",   label:"VOLUME",      w:"110px"   },
-    { key:"vwap",     label:"VWAP",        w:"90px" },
-    { key:"rsi",      label:"RSI",         w:"70px" },
-    { key:"signal",   label:"SIGNAL",      w:"100px" },
+    { key:"symbol",  label:"SYMBOL",  w:"minmax(200px,2fr)" },
+    { key:"spark",   label:"TREND",   w:"56px"  },
+    { key:"open",    label:"OPEN",    w:"80px"  },
+    { key:"price",   label:"PRICE",   w:"86px"  },
+    { key:"change",  label:"$ CHG",   w:"86px"  },
+    { key:"pct",     label:"% CHG",   w:"86px"  },
+    { key:"volume",  label:"VOLUME",  w:"100px" },
+    { key:"vwap",    label:"VWAP",    w:"80px"  },
+    { key:"signal",  label:"SIGNAL",  w:"170px" },
   ];
-
-  // AH column definitions
   const AH_COLS = [
-    { key:"symbol",     label:"SYMBOL",        w:"minmax(220px, 2fr)" },
-    { key:"prev_close", label:"PREV CLOSE",    w:"100px"  },
-    { key:"today_close",label:"TODAY CLOSE",   w:"110px"  },
-    { key:"live_price", label:"LIVE PRICE",    w:"100px"  },
-    { key:"change",     label:"$ CHG",         w:"90px"  },
-    { key:"pct",        label:"% CHG",         w:"90px"},
+    { key:"symbol",      label:"SYMBOL",       w:"minmax(200px,2fr)" },
+    { key:"spark",       label:"TREND",        w:"56px"  },
+    { key:"prev_close",  label:"PREV CLOSE",   w:"100px" },
+    { key:"today_close", label:"TODAY CLOSE",  w:"110px" },
+    { key:"live_price",  label:"LIVE PRICE",   w:"100px" },
+    { key:"change",      label:"$ CHG",        w:"86px"  },
+    { key:"pct",         label:"% CHG",        w:"86px"  },
   ];
-
   const cols = subMode === "MH" ? MH_COLS : AH_COLS;
-  const gridCols = cols.map(c => c.w).join(" ");
+  const gridCols = cols.map(c=>c.w).join(" ");
 
   return (
     <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:12 }}>
@@ -1019,30 +1104,78 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
                             </div>
                           </div>
                         </div>
-                        {/* Open */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.open || 0)}</div>
-                        {/* Price */}
-                        <div style={{ padding:"10px 14px", color:T.text0, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price || 0)}</div>
-                        {/* Change */}
-                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
-                          {isPositive ? '+' : ''}{fmt2(ticker.change_value || 0)}
+                        {/* TREND */}
+                        <div style={{padding:"8px 6px",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                          <Sparkline ticker={ticker.ticker}/>
                         </div>
-                        {/* %CHG */}
-                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
-                          {pct(ticker.percent_change || 0)}
+                        {/* Open */}
+                        <div style={{padding:"10px 10px",color:T.text1,fontFamily:T.font,fontSize:12,textAlign:"right"}}>
+                          {ticker.open>0?`$${fmt2(ticker.open)}`:"—"}
+                        </div>
+                        {/* Price */}
+                        <div style={{padding:"10px 10px",color:T.text0,fontFamily:T.font,fontSize:12,fontWeight:700,textAlign:"right"}}>
+                          ${fmt2(ticker.live_price||0)}
+                        </div>
+                        {/* $ CHG */}
+                        <div style={{padding:"10px 10px",color:changeColor,fontFamily:T.font,fontSize:12,fontWeight:600,textAlign:"right"}}>
+                          {isPositive?"+":""}{fmt2(ticker.change_value||0)}
+                        </div>
+                        {/* % CHG */}
+                        <div style={{padding:"10px 10px",color:changeColor,fontFamily:T.font,fontSize:12,fontWeight:700,textAlign:"right"}}>
+                          {pct(ticker.percent_change||0)}
                         </div>
                         {/* Volume */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
-                          {fmtVol(ticker.volume || 0)}
+                        <div style={{padding:"10px 10px",fontFamily:T.font,fontSize:12,textAlign:"right",
+                          color:ticker.volume_spike_level==="high"?T.orange:ticker.volume_spike?T.gold:T.text1}}>
+                          {fmtVol(ticker.volume||0)}{ticker.volume_spike&&<span style={{marginLeft:3,fontSize:8}}>{ticker.volume_spike_level==="high"?"▲▲":"▲"}</span>}
                         </div>
                         {/* VWAP */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>—</div>
-                        {/* RSI */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>—</div>
-                        {/* Signal */}
-                        <div style={{ padding:"10px 14px", display:"flex", alignItems:"center" }}>
-                          {ticker.volume_spike && (
-                            <span style={{ color:T.orange, fontSize:10, fontFamily:T.font, background:T.orangeDim, padding:"3px 8px", borderRadius:4, fontWeight:600 }}>VOL</span>
+                        <div style={{padding:"10px 10px",color:T.text2,fontFamily:T.font,fontSize:12,textAlign:"right"}}>—</div>
+                        {/* SIGNAL */}
+                        <div style={{padding:"7px 8px",display:"flex",alignItems:"center",gap:3,flexWrap:"wrap"}}>
+                          {ticker.pullback_state==="neutral"&&ticker.hwm>0&&ticker.live_price>=ticker.hwm*0.999&&(
+                            <span title={`Intraday high $${fmt2(ticker.hwm)}`}
+                              style={{background:"#00e67612",border:"1px solid #00e67640",color:T.green,
+                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>▲HWM</span>
+                          )}
+                          {ticker.pullback_state==="tsl_alert"&&(
+                            <span title={`${(ticker.pullback_pct||0).toFixed(1)}% off HWM — TSL alert`}
+                              style={{background:"#ff244412",border:"1px solid #ff244440",color:T.red,
+                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>
+                              ⚠{(ticker.pullback_pct||0).toFixed(1)}%↓</span>
+                          )}
+                          {ticker.pullback_state==="pulling_back"&&(
+                            <span title={`Pulling back ${(ticker.pullback_pct||0).toFixed(1)}% from HWM $${fmt2(ticker.hwm||0)}`}
+                              style={{background:"#ffc40012",border:"1px solid #ffc40040",color:T.gold,
+                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>
+                              ↘{(ticker.pullback_pct||0).toFixed(1)}%</span>
+                          )}
+                          {ticker.went_positive===1&&(
+                            <span title="Just turned positive"
+                              style={{background:"#00e67610",border:"1px solid #00e67640",color:T.green,
+                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>⚡+</span>
+                          )}
+                          {ticker.volume_spike&&(
+                            <span title={`${(ticker.volume_ratio||1).toFixed(1)}× avg volume`}
+                              style={{background:"#ff6d0014",border:"1px solid #ff6d0050",color:T.orange,
+                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>
+                              VOL{ticker.volume_spike_level==="high"?"▲▲":"▲"}</span>
+                          )}
+                          {ticker.is_gap_play&&(
+                            <span title={`Gap ${ticker.gap_direction==="up"?"up":"down"} ${(ticker.gap_percent||0).toFixed(1)}%`}
+                              style={{background:"#b388ff14",border:"1px solid #b388ff50",color:T.purple,
+                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>
+                              GAP{ticker.gap_direction==="up"?"↑":"↓"}</span>
+                          )}
+                          {ticker.ah_momentum&&(
+                            <span title="After-hours momentum"
+                              style={{background:"#00bcd414",border:"1px solid #00bcd450",color:"#00bcd4",
+                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>AHM</span>
+                          )}
+                          {ticker.is_earnings_gap_play&&(
+                            <span title="Earnings gap play"
+                              style={{background:"#ffc40014",border:"1px solid #ffc40050",color:T.gold,
+                                fontSize:9,fontFamily:T.font,fontWeight:700,padding:"2px 5px",borderRadius:3}}>EARN</span>
                           )}
                         </div>
                       </>
@@ -1103,19 +1236,29 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
                             </div>
                           </div>
                         </div>
-                        {/* Prev Close */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.prev_close || 0)}</div>
-                        {/* Today Close */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.today_close || 0)}</div>
-                        {/* Live Price */}
-                        <div style={{ padding:"10px 14px", color:T.cyan, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price || 0)}</div>
-                        {/* Change */}
-                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
-                          {isPositive ? '+' : ''}{fmt2(ticker.change_value || 0)}
+                        {/* TREND */}
+                        <div style={{padding:"8px 6px",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                          <Sparkline ticker={ticker.ticker}/>
                         </div>
-                        {/* %CHG */}
-                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
-                          {pct(ticker.percent_change || 0)}
+                        {/* Prev Close */}
+                        <div style={{padding:"10px 10px",color:T.text1,fontFamily:T.font,fontSize:12,textAlign:"right"}}>
+                          {ticker.prev_close>0?`$${fmt2(ticker.prev_close)}`:"—"}
+                        </div>
+                        {/* Today Close */}
+                        <div style={{padding:"10px 10px",color:T.text1,fontFamily:T.font,fontSize:12,textAlign:"right"}}>
+                          {ticker.today_close>0?`$${fmt2(ticker.today_close)}`:"—"}
+                        </div>
+                        {/* Live Price */}
+                        <div style={{padding:"10px 10px",color:T.cyan,fontFamily:T.font,fontSize:12,fontWeight:700,textAlign:"right"}}>
+                          ${fmt2(ticker.live_price||0)}
+                        </div>
+                        {/* $ CHG */}
+                        <div style={{padding:"10px 10px",color:changeColor,fontFamily:T.font,fontSize:12,fontWeight:600,textAlign:"right"}}>
+                          {isPositive?"+":""}{fmt2(ticker.change_value||0)}
+                        </div>
+                        {/* % CHG */}
+                        <div style={{padding:"10px 10px",color:changeColor,fontFamily:T.font,fontSize:12,fontWeight:700,textAlign:"right"}}>
+                          {pct(ticker.percent_change||0)}
                         </div>
                       </>
                     )}
@@ -1257,7 +1400,7 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
               <div key={sym} className="card" style={{ overflow:"hidden" }}>
                 <div style={{ padding:"7px 12px", borderBottom:`1px solid ${T.border}`, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
                   <span style={{ color:T.text0, fontFamily:T.font, fontSize:12, fontWeight:700 }}>{sym}</span>
-                  <a href={`https://www.tradingview.com/chart/?symbol=${sym}`} target="_blank" rel="noreferrer"
+                  <a href={`https://www.tradingview.com/chart/?symbol=${sym}&session=extended`} target="_blank" rel="noreferrer"
                     style={{ color:T.text2, fontSize:8.5, textDecoration:"none", fontFamily:T.font }}>↗ TV</a>
                 </div>
                 <TVChart symbol={sym} height={180} />
@@ -2193,7 +2336,8 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
   // trigger a full Map copy on every message. A throttled interval flushes
   // the ref into React state at most once every 250 ms, keeping the UI
   // responsive without copying 1 500+ entries on every price update.
-  const tickerCacheRef = useRef(new Map());
+  const tickerCacheRef  = useRef(new Map());
+  const sparkHistoryRef = useRef({});   // {ticker:[p1,p2,...]} last 20 prices
 
   // ── Live Notifications ────────────────────────────────────────────────────
   // Accumulates real alerts fired by WS ticks. Capped at 50 entries (ring buffer).
@@ -2287,6 +2431,12 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
             const prev  = cache.get(msg.ticker) ?? {};
             const next  = { ...prev, ...msg.data };
             cache.set(msg.ticker, next);
+            if (msg.data?.live_price) {
+              const h = sparkHistoryRef.current;
+              if (!h[msg.ticker]) h[msg.ticker] = [];
+              h[msg.ticker].push(+msg.data.live_price);
+              if (h[msg.ticker].length > 20) h[msg.ticker].shift();
+            }
 
             // ── Live alert detection ──────────────────────────────────────
             const d      = msg.data;
@@ -2422,7 +2572,7 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
   const renderPage = () => {
     switch (page) {
       case "dashboard": return <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange} onNavigate={setPage} sectorPerformance={sectorPerformance} tickers={tickers} T={T} />;
-      case "live":      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} T={T} />;
+      case "live":      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} sparkHistory={sparkHistoryRef} T={T} />;
       case "chart":     return <PageChart T={T} />;
       case "signals":   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} T={T} />;
       case "earnings":  return <PageEarnings T={T} />;
