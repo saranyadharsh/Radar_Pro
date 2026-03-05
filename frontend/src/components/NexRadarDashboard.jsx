@@ -610,7 +610,15 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
               const hasData = perf.count > 0;
 
               return (
-                <div key={s.id} onClick={() => { onSectorChange([s.id]); onNavigate("live"); }}
+                <div key={s.id} onClick={() => { 
+                  // Toggle behavior: click selected sector to deselect (go back to ALL)
+                  if (active && s.id !== "ALL") {
+                    onSectorChange(["ALL"]);
+                  } else {
+                    onSectorChange([s.id]); 
+                    onNavigate("live");
+                  }
+                }}
                   style={{ 
                     background: active ? s.color+"12" : T.bg2, 
                     borderLeft:`1px solid ${active ? s.color+"40" : T.border}`,
@@ -844,13 +852,28 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
       <div style={{ display:"flex", gap:18, flexWrap:"wrap" }}>
         {/* Top Gainers */}
         <div className="card" style={{ flex:1, minWidth:200 }}>
-          <SectionHeader title="Top Gainers" T={T}>
+          <SectionHeader title={selectedSectors.includes("ALL") ? "Top Gainers" : `Top Gainers · ${selectedSectors.join(" + ")}`} T={T}>
             <button className="btn-ghost" style={{ fontSize:8 }} onClick={() => onNavigate("live")}>VIEW ALL</button>
           </SectionHeader>
           <div style={{ padding:"8px 14px" }}>
             {(() => {
               const tickerArray = Array.from(tickers.values());
-              const topGainers = tickerArray
+              
+              // Filter by selected sector if not ALL
+              let filteredTickers = tickerArray;
+              if (!selectedSectors.includes("ALL")) {
+                filteredTickers = tickerArray.filter(t => {
+                  // Handle EARNINGS sector
+                  if (selectedSectors.includes("EARNINGS")) {
+                    if (t.is_earnings_gap_play) return true;
+                  }
+                  // Handle regular sectors
+                  const tickerSector = normalizeSector(t.sector);
+                  return tickerSector && selectedSectors.some(s => tickerSector === s && s !== "EARNINGS");
+                });
+              }
+              
+              const topGainers = filteredTickers
                 .filter(t => (t.percent_change || 0) > 0)
                 .sort((a, b) => (b.percent_change || 0) - (a.percent_change || 0))
                 .slice(0, 5);
@@ -876,13 +899,28 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
 
         {/* Top Losers */}
         <div className="card" style={{ flex:1, minWidth:200 }}>
-          <SectionHeader title="Top Losers" T={T}>
+          <SectionHeader title={selectedSectors.includes("ALL") ? "Top Losers" : `Top Losers · ${selectedSectors.join(" + ")}`} T={T}>
             <button className="btn-ghost" style={{ fontSize:8 }} onClick={() => onNavigate("live")}>VIEW ALL</button>
           </SectionHeader>
           <div style={{ padding:"8px 14px" }}>
             {(() => {
               const tickerArray = Array.from(tickers.values());
-              const topLosers = tickerArray
+              
+              // Filter by selected sector if not ALL
+              let filteredTickers = tickerArray;
+              if (!selectedSectors.includes("ALL")) {
+                filteredTickers = tickerArray.filter(t => {
+                  // Handle EARNINGS sector
+                  if (selectedSectors.includes("EARNINGS")) {
+                    if (t.is_earnings_gap_play) return true;
+                  }
+                  // Handle regular sectors
+                  const tickerSector = normalizeSector(t.sector);
+                  return tickerSector && selectedSectors.some(s => tickerSector === s && s !== "EARNINGS");
+                });
+              }
+              
+              const topLosers = filteredTickers
                 .filter(t => (t.percent_change || 0) < 0)
                 .sort((a, b) => (a.percent_change || 0) - (b.percent_change || 0))
                 .slice(0, 5);
