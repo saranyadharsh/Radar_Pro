@@ -49,6 +49,7 @@ except ModuleNotFoundError:
 
 
 import yfinance as _yf
+import httpx
 try:
     import os as _os
     _os.makedirs("/tmp/yf_cache", exist_ok=True)
@@ -378,3 +379,78 @@ async def ws_live(websocket: WebSocket):
         async with _clients_lock:
             _clients.discard(websocket)
         logger.info(f"WS client disconnected — remaining: {len(_clients)}")
+
+
+# ── Yahoo Finance Proxy — Quote (Key Stats) ────────────────────────────────────
+_YF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/xml, */*",
+}
+
+@app.get("/api/quote/{symbol}")
+async def get_quote(symbol: str):
+    """
+    Proxy to Yahoo Finance v8 chart API — returns key stats for a symbol.
+    Called by the Chart tab sidebar (Key Stats panel) in the React frontend.
+    No API key required. Runs server-side so no CORS issues.
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol.upper()}?interval=1d&range=1d"
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(url, headers=_YF_HEADERS)
+            r.raise_for_status()
+            data = r.json()
+        meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
+        return {
+            "open":      meta.get("regularMarketOpen"),
+            "high":      meta.get("regularMarketDayHigh"),
+            "low":       meta.get("regularMarketDayLow"),
+            "prevClose": meta.get("chartPreviousClose"),
+            "volume":    meta.get("regularMarketVolume"),
+            "avgVol":    meta.get("averageDailyVolume10Day"),
+            "marketCap": meta.get("marketCap"),
+            "wkHi52":    meta.get("fiftyTwoWeekHigh"),
+            "wkLo52":    meta.get("fiftyTwoWeekLow"),
+            "exchange":  meta.get("exchangeName"),
+            "name":      meta.get("longName", symbol.upper()),
+        }
+    except httpx.HTTPStatusError as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=e.response.status_code, detail=f"Yahoo Finance error: {e.response.status_code}")
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ── Yahoo Finance Proxy — News Feed (RSS) ─────────────────────────────────────
+@app.get("/api/news/{symbol}")
+async def get_news(symbol: str):
+    """
+    Proxy to Yahoo Finance RSS feed — returns last 8 headlines for a symbol.
+    Called by the Chart tab sidebar (News Feed panel) in the React frontend.
+    No API key required. Runs server-side so no CORS issues.
+    """
+    url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol.upper()}&region=US&lang=en-US"
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(url, headers=_YF_HEADERS)
+            r.raise_for_status()
+            xml_text = r.text
+
+        import xml.etree.ElementTree as ET
+        root  = ET.fromstring(xml_text)
+        items = []
+        for item in root.findall(".//item")[:8]:
+            items.append({
+                "title":   (item.findtext("title")   or "").strip(),
+                "link":    (item.findtext("link")    or "#").strip(),
+                "pubDate": (item.findtext("pubDate") or "").strip(),
+                "source":  (item.findtext("source")  or "Yahoo Finance").strip(),
+            })
+        return {"items": items}
+    except httpx.HTTPStatusError as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=e.response.status_code, detail=f"Yahoo Finance RSS error: {e.response.status_code}")
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=502, detail=str(e))

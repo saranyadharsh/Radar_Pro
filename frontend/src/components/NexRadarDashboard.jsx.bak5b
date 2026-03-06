@@ -406,15 +406,18 @@ function EmptyChart({ height=180, label="Awaiting live data feed", T }) {
 
 // ─── TradingView Embed — exchange-aware, auto-retries NYSE/AMEX ──────────────
 // TradingView resolves most US symbols without an exchange prefix.
-// ─── TradingView Embed ─ iframe, extended hours ──────────────────────────────
-function TVChart({ symbol, height = 220, T, interval = "5", style = "1" }) {
+// --- TradingView Embed - iframe URL, extended hours guaranteed ---------------
+// Uses widgetembed iframe URL with extended_hours=1.
+// The JS TradingView.widget() API cuts off at 15:55 regardless of
+// session:"extended" -- the URL param is the only reliable method.
+function TVChart({ symbol, height = 220, T }) {
   const bg1 = T?.bg1 || "#060d18";
 
   if (!symbol) return (
     <div style={{
       width: "100%", height, background: bg1,
       display: "flex", alignItems: "center", justifyContent: "center",
-      color: T?.text2 || "#4a6278", fontSize: 13,
+      color: T?.text2 || "#4a6278", fontSize: 13
     }}>
       Select a symbol to view chart
     </div>
@@ -422,10 +425,10 @@ function TVChart({ symbol, height = 220, T, interval = "5", style = "1" }) {
 
   const params = new URLSearchParams({
     symbol:              symbol,
-    interval:            interval,
+    interval:            "5",
     timezone:            "America/New_York",
     theme:               "dark",
-    style:               style,
+    style:               "1",
     locale:              "en",
     extended_hours:      "1",
     hide_top_toolbar:    "0",
@@ -435,13 +438,119 @@ function TVChart({ symbol, height = 220, T, interval = "5", style = "1" }) {
     save_image:          "0",
   });
 
+  const iframeSrc = `https://s.tradingview.com/widgetembed/?${params.toString()}`;
+
   return (
     <iframe
-      key={`${symbol}-${interval}-${style}`}
-      src={`https://s.tradingview.com/widgetembed/?${params.toString()}`}
-      style={{ width: "100%", height, border: "none", display: "block", background: bg1 }}
+      key={symbol}
+      src={iframeSrc}
+      style={{ width: "100%", height: height, border: "none", display: "block", background: bg1 }}
       allowFullScreen
-      title={`TradingView Chart — ${symbol}`}
+      title={`TradingView Chart - ${symbol}`}
+    />
+  );
+}
+) {
+  const bg1   = T?.bg1   || "#060d18";
+  const border = T?.border || "#172438";
+  const ref   = useRef(null);
+  const attemptRef = useRef(0);
+
+  useEffect(() => {
+    if (!symbol || !ref.current) return;
+    attemptRef.current = 0;
+
+    // Unique stable container id — no Math.random so re-renders reuse same el
+    const containerId = `tv_${symbol.replace(/[^A-Z0-9]/g, "_")}`;
+
+    const loadWidget = (exchangePrefix) => {
+      if (!ref.current) return;
+      ref.current.innerHTML = "";
+
+      const container = document.createElement("div");
+      container.id = containerId;
+      container.style.width  = "100%";
+      container.style.height = height + "px";
+      ref.current.appendChild(container);
+
+      const fullSymbol = exchangePrefix ? `${exchangePrefix}:${symbol}` : symbol;
+
+      const tryNextExchange = () => {
+        attemptRef.current += 1;
+        if (attemptRef.current < TV_EXCHANGE_FALLBACKS.length) {
+          loadWidget(TV_EXCHANGE_FALLBACKS[attemptRef.current]);
+        }
+        // If all fallbacks exhausted the container shows TV's own error UI
+      };
+
+      const initWidget = () => {
+        if (!window.TradingView || !ref.current) return;
+        try {
+          const widget = new window.TradingView.widget({
+            autosize:           true,
+            symbol:             fullSymbol,
+            interval:           "5",
+            timezone:           "America/New_York",
+            theme:              "dark",
+            style:              "1",
+            locale:             "en",
+            enable_publishing:  false,
+            hide_top_toolbar:   false,    // must be false to show extended-hours toggle
+            hide_legend:        true,
+            hide_side_toolbar:  true,
+            allow_symbol_change: true,    // let user fix exchange manually
+            save_image:         false,
+            session:            "extended", // show pre-market + after-hours
+            studies:            [],
+            container_id:       containerId,
+            backgroundColor:    bg1,
+            gridColor:          border,
+          });
+
+          // TradingView fires this callback when symbol is not found
+          if (widget && typeof widget.onChartReady === "function") {
+            widget.onChartReady(() => {
+              // chart loaded successfully — nothing to do
+            });
+          }
+        } catch(e) {
+          tryNextExchange();
+        }
+      };
+
+      // Reuse already-loaded tv.js if available
+      if (window.TradingView) {
+        initWidget();
+      } else {
+        // Remove any existing tv.js script to avoid duplicates
+        const existing = document.querySelector('script[src="https://s3.tradingview.com/tv.js"]');
+        if (existing) {
+          // Already loading — poll until ready
+          const poll = setInterval(() => {
+            if (window.TradingView) { clearInterval(poll); initWidget(); }
+          }, 100);
+          return;
+        }
+        const s  = document.createElement("script");
+        s.src    = "https://s3.tradingview.com/tv.js";
+        s.async  = true;
+        s.onload = initWidget;
+        s.onerror = tryNextExchange;
+        document.head.appendChild(s);
+      }
+    };
+
+    loadWidget(TV_EXCHANGE_FALLBACKS[0]); // start with no prefix (auto-resolve)
+
+    return () => {
+      if (ref.current) ref.current.innerHTML = "";
+    };
+  }, [symbol, bg1, border, height]);
+
+  return (
+    <div
+      ref={ref}
+      style={{ width:"100%", height, position:"relative", background:bg1 }}
     />
   );
 }
@@ -1070,7 +1179,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
 // • AH cols: SYMBOL+name | PREV CLOSE | TODAY CLOSE | LIVE PRICE | CHANGE | %CHG
 // • Source: ALL / WATCHLIST / (Yahoo Finance | TradingView) replaces PORTFOLIO
 // • Matrix view: top 50 clean TradingView charts
-function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", wsWatchlistRef = null, quickFilter = null, onClearQuickFilter = null, T }) {
+function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", wsWatchlistRef = null, T }) {
   const [viewMode,   setViewMode]   = useState("TABLE");
   const autoSubMode = SESSION_META[marketSession]?.subMode ?? "MH";
   const [subModeOverride, setSubModeOverride] = useState(null);
@@ -1185,15 +1294,12 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
     return filtered;
   }, [tickers, selectedSectors, source, watchlist, earningsTickers]);
 
+  // Filter by minimum delta
   const filteredTickers = useMemo(() => {
-    let arr = tickerArray.filter(t => Math.abs(t.change_value || 0) >= minDelta);
-    if (quickFilter === "VOL_SPIKES")  arr = arr.filter(t => t.volume_spike);
-    if (quickFilter === "GAP_PLAYS")   arr = arr.filter(t => t.is_gap_play);
-    if (quickFilter === "AH_MOMT")     arr = arr.filter(t => t.ah_momentum);
-    if (quickFilter === "EARN_GAPS")   arr = arr.filter(t => t.is_earnings_gap_play);
-    if (quickFilter === "DIAMOND")     arr = arr.filter(t => Math.abs(t.percent_change || 0) >= 5);
-    return arr.sort((a, b) => (b.change_value || 0) - (a.change_value || 0));
-  }, [tickerArray, minDelta, quickFilter]);
+    return tickerArray
+      .filter(t => Math.abs(t.change_value || 0) >= minDelta)
+      .sort((a, b) => (b.change_value || 0) - (a.change_value || 0));
+  }, [tickerArray, minDelta]);
 
   // Reset to page 1 when filters change
   useEffect(() => {
@@ -1219,16 +1325,15 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
   const activeLabel = selectedSectors.includes("ALL") ? "ALL" : selectedSectors.join(" + ");
   const tickerCount = tickerArray.length; // Use tickerArray (after sector filter) not filteredTickers (after minDelta filter)
 
+  // Placeholders for top 50 symbols for matrix
   const matrixSymbols = useMemo(() => {
-    if (filteredTickers && filteredTickers.length > 0) {
-      return filteredTickers.slice(0, matrixCount).map(t => t.ticker);
-    }
-    return ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","JPM","V",
+    const syms = ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","JPM","V",
       "MA","UNH","LLY","JNJ","XOM","PG","HD","BAC","ABBV","MRK","COST","NFLX","AMD",
       "TMO","CVX","ORCL","KO","CRM","QCOM","MCD","ACN","PFE","TXN","ABT","LIN",
       "CSCO","WFC","AXP","DHR","AMGN","INTU","IBM","SPGI","UPS","BKNG","GS","BLK",
       "DE","CAT","HON"].slice(0, matrixCount);
-  }, [filteredTickers, matrixCount]);
+    return syms;
+  }, [matrixCount]);
 
   const openExternalCharts = () => {
     const topSymbols = filteredTickers.slice(0, chartOpenCount).map(t => t.ticker);
@@ -1284,12 +1389,6 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
         {/* View mode */}
         <button className={`btn-ghost${viewMode==="TABLE"?" active":""}`}    onClick={()=>setViewMode("TABLE")}>≡ TABLE</button>
         <button className={`btn-ghost${viewMode==="MATRIX"?" active":""}`}   onClick={()=>setViewMode("MATRIX")}>⊞ MATRIX</button>
-        {quickFilter && (
-          <div style={{ display:"flex", alignItems:"center", gap:6, marginLeft:8, background:"rgba(34,211,238,0.08)", border:"1px solid rgba(34,211,238,0.25)", borderRadius:6, padding:"3px 10px" }}>
-            <span style={{ color:T.cyan, fontSize:10, fontFamily:T.font, fontWeight:600 }}>{{"VOL_SPIKES":"📡 VOL SPIKES","GAP_PLAYS":"📊 GAP PLAYS","AH_MOMT":"🌙 AH MOMT.","EARN_GAPS":"📋 EARN. GAPS","DIAMOND":"💎 DIAMOND"}[quickFilter]}</span>
-            <button onClick={() => onClearQuickFilter && onClearQuickFilter()} style={{ background:"none", border:"none", color:"#4a6278", cursor:"pointer", fontSize:13, lineHeight:1, padding:0 }}>✕</button>
-          </div>
-        )}
 
         {/* MH / AH sub-mode (TABLE only) */}
         {viewMode === "TABLE" && (
@@ -1701,165 +1800,64 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
 }
 
 // ─── PAGE: Chart (PRESERVED as-is) ───────────────────────────────────────────
-function useKeyStats(sym) {
-  const [stats, setStats] = useState(null);
-  const [loading, setLoading] = useState(false);
-  useEffect(() => {
-    if (!sym) { setStats(null); return; }
-    setLoading(true); setStats(null);
-    fetch(`${API_BASE}/api/quote/${sym}`)
-      .then(r => { if (!r.ok) throw new Error("backend"); return r.json(); })
-      .then(data => setStats(data))
-      .catch(() =>
-        fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=1d`)}`)
-          .then(r => r.json()).then(w => {
-            const meta = JSON.parse(w.contents)?.chart?.result?.[0]?.meta ?? {};
-            setStats({ open:meta.regularMarketOpen, high:meta.regularMarketDayHigh, low:meta.regularMarketDayLow, prevClose:meta.chartPreviousClose, volume:meta.regularMarketVolume, avgVol:meta.averageDailyVolume10Day, marketCap:meta.marketCap, wkHi52:meta.fiftyTwoWeekHigh, wkLo52:meta.fiftyTwoWeekLow, exchange:meta.exchangeName });
-          }).catch(() => setStats(null))
-      ).finally(() => setLoading(false));
-  }, [sym]);
-  return { stats, loading };
-}
-
-function useNewsFeed(sym) {
-  const [news, setNews] = useState([]);
-  const [loading, setLoading] = useState(false);
-  useEffect(() => {
-    if (!sym) { setNews([]); return; }
-    setLoading(true); setNews([]);
-    fetch(`${API_BASE}/api/news/${sym}`)
-      .then(r => { if (!r.ok) throw new Error("backend"); return r.json(); })
-      .then(data => setNews(data.items ?? []))
-      .catch(() =>
-        fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(`https://feeds.finance.yahoo.com/rss/2.0/headline?s=${sym}&region=US&lang=en-US`)}`)
-          .then(r => r.json()).then(w => {
-            const xml = new DOMParser().parseFromString(w.contents, "text/xml");
-            setNews(Array.from(xml.querySelectorAll("item")).slice(0, 8).map(it => ({
-              title: it.querySelector("title")?.textContent ?? "", link: it.querySelector("link")?.textContent ?? "#",
-              pubDate: it.querySelector("pubDate")?.textContent ?? "", source: it.querySelector("source")?.textContent ?? "Yahoo Finance",
-            })));
-          }).catch(() => setNews([]))
-      ).finally(() => setLoading(false));
-  }, [sym]);
-  return { news, loading };
-}
-
-function _fmtBig(n) {
-  if (!n) return "—";
-  if (n >= 1e12) return `$${(n/1e12).toFixed(2)}T`;
-  if (n >= 1e9)  return `$${(n/1e9).toFixed(2)}B`;
-  if (n >= 1e6)  return `$${(n/1e6).toFixed(2)}M`;
-  return `$${n.toLocaleString()}`;
-}
-function _fmtVol(n) {
-  if (!n) return "—";
-  if (n >= 1e9) return `${(n/1e9).toFixed(2)}B`;
-  if (n >= 1e6) return `${(n/1e6).toFixed(2)}M`;
-  if (n >= 1e3) return `${(n/1e3).toFixed(1)}K`;
-  return String(n);
-}
-function _timeAgo(d) {
-  if (!d) return "";
-  const m = Math.floor((Date.now() - new Date(d)) / 60000);
-  if (m < 60) return `${m}m ago`;
-  if (m < 1440) return `${Math.floor(m/60)}h ago`;
-  return `${Math.floor(m/1440)}d ago`;
-}
-
 function PageChart({ T }) {
-  const [inputVal,   setInputVal]   = useState("");
-  const [sym,        setSym]        = useState("");
-  const [tf,         setTf]         = useState("1D");
-  const [chartStyle, setChartStyle] = useState("1");
-  const TF_MAP = {"1m":"1","5m":"5","15m":"15","1H":"60","4H":"240","1D":"D","1W":"W"};
-  const { stats, loading: sLoad } = useKeyStats(sym);
-  const { news,  loading: nLoad } = useNewsFeed(sym);
-  const handleLoad = () => { const s = inputVal.trim().toUpperCase(); if (s) setSym(s); };
-  const statRows = stats ? [
-    ["Open",        stats.open      ? `$${(+stats.open).toFixed(2)}`      : "—"],
-    ["Day High",    stats.high      ? `$${(+stats.high).toFixed(2)}`      : "—"],
-    ["Day Low",     stats.low       ? `$${(+stats.low).toFixed(2)}`       : "—"],
-    ["Prev Close",  stats.prevClose ? `$${(+stats.prevClose).toFixed(2)}` : "—"],
-    ["Volume",      _fmtVol(stats.volume)],
-    ["Avg Vol 10d", _fmtVol(stats.avgVol)],
-    ["Market Cap",  _fmtBig(stats.marketCap)],
-    ["52W High",    stats.wkHi52    ? `$${(+stats.wkHi52).toFixed(2)}`   : "—"],
-    ["52W Low",     stats.wkLo52    ? `$${(+stats.wkLo52).toFixed(2)}`   : "—"],
-    ["Exchange",    stats.exchange  ?? "—"],
-  ] : [];
-
+  const [sym, setSym] = useState("");
+  const [tf,  setTf]  = useState("1D");
   return (
     <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:16 }}>
       <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
-        <input placeholder="Enter symbol…" value={inputVal}
-          onChange={e => setInputVal(e.target.value.toUpperCase())}
-          onKeyDown={e => e.key === "Enter" && handleLoad()}
-          style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:7,
-            padding:"7px 13px", color:T.text0, fontFamily:T.font, fontSize:13, outline:"none", width:170 }}/>
-        <button onClick={handleLoad}
-          style={{ background:T.cyanDim, border:`1px solid ${T.cyanMid}`, color:T.cyan,
-            borderRadius:6, padding:"6px 14px", cursor:"pointer", fontFamily:T.font, fontSize:10, fontWeight:700, letterSpacing:1 }}>LOAD</button>
-        {["1m","5m","15m","1H","4H","1D","1W"].map(t => (
-          <button key={t} onClick={() => setTf(t)}
-            style={{ background:tf===t?T.cyanDim:T.bg2, border:`1px solid ${tf===t?T.cyanMid:T.border}`,
-              color:tf===t?T.cyan:T.text2, borderRadius:5, padding:"5px 11px",
-              cursor:"pointer", fontFamily:T.font, fontSize:10, letterSpacing:1 }}>{t}</button>
+        <input placeholder="Enter symbol…" value={sym} onChange={e=>setSym(e.target.value.toUpperCase())}
+          style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:7, padding:"7px 13px", color:T.text0, fontFamily:T.font, fontSize:13, outline:"none", width:170 }}/>
+        {["1m","5m","15m","1H","4H","1D","1W"].map(t=>(
+          <button key={t} onClick={()=>setTf(t)}
+            style={{ background:tf===t?T.cyanDim:T.bg2, border:`1px solid ${tf===t?T.cyanMid:T.border}`, color:tf===t?T.cyan:T.text2, borderRadius:5, padding:"5px 11px", cursor:"pointer", fontFamily:T.font, fontSize:10, letterSpacing:1 }}>{t}</button>
         ))}
         <div style={{ marginLeft:"auto", display:"flex", gap:6 }}>
-          {[["CANDLE","1"],["LINE","2"],["BAR","3"]].map(([lbl, s]) => (
-            <button key={lbl} onClick={() => setChartStyle(s)}
-              className={`btn-ghost${chartStyle===s?" active":""}`} style={{ fontSize:9 }}>{lbl}</button>
-          ))}
+          {["CANDLE","LINE","BAR"].map(ct=><button key={ct} className="btn-ghost" style={{ fontSize:9 }}>{ct}</button>)}
         </div>
       </div>
-      <div style={{ display:"flex", gap:16, alignItems:"flex-start", flexWrap:"wrap" }}>
-        <div className="card" style={{ flex:3, minWidth:300, overflow:"hidden" }}>
+      <div style={{ display:"flex", gap:16, flexWrap:"wrap" }}>
+        <div className="card" style={{ flex:3, minWidth:300 }}>
           <SectionHeader title={sym||"— SELECT SYMBOL"}><Chip color={T.cyan}>{tf}</Chip></SectionHeader>
-          {sym
-            ? <TVChart symbol={sym} height={460} T={T} interval={TF_MAP[tf]} style={chartStyle}/>
-            : <EmptyChart height={460} label="Enter a symbol above and press LOAD or Enter"/>}
-        </div>
-        <div style={{ flex:1, minWidth:230, display:"flex", flexDirection:"column", gap:14 }}>
-          <div className="card">
-            <SectionHeader title="Key Stats">{sym && <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>{sym}</span>}</SectionHeader>
-            <div style={{ padding:"10px 13px" }}>
-              {!sym && <p style={{ color:T.text2, fontSize:9.5, fontFamily:T.font, margin:0 }}>Load a symbol to see stats.</p>}
-              {sym && sLoad && Array(8).fill(0).map((_,i) => (
-                <div key={i} style={{ display:"flex", justifyContent:"space-between", marginBottom:7 }}>
-                  <Shimmer w={80} h={10}/><Shimmer w={55} h={10}/>
+          <div style={{ padding:16 }}>
+            <div style={{ display:"flex", gap:16, marginBottom:14, flexWrap:"wrap" }}>
+              {["OPEN","HIGH","LOW","CLOSE","VOL"].map(l=>(
+                <div key={l}>
+                  <div style={{ color:T.text2, fontSize:8.5, letterSpacing:1.5, fontFamily:T.font, marginBottom:4 }}>{l}</div>
+                  <Shimmer w={70} h={15}/>
                 </div>
               ))}
-              {sym && !sLoad && !stats && <p style={{ color:T.red, fontSize:9.5, fontFamily:T.font, margin:0 }}>⚠ Could not load stats — check symbol or network</p>}
-              {statRows.map(([label, val]) => (
-                <div key={label} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"5px 0", borderBottom:`1px solid ${T.border}` }}>
-                  <span style={{ color:T.text2, fontSize:9.5, fontFamily:T.font }}>{label}</span>
-                  <span style={{ color:T.text0, fontSize:10, fontFamily:T.font, fontWeight:600 }}>{val}</span>
+            </div>
+            <EmptyChart height={250} label={sym?`Waiting for ${sym} data`:"Select a symbol to view chart"}/>
+            <div style={{ marginTop:8 }}>
+              <div style={{ color:T.text2, fontSize:8.5, letterSpacing:1.5, fontFamily:T.font, marginBottom:5 }}>VOLUME</div>
+              <EmptyChart height={55} label=""/>
+            </div>
+          </div>
+        </div>
+        <div style={{ flex:1, minWidth:190, display:"flex", flexDirection:"column", gap:14 }}>
+          <div className="card">
+            <SectionHeader title="Indicators"/>
+            <div style={{ padding:13, display:"flex", flexDirection:"column", gap:9 }}>
+              {["RSI (14)","MACD (12,26,9)","BB (20,2)","VWAP","EMA (9)","EMA (21)"].map(ind=>(
+                <div key={ind} style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                  <span style={{ color:T.text1, fontSize:10, fontFamily:T.font }}>{ind}</span>
+                  <Shimmer w={44} h={10}/>
                 </div>
               ))}
             </div>
           </div>
           <div className="card">
-            <SectionHeader title="News Feed">{sym && <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>{sym}</span>}</SectionHeader>
-            <div style={{ padding:"10px 13px", display:"flex", flexDirection:"column", gap:8 }}>
-              {!sym && <p style={{ color:T.text2, fontSize:9.5, fontFamily:T.font, margin:0 }}>Load a symbol to see news.</p>}
-              {sym && nLoad && Array(4).fill(0).map((_,i) => (
-                <div key={i} style={{ display:"flex", flexDirection:"column", gap:4 }}>
-                  <Shimmer w="100%" h={10}/><Shimmer w="60%" h={8}/>
+            <SectionHeader title="Order Book"/>
+            <div style={{ padding:13 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+                <span style={{ color:T.red, fontSize:9.5, fontFamily:T.font }}>ASKS</span>
+                <span style={{ color:T.green, fontSize:9.5, fontFamily:T.font }}>BIDS</span>
+              </div>
+              {Array(5).fill(0).map((_,i)=>(
+                <div key={i} style={{ display:"flex", gap:6, marginBottom:5 }}>
+                  <Shimmer w="48%" h={9}/><Shimmer w="48%" h={9}/>
                 </div>
-              ))}
-              {sym && !nLoad && news.length === 0 && <p style={{ color:T.text2, fontSize:9.5, fontFamily:T.font, margin:0 }}>No recent news for {sym}.</p>}
-              {news.map((item, i) => (
-                <a key={i} href={item.link} target="_blank" rel="noreferrer"
-                  style={{ textDecoration:"none", display:"block", padding:"8px 10px", borderRadius:6,
-                    background:T.bg2, border:`1px solid ${T.border}`, transition:"border-color 0.15s" }}
-                  onMouseEnter={e => e.currentTarget.style.borderColor = T.cyanMid}
-                  onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
-                  <p style={{ color:T.text0, fontSize:10, fontFamily:T.font, lineHeight:1.45, margin:"0 0 4px 0" }}>{item.title}</p>
-                  <div style={{ display:"flex", justifyContent:"space-between" }}>
-                    <span style={{ color:T.cyan,  fontSize:8.5, fontFamily:T.font }}>{item.source}</span>
-                    <span style={{ color:T.text2, fontSize:8.5, fontFamily:T.font }}>{_timeAgo(item.pubDate)}</span>
-                  </div>
-                </a>
               ))}
             </div>
           </div>
@@ -1868,7 +1866,6 @@ function PageChart({ T }) {
     </div>
   );
 }
-
 
 // ─── PAGE: Signals (PRESERVED as-is) ─────────────────────────────────────────
 // ─── PAGE: Signals - Uses live ticker data directly ──────────────────────────
@@ -2687,7 +2684,6 @@ function PagePortfolio({ tickers = new Map(), marketSession = "market", T }) {
 // ─── App Shell ────────────────────────────────────────────────────────────────
 export default function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp = 'all', sector: sectorProp = 'ALL', onSourceChange, onSectorChange, onThemeChange, currentTheme = 'auto' }) {
   // Active page state - persisted in localStorage
-  const [quickFilter, setQuickFilter] = useState(null);
   const [page, setPage] = useState(() => {
     try {
       const saved = localStorage.getItem('nexradar_active_page');
@@ -3011,7 +3007,7 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
   const renderPage = () => {
     switch (page) {
       case "dashboard": return <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange} onNavigate={setPage} sectorPerformance={sectorPerformance} tickers={tickers} T={T} />;
-      case "live":      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={() => setQuickFilter(null)} T={T} />;
+      case "live":      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} T={T} />;
       case "chart":     return <PageChart T={T} />;
       case "signals":   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} T={T} />;
       case "earnings":  return <PageEarnings T={T} />;
@@ -3387,11 +3383,7 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
               ];
               return counts.map(([icon,label,color,count]) => (
                 <div key={label}
-                  onClick={() => {
-                    const filterMap = {"VOL SPIKES":"VOL_SPIKES","GAP PLAYS":"GAP_PLAYS","AH MOMT.":"AH_MOMT","EARN. GAPS":"EARN_GAPS","DIAMOND":"DIAMOND"};
-                    setQuickFilter(filterMap[label] ?? null);
-                    setPage("live");
-                  }}
+                  onClick={() => setPage("live")}
                   style={{ display:"flex",alignItems:"center",gap:8,background:T.bg2,border:`1px solid ${T.border}`,borderRadius:7,padding:"5px 13px",cursor:"pointer",flexShrink:0,transition:"all 0.2s" }}
                   onMouseEnter={e=>{e.currentTarget.style.borderColor=color+"40"; e.currentTarget.style.background=color+"08";}}
                   onMouseLeave={e=>{e.currentTarget.style.borderColor=T.border; e.currentTarget.style.background=T.bg2;}}>
