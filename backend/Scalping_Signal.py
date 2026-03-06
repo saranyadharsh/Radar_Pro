@@ -150,6 +150,8 @@ class IndicatorCalculator:
         self._vwap_cum_vol = 0.0
         # FIX-4: store true streaming MACD line values for accurate signal EMA
         self._macd_history: deque = deque(maxlen=50)
+        # Cache most-recent computed indicators for live snapshot API
+        self._latest_ind: Optional[dict] = None
 
     def reset_vwap(self):
         """
@@ -166,7 +168,9 @@ class IndicatorCalculator:
         self.bars.append(bar)
         if len(self.bars) < 27:
             return None
-        return self._compute(bar)
+        ind = self._compute(bar)
+        self._latest_ind = ind   # cache for snapshot API
+        return ind
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -387,6 +391,171 @@ class ScalpingSignalEngine:
             for c in self._calcs.values():
                 c.reset_vwap()   # FIX-1: also resets OBV and MACD history
         logger.info("VWAP + OBV + MACD history reset for all symbols.")
+
+    def get_scalp_snapshot(self, watchlist: List[str]) -> List[dict]:
+        """
+        Return the latest indicator snapshot + derived signal for every
+        symbol in *watchlist* that has enough bars (>=27).
+        Called by GET /api/scalp-analysis.
+        """
+        rows = []
+        with self._lock:
+            calcs_copy = {k: v for k, v in self._calcs.items() if k in watchlist}
+
+        for sym, calc in calcs_copy.items():
+            ind = calc._latest_ind
+            if ind is None:
+                rows.append({
+                    "ticker": sym, "status": "warming_up",
+                    "bars_count": len(calc.bars),
+                })
+                continue
+
+            close   = ind["close"]
+            vwap    = ind["vwap"]
+            rsi     = ind["rsi"]
+            stoch_k = ind["stoch_k"]
+            stoch_d = ind["stoch_d"]
+            macd_h  = ind["macd_hist"]
+            macd_l  = ind["macd_line"]
+            macd_s  = ind["macd_signal"]
+            adx     = ind["adx"]
+            ema9    = ind["ema9"]
+            ema21   = ind["ema21"]
+            vol     = ind["vol_ratio"]
+            atr     = ind["atr"]
+            bb_u    = ind["bb_upper"]
+            bb_l    = ind["bb_lower"]
+
+            # ── Derived labels ───────────────────────────────────────────────
+            vwap_pct    = (close - vwap) / vwap * 100 if vwap else 0
+            vwap_status = "ABOVE" if close > vwap else "BELOW"
+
+            macd_sig_lbl = ("Bullish" if macd_h > 0 and macd_l > macd_s
+                            else "Bearish" if macd_h < 0 and macd_l < macd_s
+                            else "Neutral")
+
+            rsi_lbl = ("Overbought" if rsi >= 70 else
+                       "Oversold"   if rsi <= 30 else
+                       "Bull zone"  if rsi > 55  else
+                       "Bear zone"  if rsi < 45  else "Neutral")
+
+            stoch_sig = ("Bullish" if stoch_k > stoch_d and stoch_k < 80
+                         else "Bearish" if stoch_k < stoch_d and stoch_k > 20
+                         else "Neutral")
+
+            trend_lbl = ("Bullish" if close > ema9 > ema21
+                         else "Bearish" if close < ema9 < ema21
+                         else "Sideways")
+
+            adx_lbl   = ("Strong"   if adx >= 40
+                         else "Trending" if adx >= 25
+                         else "Choppy")
+
+            # Candle (very last 2 bars)
+            bars_list = list(calc.bars)
+            if len(bars_list) >= 2:
+                y, t = bars_list[-2], bars_list[-1]
+                body = abs(t.close - t.open)
+                rng  = t.high - t.low or 0.001
+                if body / rng < 0.1:
+                    candle = "Doji"
+                elif y.close < y.open and t.close > t.open and t.open <= y.close and t.close >= y.open:
+                    candle = "Bullish Engulfing"
+                elif y.close > y.open and t.close < t.open and t.open >= y.close and t.close <= y.open:
+                    candle = "Bearish Engulfing"
+                elif t.close > t.open:
+                    candle = "Bullish"
+                else:
+                    candle = "Bearish"
+            else:
+                candle = "—"
+
+            # ── Quick score (mirrors _evaluate logic, session-neutral) ───────
+            bull = bear = 0.0
+            confluence = 0
+            if close > vwap:     bull += 0.15; confluence += 1
+            else:                bear += 0.15
+            if close > ema9 > ema21: bull += 0.15; confluence += 1
+            elif close < ema9 < ema21: bear += 0.15
+            if macd_h > 0 and macd_l > macd_s: bull += 0.12; confluence += 1
+            elif macd_h < 0 and macd_l < macd_s: bear += 0.12
+            if rsi > 55:  bull += 0.12; confluence += 1
+            elif rsi < 45: bear += 0.12
+            if stoch_k > stoch_d and stoch_k < 80: bull += 0.11; confluence += 1
+            elif stoch_k < stoch_d and stoch_k > 20: bear += 0.11
+            if vol >= 1.5:
+                if bull > bear: bull += 0.12; confluence += 1
+                else:           bear += 0.12
+            mult = 1.3 if adx >= 40 else (1.1 if adx >= 25 else 0.85)
+            bull *= mult; bear *= mult
+            net = bull - bear
+
+            # Map to direction / signal label
+            if abs(net) < 0.45:
+                direction = "NEUTRAL"; signal = "HOLD"
+                strength  = "WEAK"
+            elif net > 0:
+                direction = "LONG";  signal = "BUY"
+                strength  = "STRONG" if abs(net) >= 0.75 else ("MODERATE" if abs(net) >= 0.55 else "WEAK")
+            else:
+                direction = "SHORT"; signal = "SELL"
+                strength  = "STRONG" if abs(net) >= 0.75 else ("MODERATE" if abs(net) >= 0.55 else "WEAK")
+
+            conf = min(abs(net) / 0.8, 1.0)
+
+            safe_atr = atr if atr > 0 else close * 0.002
+            if direction == "LONG":
+                sl = round(close - safe_atr * 1.5, 2)
+                tp = round(close + safe_atr * 2.5, 2)
+            elif direction == "SHORT":
+                sl = round(close + safe_atr * 1.5, 2)
+                tp = round(close - safe_atr * 2.5, 2)
+            else:
+                sl = round(close - safe_atr * 1.5, 2)
+                tp = round(close + safe_atr * 2.5, 2)
+            rr = round(abs(tp - close) / (abs(close - sl) + 1e-10), 2)
+
+            rows.append({
+                "ticker":       sym,
+                "status":       "ok",
+                "bars_count":   len(calc.bars),
+                "price":        round(close, 2),
+                "direction":    direction,
+                "signal":       signal,
+                "strength":     strength,
+                "score":        round(net, 3),
+                "confidence":   round(conf, 3),
+                "prediction":   round(conf * 100, 1),
+                "vwap":         round(vwap, 2),
+                "vwap_status":  vwap_status,
+                "vwap_pct":     round(vwap_pct, 2),
+                "support":      round(min(bb_l, ema21), 2),
+                "resistance":   round(max(bb_u, ema9), 2),
+                "candle":       candle,
+                "macd_signal":  macd_sig_lbl,
+                "macd_hist":    round(macd_h, 6),
+                "rsi":          round(rsi, 1),
+                "rsi_signal":   rsi_lbl,
+                "stoch_k":      round(stoch_k, 1),
+                "stoch_d":      round(stoch_d, 1),
+                "stoch_signal": stoch_sig,
+                "volume":       round(vol, 2),
+                "trend":        trend_lbl,
+                "adx":          round(adx, 1),
+                "adx_label":    adx_lbl,
+                "confluence":   confluence,
+                "tp":           tp,
+                "sl":           sl,
+                "rr":           rr,
+                "atr":          round(atr, 2),
+            })
+
+        # Sort: BUY first, then SELL, then HOLD/warming; within group by confidence desc
+        order = {"BUY": 0, "SELL": 1, "HOLD": 2, "warming_up": 3}
+        rows.sort(key=lambda r: (order.get(r.get("signal", "warming_up"), 3),
+                                  -r.get("confidence", 0)))
+        return rows
 
     # FIX-5: date-guard scheduler
     def _start_vwap_scheduler(self):

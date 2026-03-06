@@ -3,60 +3,37 @@ ws_engine.py — NexRadar Pro
 ============================
 Cloud-safe WebSocket engine.
 
-SECTOR CHANGES (marked with # <- SECTOR):
-  1. sector_map loaded at start() from supabase stock_list
-  2. cache_entry includes sector field on every tick
-  3. get_live_snapshot() accepts sector= param and filters by it
-  4. Source filter now correctly handles "stock_list" (same as "all")
+FIXES IN THIS VERSION:
+  FIX-17 STALE OPEN PRICES: historical_data was set once at startup and never
+         refreshed when a new trading day started. If backend ran overnight,
+         today's "open" was actually yesterday's open. Now _session_reset_loop
+         triggers _refresh_historical_for_new_day() at 09:31 ET daily.
+  
+  FIX-18 FIRST-TICK OPEN GUARD: If historical_data["open"] is suspiciously
+         stale (>15% away from first live tick), use the first live tick price
+         as a temporary open until the Polygon refresh at 09:31 completes.
+  
+  FIX-19 LIVE_DISPLAY_CAP raised from 1600 to 6200. Frontend already paginates
+         at 50 rows/page, so the backend cap was silently hiding 4400+ tickers
+         when user clicked ALL. Frontend pagination handles the UI load.
 
-FIXES APPLIED (v2):
-  FIX-1  intraday_highs_lock added — was unprotected across WS + AH threads
-  FIX-2  Earnings refresh guard (_earnings_refresh_event) prevents unbounded
-         thread spawns when check fires on every WS tick
-  FIX-3  intraday_highs reset at 09:30 ET daily via _session_reset_loop
-  FIX-4  get_live_snapshot handles EARNINGS pseudo-sector via is_earnings_gap_play
-  FIX-5  seed_history_from_rest() called in start() — integration of
-         Scalping_Signal FIX-3; enables immediate signals + AH signals
-  FIX-6  Gap calc guarded: ref_open <= 0 skips gap (was -100% pre-market)
-  FIX-7  AH close refresh uses ?tickers=CSV batching (was full-market fetch)
-  FIX-8  WS reconnect uses frozenset comparison to guard against spurious
-         reconnects when pointer changes but content is unchanged
-  FIX-9  shutdown() flushes pending_writes before stopping
-  FIX-10 4pm ET re-seed scheduled in _session_reset_loop
-  FIX-11 _market_session() cached with 60 s TTL (was datetime.now per msg)
-  FIX-12 yf_success/yf_failed protected by threading.Lock (30-worker race)
-  FIX-13 alert_cache_lock consolidated — snapshot copy taken once per tick
-  FIX-14 _last_broadcast_ts purged every 10 min
-  FIX-15 db_write_queue.task_done() called after each batch
-  FIX-16 AH close refresh updates historical_data only; no full alert recompute
-
-DYNAMIC WATCHLIST (v3):
-  Replaced static DEFAULT_SIGNAL_WATCHLIST with a fully dynamic system backed
-  by the `signal_watchlist` Supabase table.
-
-  User flow:
-    Frontend live table has a ★ star button per row (first or last column).
-    Clicking ★ calls POST /api/watchlist/add   {"ticker": "AAPL"}
-    Clicking ★ again calls POST /api/watchlist/remove {"ticker": "AAPL"}
-
-  Backend API routes call:
-    ws_engine.add_signal_ticker(ticker)    — persists to DB + activates live
-    ws_engine.remove_signal_ticker(ticker) — removes from DB + deactivates
-    ws_engine.get_signal_watchlist()       — returns current list for GET route
-
-  On startup, _load_signal_watchlist_from_db() reads the persisted list so
-  the watchlist survives server restarts.
-
-  Required supabase_db methods (add if not present):
-    db.get_signal_watchlist()          → List[Dict]  e.g. [{"ticker":"AAPL"}, ...]
-    db.add_signal_watchlist(ticker)    → None  (upsert, ignore duplicates)
-    db.remove_signal_watchlist(ticker) → None  (delete, ignore missing)
-
-  Supabase table DDL:
-    CREATE TABLE signal_watchlist (
-      ticker TEXT PRIMARY KEY,
-      added_at TIMESTAMPTZ DEFAULT now()
-    );
+PRIOR FIXES (preserved):
+  FIX-1  intraday_highs_lock
+  FIX-2  Earnings refresh guard
+  FIX-3  intraday_highs reset at 09:30 ET
+  FIX-4  EARNINGS pseudo-sector
+  FIX-5  seed_history_from_rest() at startup
+  FIX-6  Gap calc guarded
+  FIX-7  AH close refresh batched
+  FIX-8  WS reconnect frozenset
+  FIX-9  shutdown() flushes pending_writes
+  FIX-10 4pm ET re-seed
+  FIX-11 _market_session() cached
+  FIX-12 yf counter lock
+  FIX-13 alert_cache_lock consolidated
+  FIX-14 _last_broadcast_ts purged
+  FIX-15 task_done()
+  FIX-16 AH close refresh: historical_data only
 """
 
 import os
@@ -109,11 +86,16 @@ AH_MOMENTUM_MULTIPLIER       = 1.5
 PRICE_STALE_SECONDS          = 300
 AH_CLOSE_REFRESH_INTERVAL    = 120
 MAX_WEBSOCKET_TICKERS        = 10000
-LIVE_DISPLAY_CAP             = 1600
+# FIX-19: Raised from 1600 → 6200 to show all ~6027 tickers when user clicks ALL.
+# Frontend already paginates at 50 rows/page so this doesn't cause UI load issues.
+LIVE_DISPLAY_CAP             = 6200
 WS_BACKOFF_BASE_DELAY        = 1.0
 WS_BACKOFF_MAX_DELAY         = 60.0
 _SESSION_CACHE_TTL           = 60.0   # FIX-11
 _BROADCAST_PURGE_SEC         = 600.0  # FIX-14
+
+# FIX-18: If open price is this % away from first live tick, treat it as stale
+_STALE_OPEN_THRESHOLD_PCT    = 15.0
 
 # ── FIX-11: module-level session cache ────────────────────────────────────────
 _session_cache:    str   = "closed"
@@ -122,10 +104,6 @@ _session_cache_lock      = threading.Lock()
 
 
 def _market_session() -> str:
-    """
-    FIX-11: Cached market session — refreshed at most every 60 s.
-    Original called datetime.now(ET_TZ) on every WS message batch (hot path).
-    """
     global _session_cache, _session_cache_ts
     now_mono = time.monotonic()
     with _session_cache_lock:
@@ -168,54 +146,42 @@ class WSEngine:
         # ── State ──────────────────────────────────────────────────────────────
         self.all_tickers:      Set[str]       = set()
         self.company_map:      Dict[str, str] = {}
-        self.sector_map:       Dict[str, str] = {}   # <- SECTOR
+        self.sector_map:       Dict[str, str] = {}
         self.alert_cache:      Dict[str, Dict]= {}
         self.alert_cache_lock                 = threading.Lock()
         self.historical_data:  Dict[str, Dict]= {}
         self.historical_data_lock             = threading.Lock()
 
-        # FIX-1: dedicated lock for intraday_highs
         self.intraday_highs:      Dict[str, float] = {}
         self.intraday_highs_lock                   = threading.Lock()
 
-        # ── Portfolio/Monitor state ────────────────────────────────────────────
         self._monitor_tickers:   Set[str] = set()
         self._portfolio_tickers: Set[str] = set()
         self._last_portfolio_refresh      = 0.0
         self._PORTFOLIO_REFRESH_INTERVAL  = float(os.getenv("PORTFOLIO_REFRESH_INTERVAL", "30.0"))
 
-        # ── WebSocket state ────────────────────────────────────────────────────
         self.ws_health_status  = "connecting"
         self.ws_retry_count    = 0
         self.last_message_time = time.time()
         self.polygon_ws_client: Optional[WebSocketClient] = None
         self.ws_lock           = threading.Lock()
 
-        # ── Throttled Broadcast ────────────────────────────────────────────────
         self._last_broadcast_ts     = {}
-        self._last_broadcast_purge  = time.time()   # FIX-14
+        self._last_broadcast_purge  = time.time()
         self._BROADCAST_THROTTLE_SEC= 0.35
 
-        # ── AH close refresh ──────────────────────────────────────────────────
         self.last_ah_close_refresh = 0.0
 
-        # ── Earnings date map ─────────────────────────────────────────────────
         self.earning_date_map:       Dict[str, str] = {}
         self._earnings_last_refresh                 = 0.0
         self._EARNINGS_REFRESH_INTERVAL             = 3600.0
-        # FIX-2: Event prevents concurrent earnings refresh threads
         self._earnings_refresh_event = threading.Event()
-        self._earnings_refresh_event.set()   # set = "not currently refreshing"
+        self._earnings_refresh_event.set()
 
-        # ── Scalping Signal Engine ────────────────────────────────────────────
         self._signal_engine  = ScalpingSignalEngine()
         self._signal_watcher = SignalWatchlistManager(self._signal_engine)
-        # Dynamic watchlist — loaded from DB in start(); star button adds/removes
-        # tickers at runtime via add_signal_ticker() / remove_signal_ticker().
-        # No hardcoded list here — DB is the single source of truth.
         self._signal_engine.on_signal(self._on_signal)
 
-        # ── Source stats ──────────────────────────────────────────────────────
         self.source_stats = {
             "total_attempted":  0,
             "polygon_success":  0,
@@ -223,7 +189,6 @@ class WSEngine:
             "failed":           0,
         }
 
-        # ── Threading ─────────────────────────────────────────────────────────
         self.run_event = threading.Event()
         self.run_event.set()
 
@@ -243,11 +208,6 @@ class WSEngine:
     # ── START / STOP ──────────────────────────────────────────────────────────
 
     def start(self, tickers: List[str], company_map: Dict[str, str], sector_map: Dict[str, str] = None):
-        """
-        Accepts sector_map from caller (main.py passes it from get_stock_meta()
-        so we avoid an extra stock_list query).
-        Falls back to db.get_sector_map() only if not provided.
-        """
         self.all_tickers = set(tickers)
         self.company_map = company_map
         self.sector_map  = sector_map if sector_map is not None else self.db.get_sector_map()
@@ -270,21 +230,14 @@ class WSEngine:
             daemon=True, name="PortfolioMonitorRefresh"
         ).start()
 
-        # FIX-3 + FIX-10: reset HWMs at 9:30 ET and re-seed signals at 4pm ET
         threading.Thread(
             target=self._session_reset_loop,
             daemon=True, name="SessionReset"
         ).start()
 
         self._refresh_earning_date_map()
-
-        # Load persisted signal watchlist from DB — survives server restarts.
-        # Must run before seed_history_from_rest() so only watched tickers get seeded.
         self._load_signal_watchlist_from_db()
 
-        # FIX-5: seed signal bar history at startup (Scalping_Signal FIX-3 integration)
-        # This: (a) warms up indicators immediately so signals fire from bar 1
-        #       (b) enables AH signals — Polygon A.* stops at 4pm without seeded bars
         if self.massive_api_key:
             self._signal_watcher.seed_history_from_rest(
                 polygon_api_key=self.massive_api_key
@@ -298,20 +251,20 @@ class WSEngine:
 
         logger.info(f"WSEngine started — {len(self.all_tickers)} tickers")
 
-    # ── SESSION RESET LOOP (FIX-3 + FIX-10) ──────────────────────────────────
+    # ── SESSION RESET LOOP (FIX-3 + FIX-10 + FIX-17) ─────────────────────────
 
     def _session_reset_loop(self):
         """
-        FIX-3:  Clears intraday_highs at 09:30 ET so yesterday's HWM doesn't
-                bleed into today's session. Without this, stocks showed
-                pullback_state='tsl_alert' from the very first tick of the day.
-        FIX-10: Re-seeds signal bar history from Polygon REST at 16:01 ET so
-                AH signals can fire after Polygon A.* stops at 4pm.
-        Polls every 30 s — lightweight, no sub-second precision needed.
+        FIX-3:  Clears intraday_highs at 09:30 ET.
+        FIX-10: Re-seeds signal bars at 16:01 ET.
+        FIX-17: Refreshes historical_data (open, prev_close, today_close) at 09:31 ET
+                so that a new trading day gets fresh Polygon snapshot data instead of
+                stale startup values. This is the ROOT FIX for the stale open price bug.
         """
         et_tz = pytz.timezone("America/New_York")
-        reset_done_date:  Optional[date] = None
-        reseed_done_date: Optional[date] = None
+        reset_done_date:     Optional[date] = None
+        hist_refresh_date:   Optional[date] = None   # FIX-17
+        reseed_done_date:    Optional[date] = None
 
         while self.run_event.is_set():
             try:
@@ -320,13 +273,30 @@ class WSEngine:
                 weekday = now_et.weekday()
 
                 if weekday < 5:
-                    # 09:30 ET: reset intraday HWMs
+                    # 09:30 ET: reset intraday HWMs + clear alert cache for fresh day
                     if (now_et.hour == 9 and now_et.minute >= 30
                             and reset_done_date != today):
                         reset_done_date = today
                         with self.intraday_highs_lock:
                             self.intraday_highs.clear()
-                        logger.info("Intraday HWMs cleared at market open")
+                        # FIX-17: Clear alert_cache so stale change_value/percent_change
+                        # from yesterday don't bleed into today's first snapshot
+                        with self.alert_cache_lock:
+                            self.alert_cache.clear()
+                        logger.info("⏰ 09:30 ET: Intraday HWMs + alert_cache cleared for new day")
+
+                    # FIX-17: 09:31 ET: Refresh historical_data from Polygon snapshot
+                    # This gets today's REAL open prices, prev_close, etc.
+                    # We wait 1 min after open so Polygon has the day's open price.
+                    if (now_et.hour == 9 and now_et.minute >= 31
+                            and hist_refresh_date != today
+                            and self.massive_api_key):
+                        hist_refresh_date = today
+                        logger.info("⏰ 09:31 ET: Refreshing historical_data for new trading day...")
+                        threading.Thread(
+                            target=self._refresh_historical_for_new_day,
+                            daemon=True, name="DailyHistRefresh"
+                        ).start()
 
                     # 16:01 ET: re-seed signal bar history for AH
                     if (now_et.hour == 16 and now_et.minute >= 1
@@ -343,19 +313,109 @@ class WSEngine:
 
             time.sleep(30)
 
+    # ── FIX-17: Daily historical data refresh ─────────────────────────────────
+
+    def _refresh_historical_for_new_day(self):
+        """
+        FIX-17: Re-fetch Polygon snapshot for ALL tickers at market open.
+        This replaces stale overnight open/prev_close/today_close values
+        with today's actual data from Polygon.
+
+        Called at 09:31 ET by _session_reset_loop (1 min after market open
+        so Polygon has had time to record today's opening prices).
+        """
+        try:
+            with self.ws_lock:
+                snap_tickers = list(self.all_tickers)
+
+            if not snap_tickers:
+                logger.warning("_refresh_historical_for_new_day: no tickers")
+                return
+
+            logger.info(f"FIX-17: Refreshing historical data for {len(snap_tickers)} tickers...")
+            start_time = time.time()
+
+            BATCH_SIZE = 100
+            refreshed = 0
+
+            for i in range(0, len(snap_tickers), BATCH_SIZE):
+                batch = snap_tickers[i : i + BATCH_SIZE]
+                tickers_csv = ",".join(batch)
+                url = (
+                    f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+                    f"?tickers={tickers_csv}&apiKey={self.massive_api_key}"
+                )
+                try:
+                    resp = requests.get(url, timeout=20)
+                    if resp.status_code != 200:
+                        logger.warning(f"FIX-17 refresh HTTP {resp.status_code} batch {i}")
+                        continue
+
+                    snap_map = {
+                        item["ticker"]: item
+                        for item in resp.json().get("tickers", [])
+                    }
+
+                    for ticker in batch:
+                        item = snap_map.get(ticker)
+                        if not item:
+                            continue
+
+                        day        = item.get("day",       {}) or {}
+                        prev_day   = item.get("prevDay",   {}) or {}
+                        last_trade = item.get("lastTrade", {}) or {}
+
+                        open_price  = float(day.get("o",  0) or 0)
+                        today_close = float(day.get("c",  0) or 0)
+                        avg_vol     = float(day.get("av", 0) or 0)
+                        prev_close  = float(prev_day.get("c", 0) or 0)
+
+                        if today_close <= 0:
+                            today_close = float(last_trade.get("p", 0) or 0)
+                        if open_price  <= 0: open_price  = today_close
+                        if prev_close  <= 0: prev_close  = open_price
+                        if today_close <= 0: today_close = open_price
+
+                        if open_price <= 0:
+                            continue
+
+                        with self.historical_data_lock:
+                            self.historical_data[ticker] = {
+                                "open":        open_price,
+                                "prev_close":  prev_close,
+                                "today_close": today_close,
+                                "avg_volume":  avg_vol,
+                            }
+                        refreshed += 1
+
+                except Exception as e:
+                    logger.error(f"FIX-17 refresh batch {i}: {e}")
+
+            elapsed = round(time.time() - start_time, 1)
+            logger.info(
+                f"FIX-17: Historical data refreshed for {refreshed}/{len(snap_tickers)} "
+                f"tickers in {elapsed}s — today's open prices are now current"
+            )
+
+            # After refresh, broadcast a fresh snapshot so all connected clients
+            # immediately see corrected open prices without waiting for next tick
+            if self._broadcast_cb and self._loop and refreshed > 0:
+                snapshot = self.get_live_snapshot(limit=10000, only_positive=False)
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_cb({
+                        "type": "snapshot",
+                        "data": snapshot,
+                    }),
+                    self._loop,
+                )
+                logger.info(f"FIX-17: Broadcast fresh snapshot after daily refresh ({len(snapshot)} tickers)")
+
+        except Exception as e:
+            logger.error(f"_refresh_historical_for_new_day: {e}")
+
     # ── DYNAMIC SIGNAL WATCHLIST ──────────────────────────────────────────────
 
     def _load_signal_watchlist_from_db(self):
-        """
-        Reads the persisted signal_watchlist table from Supabase and activates
-        those tickers in the live SignalWatchlistManager.
-        Called once in start() — restores user's watchlist after server restart.
-        Safe to call again at any time (idempotent: set_watchlist replaces all).
-
-        Required supabase_db method:
-            db.get_signal_watchlist() -> List[Dict[str, str]]
-            e.g. [{"ticker": "AAPL"}, {"ticker": "NVDA"}, ...]
-        """
         try:
             rows    = self.db.get_signal_watchlist()
             tickers = [r["ticker"] for r in rows if r.get("ticker")]
@@ -368,132 +428,64 @@ class WSEngine:
             logger.error(f"_load_signal_watchlist_from_db: {e} — starting with empty watchlist")
 
     def add_signal_ticker(self, ticker: str) -> Dict:
-        """
-        Called by the FastAPI POST /api/watchlist/add route when the user
-        clicks the ★ star button in the live table.
-
-        Persists to DB first (source of truth), then activates in the live
-        SignalWatchlistManager so signals start firing immediately — no restart.
-
-        Returns a status dict for the API response.
-
-        Required supabase_db method:
-            db.add_signal_watchlist(ticker: str) -> None
-            (upsert / INSERT OR IGNORE — safe to call for existing ticker)
-        """
         ticker = ticker.upper().strip()
         if not ticker:
             return {"ok": False, "error": "ticker is required"}
-
         try:
-            # Persist first — DB is the source of truth
             self.db.add_signal_watchlist(ticker)
-
-            # Activate in live engine — get current list and append
             current = list(self._signal_watcher.watched)
             if ticker not in current:
                 current.append(ticker)
                 self._signal_watcher.set_watchlist(current)
-
             logger.info(f"Signal watchlist: added {ticker} (total: {len(self._signal_watcher.watched)})")
-
-            # Broadcast watchlist_update so all open browser tabs sync ★ state
             if self._broadcast_cb and self._loop:
                 asyncio.run_coroutine_threadsafe(
                     self._broadcast_cb({
-                        "type":    "watchlist_update",
-                        "action":  "add",
-                        "ticker":  ticker,
+                        "type": "watchlist_update", "action": "add", "ticker": ticker,
                         "watchlist": sorted(self._signal_watcher.watched),
                     }),
                     self._loop,
                 )
-
             return {"ok": True, "action": "add", "ticker": ticker,
                     "watchlist_count": len(self._signal_watcher.watched)}
-
         except Exception as e:
             logger.error(f"add_signal_ticker({ticker}): {e}")
             return {"ok": False, "error": str(e)}
 
     def remove_signal_ticker(self, ticker: str) -> Dict:
-        """
-        Called by the FastAPI POST /api/watchlist/remove route when the user
-        un-stars a ticker in the live table.
-
-        Removes from DB first, then deactivates in the live engine.
-        Clears any buffered OHLCV bars for that ticker from the signal engine
-        so stale indicator state doesn't persist.
-
-        Returns a status dict for the API response.
-
-        Required supabase_db method:
-            db.remove_signal_watchlist(ticker: str) -> None
-            (DELETE WHERE ticker = ... — safe to call for non-existent ticker)
-        """
         ticker = ticker.upper().strip()
         if not ticker:
             return {"ok": False, "error": "ticker is required"}
-
         try:
-            # Remove from DB first
             self.db.remove_signal_watchlist(ticker)
-
-            # Deactivate in live engine
             current = list(self._signal_watcher.watched)
             if ticker in current:
                 current.remove(ticker)
                 self._signal_watcher.set_watchlist(current)
-
-            # Clear stale indicator bars for this ticker from the signal engine
-            # so if the user re-adds it later, it starts fresh rather than
-            # resuming from potentially stale OHLCV state.
             if ticker in self._signal_engine._calcs:
                 del self._signal_engine._calcs[ticker]
-                logger.debug(f"Cleared stale indicator bars for removed ticker {ticker}")
-
             logger.info(f"Signal watchlist: removed {ticker} (total: {len(self._signal_watcher.watched)})")
-
-            # Broadcast watchlist_update so all open browser tabs sync ★ state
             if self._broadcast_cb and self._loop:
                 asyncio.run_coroutine_threadsafe(
                     self._broadcast_cb({
-                        "type":    "watchlist_update",
-                        "action":  "remove",
-                        "ticker":  ticker,
+                        "type": "watchlist_update", "action": "remove", "ticker": ticker,
                         "watchlist": sorted(self._signal_watcher.watched),
                     }),
                     self._loop,
                 )
-
             return {"ok": True, "action": "remove", "ticker": ticker,
                     "watchlist_count": len(self._signal_watcher.watched)}
-
         except Exception as e:
             logger.error(f"remove_signal_ticker({ticker}): {e}")
             return {"ok": False, "error": str(e)}
 
     def get_signal_watchlist(self) -> Dict:
-        """
-        Called by the FastAPI GET /api/watchlist route.
-        Returns the live in-memory watchlist (already in sync with DB).
-        Frontend uses this to render ★ filled/unfilled state on page load.
-        """
         tickers = sorted(self._signal_watcher.watched)
-        return {
-            "watchlist": tickers,
-            "count":     len(tickers),
-        }
+        return {"watchlist": tickers, "count": len(tickers)}
 
     # ── EARNINGS DATE MAP ─────────────────────────────────────────────────────
 
     def _refresh_earning_date_map(self):
-        """
-        Fetch earnings ±7 day window. Called at startup and hourly.
-        FIX-2: Sets _earnings_refresh_event at end (in finally) so future ticks
-               can trigger refresh again. Optimistic timestamp update at spawn
-               time (not here) prevents concurrent threads.
-        """
         try:
             today = date.today()
             start = (today - timedelta(days=1)).isoformat()
@@ -509,12 +501,9 @@ class WSEngine:
         except Exception as e:
             logger.error(f"_refresh_earning_date_map: {e}")
         finally:
-            # FIX-2: always release so next hourly cycle can spawn a new refresh
             self._earnings_refresh_event.set()
 
     def shutdown(self):
-        # FIX-9: flush buffered pending_writes before stopping so last-second
-        # ticks are not silently dropped on restart/redeploy
         with self._pending_writes_lock:
             if self._pending_writes:
                 self.db_write_queue.put(list(self._pending_writes.values()))
@@ -535,12 +524,6 @@ class WSEngine:
     # ── MASSIVE WS LISTENER ───────────────────────────────────────────────────
 
     def _ws_listener_loop(self):
-        """
-        FIX-8: Use frozenset comparison so reconnect only fires when ticker
-               set *content* changes, not just pointer identity. Polygon does
-               not support incremental subscribe/unsubscribe — full reconnect
-               is still required on any real change.
-        """
         last_subscribed: frozenset = frozenset()
 
         while self.run_event.is_set():
@@ -620,8 +603,6 @@ class WSEngine:
             if hasattr(msg, "open") or hasattr(msg, "op"):
                 self._signal_watcher.process_aggregate_message(msg)
 
-        # AH close refresh — per batch, not per message
-        # FIX-11: _market_session() is now cached, no per-call datetime.now()
         if _market_session() == "after":
             now = time.time()
             if (now - self.last_ah_close_refresh) > AH_CLOSE_REFRESH_INTERVAL:
@@ -634,7 +615,7 @@ class WSEngine:
 
     def _update_alert_cache_logic(self, ticker: str, live_price: float, msg=None):
         company_name = self.company_map.get(ticker, ticker)
-        sector       = self.sector_map.get(ticker, "Unknown")   # <- SECTOR
+        sector       = self.sector_map.get(ticker, "Unknown")
 
         with self.historical_data_lock:
             hist = self.historical_data.get(ticker, {})
@@ -644,7 +625,22 @@ class WSEngine:
         ref_avgvol  = hist.get("avg_volume", 0)
         today_close = hist.get("today_close", 0.0)
 
-        # FIX-11: cached session, no datetime.now() in hot path
+        # FIX-18: Detect stale open price — if the stored "open" is wildly different
+        # from the live price (>15%), it's likely yesterday's data. Use live_price
+        # as a temporary open until the daily Polygon refresh at 09:31 ET fixes it.
+        if ref_open > 0 and live_price > 0:
+            open_deviation_pct = abs(live_price - ref_open) / ref_open * 100
+            if open_deviation_pct > _STALE_OPEN_THRESHOLD_PCT:
+                # Open looks stale — use live_price as temp open and update historical_data
+                logger.debug(
+                    f"FIX-18: {ticker} open {ref_open} is {open_deviation_pct:.1f}% away from "
+                    f"live {live_price} — using live_price as temp open"
+                )
+                ref_open = live_price
+                with self.historical_data_lock:
+                    if ticker in self.historical_data:
+                        self.historical_data[ticker]["open"] = live_price
+
         session = _market_session()
         if session == "after" and today_close > 0:
             base = today_close
@@ -655,7 +651,6 @@ class WSEngine:
         percent_change = (change_value / base * 100) if base else 0
 
         # ── Volume ────────────────────────────────────────────────────────────
-        # FIX-13: take a single snapshot copy under one lock acquire
         with self.alert_cache_lock:
             prev = dict(self.alert_cache.get(ticker, {}))
 
@@ -679,8 +674,6 @@ class WSEngine:
             "none"
         )
 
-        # FIX-6: skip gap calc when today's open hasn't been set (pre-market)
-        # Original: (0 - prev_close) / prev_close = -100% on every pre-mkt tick
         if ref_open > 0 and ref_prev > 0:
             gap_pct = (ref_open - ref_prev) / ref_prev * 100
         else:
@@ -693,14 +686,11 @@ class WSEngine:
             "normal"
         )
 
-        # FIX-2: earnings refresh — Event guard prevents concurrent spawns
-        # Original: check ran on every tick; timestamp set inside thread so
-        # hundreds of threads could spawn before any one finished.
         _now = time.time()
         if (_now - self._earnings_last_refresh > self._EARNINGS_REFRESH_INTERVAL
                 and self._earnings_refresh_event.is_set()):
-            self._earnings_refresh_event.clear()   # block concurrent spawns immediately
-            self._earnings_last_refresh = _now     # optimistic update at spawn time
+            self._earnings_refresh_event.clear()
+            self._earnings_last_refresh = _now
             threading.Thread(
                 target=self._refresh_earning_date_map,
                 daemon=True, name="EarningsRefresh"
@@ -714,7 +704,6 @@ class WSEngine:
             regular_move = abs(today_close - ref_prev) if ref_prev else 0
             ah_mom = ah_move > regular_move * AH_MOMENTUM_MULTIPLIER
 
-        # FIX-1: intraday_highs protected by dedicated lock
         with self.intraday_highs_lock:
             hwm = self.intraday_highs.get(ticker, live_price)
             if live_price > hwm:
@@ -728,7 +717,6 @@ class WSEngine:
             "neutral"
         )
 
-        # ── went_positive — uses `prev` snapshot from single lock acquire above
         is_positive   = change_value >= 0
         went_positive = 0
         prev_cv       = prev.get("change_value", 0)
@@ -742,12 +730,12 @@ class WSEngine:
             went_positive    = 1
             went_positive_ts = prev_wp_ts
         else:
-            went_positive_ts = prev_wp_ts   # preserve existing ts (0 for brand-new ticker)
+            went_positive_ts = prev_wp_ts
 
         cache_entry = {
             "ticker":               ticker,
             "company_name":         company_name,
-            "sector":               sector,               # <- SECTOR
+            "sector":               sector,
             "live_price":           live_price,
             "open":                 ref_open,
             "prev_close":           ref_prev,
@@ -774,7 +762,6 @@ class WSEngine:
             "session":              session,
         }
 
-        # FIX-13: single final lock acquire for write
         with self.alert_cache_lock:
             self.alert_cache[ticker] = cache_entry
 
@@ -806,15 +793,12 @@ class WSEngine:
                 )
                 self._last_broadcast_ts[ticker] = now
 
-        # FIX-14: purge stale broadcast timestamp entries periodically
         if now - self._last_broadcast_purge > _BROADCAST_PURGE_SEC:
             self._last_broadcast_purge = now
             cutoff = now - 300.0
             stale  = [k for k, v in self._last_broadcast_ts.items() if v < cutoff]
             for k in stale:
                 del self._last_broadcast_ts[k]
-            if stale:
-                logger.debug(f"Purged {len(stale)} stale broadcast ts entries")
 
     # ── SIGNAL CALLBACK ───────────────────────────────────────────────────────
 
@@ -834,7 +818,6 @@ class WSEngine:
                                 for r in signal.reasons],
                 "session":     signal.session.value if hasattr(signal.session, "value")
                                else str(signal.session),
-                "timestamp":   signal.timestamp.strftime("%H:%M:%S"),
                 "created_at":  datetime.utcnow().isoformat(),
             }
             self.db.insert_signal(row)
@@ -845,14 +828,6 @@ class WSEngine:
     # ── AH CLOSE REFRESH ──────────────────────────────────────────────────────
 
     def _refresh_ah_closing_prices(self):
-        """
-        FIX-7:  Batched ?tickers=CSV requests (was fetching entire market,
-                ~8k tickers / 5-10MB, every 120 s in AH = ~150MB/hr).
-        FIX-16: Only updates historical_data["today_close"]. No longer calls
-                _update_alert_cache_logic() with msg=None which unnecessarily
-                re-ran gap/HWM/went_positive logic. The next real WS tick will
-                pick up the updated today_close naturally.
-        """
         if not self.massive_api_key or not self.all_tickers:
             return
         try:
@@ -871,7 +846,6 @@ class WSEngine:
                 try:
                     resp = requests.get(url, timeout=15)
                     if resp.status_code != 200:
-                        logger.warning(f"AH close refresh HTTP {resp.status_code} batch {i}")
                         continue
                     for item in resp.json().get("tickers", []):
                         snap_map[item["ticker"]] = item
@@ -903,7 +877,6 @@ class WSEngine:
                     else:
                         old = hist.get("today_close", 0.0)
                         if abs(official_close - old) > 0.01:
-                            # FIX-16: only update today_close; next WS tick recomputes
                             hist["today_close"] = official_close
                             updated += 1
 
@@ -914,11 +887,6 @@ class WSEngine:
     # ── HISTORICAL FETCH ──────────────────────────────────────────────────────
 
     def _fetch_historical_batch(self, tickers: List[str]):
-        """
-        Two-pass historical data seeding at startup:
-          Pass 1 — Polygon REST snapshot (primary, bulk, batches of 100)
-          Pass 2 — yfinance fallback (30 workers, only for Polygon misses)
-        """
         logger.info(f"Fetching historical data for {len(tickers)} tickers ...")
         self.source_stats["total_attempted"] = len(tickers)
 
@@ -932,10 +900,7 @@ class WSEngine:
                 f"{len(failed_after_polygon)} need yfinance fallback"
             )
         else:
-            logger.warning(
-                "MASSIVE_API_KEY not set — skipping Polygon snapshot, "
-                "falling back to yfinance for all tickers"
-            )
+            logger.warning("MASSIVE_API_KEY not set — falling back to yfinance for all tickers")
 
         if failed_after_polygon:
             self._fetch_yfinance_fallback(failed_after_polygon)
@@ -948,25 +913,17 @@ class WSEngine:
             f"yf={self.source_stats['yfinance_success']}, "
             f"failed={self.source_stats['failed']})"
         )
-        
-        # Broadcast snapshot to all connected WebSocket clients after historical data loads
-        if self.broadcast_cb and total_seeded > 0:
-            logger.info(f"Broadcasting snapshot with {total_seeded} tickers to connected clients")
-            snapshot = self.get_live_snapshot(limit=5000, only_positive=False)
+
+        # Broadcast snapshot after historical data loads
+        if self._broadcast_cb and self._loop and total_seeded > 0:
+            snapshot = self.get_live_snapshot(limit=10000, only_positive=False)
             asyncio.run_coroutine_threadsafe(
-                self.broadcast_cb({
-                    "type": "snapshot",
-                    "data": snapshot,
-                }),
-                self.loop
+                self._broadcast_cb({"type": "snapshot", "data": snapshot}),
+                self._loop,
             )
+            logger.info(f"Broadcast initial snapshot: {len(snapshot)} tickers")
 
     def _fetch_polygon_snapshot_bulk(self, tickers: List[str]) -> List[str]:
-        """
-        Polygon REST snapshot — primary bulk fetch.
-        Batches of 100 (URL-length safe).
-        Returns list of tickers NOT seeded (for yfinance fallback).
-        """
         BATCH_SIZE = 100
         failed: List[str] = []
         polygon_seeded    = 0
@@ -981,10 +938,6 @@ class WSEngine:
             try:
                 resp = requests.get(url, timeout=20)
                 if resp.status_code != 200:
-                    logger.warning(
-                        f"Polygon snapshot HTTP {resp.status_code} "
-                        f"batch {i}-{i + len(batch) - 1}"
-                    )
                     failed.extend(batch)
                     continue
 
@@ -1029,22 +982,17 @@ class WSEngine:
                     polygon_seeded += 1
 
             except Exception as e:
-                logger.error(f"Polygon snapshot batch {i}: {e} — queuing {len(batch)} for yfinance")
+                logger.error(f"Polygon snapshot batch {i}: {e}")
                 failed.extend(batch)
 
         self.source_stats["polygon_success"] = polygon_seeded
         return failed
 
     def _fetch_yfinance_fallback(self, tickers: List[str]):
-        """
-        yfinance per-ticker fallback for Polygon misses.
-        FIX-12: yf_success and yf_failed protected by threading.Lock —
-                original nonlocal += was technically a race across 30 workers.
-        """
         logger.info(f"yfinance fallback for {len(tickers)} tickers ...")
         yf_success     = 0
         yf_failed: List[str] = []
-        _counter_lock  = threading.Lock()   # FIX-12
+        _counter_lock  = threading.Lock()
 
         def fetch_one(ticker: str):
             nonlocal yf_success
@@ -1070,7 +1018,6 @@ class WSEngine:
                 with _counter_lock:
                     yf_success += 1
             except Exception as e:
-                logger.debug(f"yfinance fallback failed {ticker}: {e}")
                 with _counter_lock:
                     yf_failed.append(ticker)
 
@@ -1079,12 +1026,6 @@ class WSEngine:
 
         self.source_stats["yfinance_success"] = yf_success
         self.source_stats["failed"]           = len(yf_failed)
-
-        if yf_failed:
-            logger.warning(
-                f"{len(yf_failed)} tickers have no historical data — "
-                f"will show 0% change until live WS tick. Sample: {yf_failed[:10]}"
-            )
         logger.info(f"yfinance fallback complete — {yf_success} seeded, {len(yf_failed)} failed")
 
     # ── PORTFOLIO/MONITOR REFRESH ─────────────────────────────────────────────
@@ -1095,11 +1036,6 @@ class WSEngine:
             monitor_rows   = self.db.get_monitor()
             self._portfolio_tickers = {r.get("ticker") for r in portfolio_rows if r.get("ticker")}
             self._monitor_tickers   = {r.get("ticker") for r in monitor_rows   if r.get("ticker")}
-            logger.debug(
-                f"Refreshed portfolio/monitor: "
-                f"{len(self._portfolio_tickers)} portfolio, "
-                f"{len(self._monitor_tickers)} monitor tickers"
-            )
         except Exception as e:
             logger.error(f"Error refreshing portfolio/monitor: {e}")
 
@@ -1153,38 +1089,25 @@ class WSEngine:
             except Exception as e:
                 logger.error(f"DB writer upsert error: {e}")
             finally:
-                # FIX-15: always call task_done so queue.join() works correctly
                 self.db_write_queue.task_done()
 
     # ── PUBLIC READ HELPERS ───────────────────────────────────────────────────
 
     def get_live_snapshot(
         self,
-        limit:         int       = 1600,
+        limit:         int       = 6200,
         only_positive: bool      = True,
         source:        str       = "all",
         sector:        str       = "",
         sectors:       List[str] = None,
     ) -> List[Dict]:
         """
-        Returns live ticker data from in-memory alert_cache.
-
-        FIX-4: EARNINGS pseudo-sector handled explicitly.
-          Frontend sends sectors=["EARNINGS"]. "EARNINGS" is not a real sector
-          string in cache_entry["sector"] so the old code always returned 0 rows.
-          Now detected and mapped to is_earnings_gap_play=True filter.
-
-        sector / sectors params:
-          - sector  (str):  single sector, backward compat.
-          - sectors (list): multi-sector from frontend sidebar.
-          "ALL" or empty -> no filter applied.
-
-        Cap: portfolio/monitor uncapped; all/stock_list capped at LIVE_DISPLAY_CAP.
+        FIX-19: Default limit raised to 6200. LIVE_DISPLAY_CAP also 6200.
+        Frontend paginates at 50 rows/page so sending all tickers is fine.
         """
         with self.alert_cache_lock:
             rows = list(self.alert_cache.values())
 
-        # Source filter
         if source == "monitor":
             monitor_set = getattr(self, "_monitor_tickers", set())
             rows = [r for r in rows if r["ticker"] in monitor_set]
@@ -1192,7 +1115,6 @@ class WSEngine:
             portfolio_set = getattr(self, "_portfolio_tickers", set())
             rows = [r for r in rows if r["ticker"] in portfolio_set]
 
-        # Build active_sectors list
         active_sectors: List[str] = []
         if sectors:
             active_sectors = [s for s in sectors if s and s.upper() != "ALL"]
@@ -1205,7 +1127,6 @@ class WSEngine:
             real_sectors   = [s for s in active_sectors if s.upper() != "EARNINGS"]
 
             if wants_earnings and real_sectors:
-                # EARNINGS chip + real sector chip(s) selected simultaneously
                 lower_real = [s.lower() for s in real_sectors]
                 rows = [
                     r for r in rows
@@ -1213,10 +1134,8 @@ class WSEngine:
                     or r.get("sector", "").lower() in lower_real
                 ]
             elif wants_earnings:
-                # EARNINGS chip only
                 rows = [r for r in rows if r.get("is_earnings_gap_play")]
             else:
-                # Normal sector strings only
                 lower_real = [s.lower() for s in real_sectors]
                 rows = [r for r in rows if r.get("sector", "").lower() in lower_real]
 
@@ -1225,7 +1144,8 @@ class WSEngine:
 
         rows.sort(key=lambda r: r.get("change_value", 0), reverse=True)
 
-        cap = limit if source in ("portfolio", "monitor") else min(limit, LIVE_DISPLAY_CAP)
+        # FIX-19: Use the raised cap for all sources
+        cap = min(limit, LIVE_DISPLAY_CAP)
         return rows[:cap]
 
     def get_metrics(self) -> Dict:
@@ -1270,7 +1190,7 @@ class WSEngine:
                 "failed":           self.source_stats.get("failed",           0),
             },
             "signal_watched":       len(self._signal_watcher.watched),
-            "signal_watchlist_count": len(self._signal_watcher.watched),  # alias for clarity
+            "signal_watchlist_count": len(self._signal_watcher.watched),
             "signal_count":         len(self._signal_engine.signal_history),
             "signal_bars":          len(self._signal_engine._calcs),
         }

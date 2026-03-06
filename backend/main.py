@@ -41,11 +41,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # Try both import styles for compatibility
 try:
-    from backend.supabase_db import SupabaseDB
-    from backend.ws_engine    import WSEngine
+    from backend.supabase_db          import SupabaseDB
+    from backend.ws_engine            import WSEngine
+    from backend.market_monitor_api   import get_cached_monitor
 except ModuleNotFoundError:
-    from supabase_db import SupabaseDB
-    from ws_engine    import WSEngine
+    from supabase_db          import SupabaseDB
+    from ws_engine            import WSEngine
+    from market_monitor_api   import get_cached_monitor
 
 
 import yfinance as _yf
@@ -169,7 +171,7 @@ async def debug_sectors():
 # ── Live tickers ───────────────────────────────────────────────────────────────
 @app.get("/api/tickers")
 async def get_tickers(
-    limit:         int  = Query(1500, le=2000),
+    limit:         int  = Query(6200, le=10000),
     only_positive: bool = Query(True),
     source:        str  = Query("all"),
     sector:        str  = Query(""),        # ← SECTOR: new param
@@ -335,6 +337,80 @@ async def reset_vwap():
     return {"ok": True}
 
 
+# ── Market Monitor Tech Analysis (watchlist-driven) ────────────────────────────
+@app.get("/api/market-monitor")
+async def get_market_monitor(refresh: int = Query(0)):
+    """
+    Run market_monitor_tech analysis on the user's ★ watchlist tickers.
+    Returns RSI, ATR, Bollinger Bands, RVOL, candlestick patterns,
+    institutional footprint, FCF Yield, D/E Ratio, and composite Score.
+
+    Query params:
+      ?refresh=1  →  bypass 5-min cache, force fresh yfinance fetch
+      (default)   →  return cached result if < 5 min old
+
+    First call takes ~15–60s depending on watchlist size (up to 50 tickers).
+    Subsequent calls within 5 min return instantly from cache.
+    """
+    if not engine:
+        return {"error": "engine not ready", "data": []}
+
+    wl = engine.get_signal_watchlist()
+    tickers = wl.get("watchlist", [])
+
+    if not tickers:
+        return {
+            "data": [],
+            "ticker_count": 0,
+            "message": (
+                "No tickers in watchlist. "
+                "Star (★) some tickers in the Live Table first."
+            ),
+        }
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None, get_cached_monitor, tickers, bool(refresh)
+    )
+    return result
+
+
+# ── Pro Scalp Analysis — live indicator snapshot (watchlist-driven) ────────────
+@app.get("/api/scalp-analysis")
+async def get_scalp_analysis():
+    """
+    Returns the latest computed indicator snapshot for every tickers in the
+    user's ★ watchlist that has accumulated >= 27 bars.
+
+    Data comes directly from the in-memory ScalpingSignalEngine — zero yfinance
+    latency.  Refresh on every request (no cache needed, pure in-memory read).
+
+    Fields per ticker:
+      ticker, price, direction (LONG/SHORT/NEUTRAL), signal (BUY/SELL/HOLD),
+      strength, score, confidence, prediction (%),
+      vwap, vwap_status, vwap_pct, support, resistance,
+      candle, macd_signal, rsi, rsi_signal, stoch_k, stoch_d, stoch_signal,
+      volume (RVOL), trend, adx, adx_label, confluence (0-6), tp, sl, rr, atr,
+      bars_count, status (ok | warming_up)
+    """
+    if not engine:
+        return {"data": [], "error": "engine not ready"}
+    wl = engine.get_signal_watchlist()
+    watchlist_tickers = wl.get("watchlist", [])
+    if not watchlist_tickers:
+        return {
+            "data": [],
+            "message": "No tickers in watchlist. Star (★) some tickers in the Live Table first.",
+        }
+    rows = engine._signal_engine.get_scalp_snapshot(watchlist_tickers)
+    return {
+        "data": rows,
+        "ticker_count": len(rows),
+        "ok_count":     sum(1 for r in rows if r.get("status") == "ok"),
+        "warming_count": sum(1 for r in rows if r.get("status") == "warming_up"),
+    }
+
+
 # ── WebSocket ──────────────────────────────────────────────────────────────────
 @app.websocket("/ws/live")
 async def ws_live(websocket: WebSocket):
@@ -347,7 +423,7 @@ async def ws_live(websocket: WebSocket):
         if engine:
             import orjson
             try:
-                snapshot = engine.get_live_snapshot()
+                snapshot = engine.get_live_snapshot(limit=10000, only_positive=False)
                 ticker_count = len(snapshot)
                 logger.info(f"Sending snapshot with {ticker_count} tickers")
                 await websocket.send_bytes(orjson.dumps({

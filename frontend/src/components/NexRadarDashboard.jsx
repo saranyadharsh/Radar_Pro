@@ -1066,7 +1066,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
 // ─── PAGE: Live Table ─────────────────────────────────────────────────────────
 // • Sector filter bar with multi-select + counts + cap warning
 // • Sub-mode tabs: MH (Market Hours) / AH (After Hours)
-// • MH cols: SYMBOL+name+open | PRICE | CHANGE | %CHG | VOLUME | VWAP | RSI | SIGNAL
+// • MH cols: SYMBOL+name+open | PRICE | $ CHG | %CHG | VOLUME | SIGNAL
 // • AH cols: SYMBOL+name | PREV CLOSE | TODAY CLOSE | LIVE PRICE | CHANGE | %CHG
 // • Source: ALL / WATCHLIST / (Yahoo Finance | TradingView) replaces PORTFOLIO
 // • Matrix view: top 50 clean TradingView charts
@@ -1088,6 +1088,24 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
   const [watchlist, setWatchlist] = useState(new Set()); // ★ Persisted signal watchlist
   const tableScrollRef = useRef(null); // Ref for scroll-to-top on page change
   const ITEMS_PER_PAGE = 50;
+
+  // ── Scalp signal map — BUY/SELL/HOLD badges in SIGNAL column ─────────────
+  const [scalpSignals, setScalpSignals] = useState({}); // { TICKER: { signal, direction, strength, confidence } }
+  useEffect(() => {
+    const fetchScalp = () =>
+      fetch(`${API_BASE}/api/scalp-analysis`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+          if (!d?.data) return;
+          const m = {};
+          d.data.forEach(r => { if (r.status === "ok") m[r.ticker] = r; });
+          setScalpSignals(m);
+        })
+        .catch(() => {});
+    fetchScalp();
+    const id = setInterval(fetchScalp, 30_000); // refresh every 30s
+    return () => clearInterval(id);
+  }, []);
   
   // Fetch earnings for EARNINGS sector filter
   const [earningsTickers, setEarningsTickers] = useState(new Set());
@@ -1248,9 +1266,7 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
     { key:"change",   label:"$ CHG",       w:"1fr" },
     { key:"pct",      label:"% CHG",       w:"1fr" },
     { key:"volume",   label:"VOLUME",      w:"1fr" },
-    { key:"vwap",     label:"VWAP",        w:"1fr" },
-    { key:"rsi",      label:"RSI",         w:"1fr" },
-    { key:"signal",   label:"SIGNAL",      w:"1fr" },
+    { key:"signal",   label:"SIGNAL",      w:"120px" },
   ];
 
   // AH column definitions
@@ -1465,15 +1481,28 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
                         <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
                           {fmtVol(ticker.volume || 0)}
                         </div>
-                        {/* VWAP */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>—</div>
-                        {/* RSI */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>—</div>
-                        {/* Signal */}
-                        <div style={{ padding:"10px 14px", display:"flex", alignItems:"center" }}>
-                          {ticker.volume_spike && (
-                            <span style={{ color:T.orange, fontSize:10, fontFamily:T.font, background:T.orangeDim, padding:"3px 8px", borderRadius:4, fontWeight:600 }}>VOL</span>
-                          )}
+                        {/* SIGNAL — from scalp analysis engine */}
+                        <div style={{ padding:"10px 14px", display:"flex", alignItems:"center", gap:5 }}>
+                          {(() => {
+                            const sig = scalpSignals[ticker.ticker];
+                            if (!sig) {
+                              return ticker.volume_spike
+                                ? <span style={{ color:T.orange, fontSize:10, fontFamily:T.font, background:T.orangeDim, padding:"3px 8px", borderRadius:4, fontWeight:600 }}>VOL⚡</span>
+                                : <span style={{ color:T.text2, fontSize:11 }}>—</span>;
+                            }
+                            const clr = sig.signal === "BUY" ? T.green : sig.signal === "SELL" ? T.red : T.text2;
+                            const bg  = sig.signal === "BUY" ? T.greenDim : sig.signal === "SELL" ? T.redDim : T.bg2;
+                            return (
+                              <div style={{ display:"flex", flexDirection:"column", gap:3 }}>
+                                <span style={{ color:clr, fontSize:11, fontFamily:T.font, fontWeight:800, background:bg, padding:"3px 8px", borderRadius:4, letterSpacing:0.5 }}>
+                                  {sig.signal === "BUY" ? "▲ BUY" : sig.signal === "SELL" ? "▼ SELL" : "◈ HOLD"}
+                                </span>
+                                <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>
+                                  {sig.strength} · {sig.prediction}%
+                                </span>
+                              </div>
+                            );
+                          })()}
                         </div>
                       </>
                     ) : (
@@ -1870,205 +1899,596 @@ function PageChart({ T }) {
 }
 
 
-// ─── PAGE: Signals (PRESERVED as-is) ─────────────────────────────────────────
-// ─── PAGE: Signals - Uses live ticker data directly ──────────────────────────
+// ─── PAGE: Signals - Scalp Signals + Pro Scalp Analysis + Tech Analysis ───────
 function PageSignals({ tickers = new Map(), selectedSectors = ["ALL"], T }) {
-  const [filter, setFilter] = useState("ALL");
-  const [minStrength, setMinStrength] = useState("WEAK");
+  const [signalView, setSignalView] = useState("SIGNALS"); // "SIGNALS" | "TECH"
 
-  // Convert tickers to signals based on live data
-  const signals = useMemo(() => {
-    const tickerArray = Array.from(tickers.values());
-    
-    return tickerArray
-      .filter(ticker => {
-        // Filter by sector
-        if (!selectedSectors.includes("ALL")) {
-          const tickerSector = normalizeSector(ticker.sector);
-          if (!tickerSector || !selectedSectors.some(s => tickerSector === s)) {
-            return false;
-          }
-        }
-        
-        // Must have significant movement
-        return Math.abs(ticker.percent_change || 0) >= 1;
+  // ── PRO SCALP (Signals tab) state ──────────────────────────────────────────
+  const [proData,    setProData]    = useState([]);
+  const [proLoading, setProLoading] = useState(false);
+  const [proError,   setProError]   = useState(null);
+  const [proFilter,  setProFilter]  = useState("ALL"); // ALL|BUY|SELL|STRONG
+  const [proSort,    setProSort]    = useState("confidence");
+  const [proSortAsc, setProSortAsc] = useState(false);
+  const proIntervalRef = useRef(null);
+
+  const fetchProData = () => {
+    setProLoading(true); setProError(null);
+    fetch(`${API_BASE}/api/scalp-analysis`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then(d => { setProData(d.data || []); })
+      .catch(e => setProError(e.message))
+      .finally(() => setProLoading(false));
+  };
+
+  // Auto-fetch + 30s poll when Signals tab active
+  useEffect(() => {
+    if (signalView === "SIGNALS") {
+      fetchProData();
+      proIntervalRef.current = setInterval(fetchProData, 30_000);
+    } else {
+      clearInterval(proIntervalRef.current);
+    }
+    return () => clearInterval(proIntervalRef.current);
+  }, [signalView]);
+
+  // ── TECH ANALYSIS state (unchanged) ───────────────────────────────────────
+  const [techData,      setTechData]      = useState([]);
+  const [techLoading,   setTechLoading]   = useState(false);
+  const [techError,     setTechError]     = useState(null);
+  const [techLastFetch, setTechLastFetch] = useState(null);
+  const [techCached,    setTechCached]    = useState(false);
+  const [techSortKey,   setTechSortKey]   = useState("score");
+  const [techSortAsc,   setTechSortAsc]   = useState(false);
+  const [techFilter,    setTechFilter]    = useState("ALL");
+
+  const fetchTechData = (forceRefresh = false) => {
+    setTechLoading(true); setTechError(null);
+    fetch(`${API_BASE}/api/market-monitor${forceRefresh ? "?refresh=1" : ""}`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then(json => {
+        if (json.error) { setTechError(json.error); return; }
+        setTechData(json.data || []);
+        setTechCached(json.cached || false);
+        setTechLastFetch(new Date());
       })
-      .map(ticker => {
-        const isPositive = (ticker.percent_change || 0) > 0;
-        const absChange = Math.abs(ticker.percent_change || 0);
-        
-        // Determine strength based on % change
-        let strength = 'WEAK';
-        if (absChange >= 5) strength = 'STRONG';
-        else if (absChange >= 3) strength = 'MEDIUM';
-        
-        // Determine direction
-        const direction = isPositive ? 'LONG' : 'SHORT';
-        
-        // Build reasons
-        const reasons = [];
-        if (absChange >= 5) reasons.push('Strong momentum');
-        if (ticker.volume_spike) reasons.push('Volume spike');
-        if (absChange >= 3) reasons.push('Significant move');
-        
-        return {
-          ticker: ticker.ticker,
-          company: ticker.company_name || ticker.ticker,
-          direction,
-          strength,
-          price: ticker.live_price || 0,
-          change: ticker.change_value || 0,
-          pct: ticker.percent_change || 0,
-          volume: ticker.volume || 0,
-          reasons,
-          timestamp: new Date().toISOString(),
-        };
-      })
-      .sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct));
-  }, [tickers, selectedSectors]);
+      .catch(err => setTechError(err.message))
+      .finally(() => setTechLoading(false));
+  };
 
-  // Filter signals
-  const filteredSignals = useMemo(() => {
-    let filtered = signals;
-    
-    // Filter by direction
-    if (filter === "LONG") filtered = filtered.filter(s => s.direction === "LONG");
-    else if (filter === "SHORT") filtered = filtered.filter(s => s.direction === "SHORT");
-    
-    // Filter by strength
-    if (minStrength === "MEDIUM") filtered = filtered.filter(s => s.strength !== "WEAK");
-    else if (minStrength === "STRONG") filtered = filtered.filter(s => s.strength === "STRONG");
-    
-    return filtered;
-  }, [signals, filter, minStrength]);
+  useEffect(() => {
+    if (signalView === "TECH" && techData.length === 0 && !techLoading) fetchTechData();
+  }, [signalView]);
 
+  // ── PRO SCALP processed rows ───────────────────────────────────────────────
+  const proRows = useMemo(() => {
+    let rows = proData.filter(r => r.status === "ok");
+    if (proFilter === "BUY")    rows = rows.filter(r => r.signal === "BUY");
+    else if (proFilter === "SELL")   rows = rows.filter(r => r.signal === "SELL");
+    else if (proFilter === "STRONG") rows = rows.filter(r => r.strength === "STRONG");
+    rows = [...rows].sort((a, b) => {
+      let va = a[proSort] ?? 0, vb = b[proSort] ?? 0;
+      if (typeof va === "string") return proSortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+      return proSortAsc ? va - vb : vb - va;
+    });
+    return rows;
+  }, [proData, proFilter, proSort, proSortAsc]);
+
+  const proWarmingUp = proData.filter(r => r.status === "warming_up");
+  const proStats = useMemo(() => ({
+    buy:    proData.filter(r => r.signal === "BUY").length,
+    sell:   proData.filter(r => r.signal === "SELL").length,
+    strong: proData.filter(r => r.strength === "STRONG").length,
+    total:  proData.filter(r => r.status === "ok").length,
+  }), [proData]);
+
+  const handleProSort = key => {
+    if (proSort === key) setProSortAsc(!proSortAsc);
+    else { setProSort(key); setProSortAsc(false); }
+  };
+
+  // ── TECH processed rows (unchanged) ───────────────────────────────────────
+  const techRows = useMemo(() => {
+    let rows = [...techData];
+    if (techFilter === "BULLISH") rows = rows.filter(r => r.score > 0);
+    else if (techFilter === "BEARISH") rows = rows.filter(r => r.score < 0);
+    else if (techFilter === "ALERTS") rows = rows.filter(r => r.alerts?.length > 0);
+    rows.sort((a, b) => {
+      let va = a[techSortKey] ?? (techSortAsc ? Infinity : -Infinity);
+      let vb = b[techSortKey] ?? (techSortAsc ? Infinity : -Infinity);
+      if (typeof va === "string") return techSortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+      return techSortAsc ? va - vb : vb - va;
+    });
+    return rows;
+  }, [techData, techFilter, techSortKey, techSortAsc]);
+
+  const techStats = useMemo(() => {
+    if (!techData.length) return null;
+    return {
+      bullish:    techData.filter(r => r.score > 0).length,
+      bearish:    techData.filter(r => r.score < 0).length,
+      oversold:   techData.filter(r => r.rsi_signal === "Oversold").length,
+      overbought: techData.filter(r => r.rsi_signal === "Overbought").length,
+      alerts:     techData.filter(r => r.alerts?.length > 0).length,
+    };
+  }, [techData]);
+
+  // ── Column definitions ─────────────────────────────────────────────────────
+  const PRO_COLS = [
+    { key:"ticker",       label:"TICKER",     w:"90px"  },
+    { key:"price",        label:"PRICE",      w:"80px"  },
+    { key:"signal",       label:"SIGNAL",     w:"90px"  },
+    { key:"prediction",   label:"PRED %",     w:"70px"  },
+    { key:"vwap_status",  label:"VWAP",       w:"80px"  },
+    { key:"support",      label:"SUPPORT",    w:"80px"  },
+    { key:"resistance",   label:"RESIST",     w:"80px"  },
+    { key:"candle",       label:"CANDLE",     w:"130px" },
+    { key:"macd_signal",  label:"MACD",       w:"80px"  },
+    { key:"rsi",          label:"RSI",        w:"55px"  },
+    { key:"stoch_signal", label:"STOCH",      w:"80px"  },
+    { key:"volume",       label:"VOLUME",     w:"70px"  },
+    { key:"trend",        label:"TREND",      w:"85px"  },
+    { key:"adx",          label:"ADX",        w:"80px"  },
+    { key:"confluence",   label:"CONFLUENC",  w:"80px"  },
+    { key:"tp",           label:"TP | SL",    w:"130px" },
+  ];
+  const proGridCols = PRO_COLS.map(c => c.w).join(" ");
+
+  const TECH_COLS = [
+    { key:"ticker",         label:"TICKER",      w:"90px"  },
+    { key:"price",          label:"PRICE",       w:"80px"  },
+    { key:"score",          label:"SCORE",       w:"70px"  },
+    { key:"trend",          label:"TREND",       w:"85px"  },
+    { key:"rsi",            label:"RSI",         w:"55px"  },
+    { key:"rsi_signal",     label:"RSI SIG",     w:"90px"  },
+    { key:"bb_status",      label:"BB STATUS",   w:"135px" },
+    { key:"candlestick",    label:"CANDLE",      w:"135px" },
+    { key:"atr",            label:"ATR",         w:"65px"  },
+    { key:"rvol",           label:"RVOL",        w:"60px"  },
+    { key:"inst_footprint", label:"INST. PRINT", w:"175px" },
+    { key:"fcf_yield",      label:"FCF %",       w:"65px"  },
+    { key:"de_ratio",       label:"D/E",         w:"55px"  },
+  ];
+  const techGridCols = TECH_COLS.map(c => c.w).join(" ");
+
+  // ── Color helpers ──────────────────────────────────────────────────────────
+  const _sigClr    = s => s === "BUY" ? T.green : s === "SELL" ? T.red : T.text2;
+  const _sigBg     = s => s === "BUY" ? T.greenDim : s === "SELL" ? T.redDim : T.bg2;
+  const _vwapClr   = s => s === "ABOVE" ? T.green : T.red;
+  const _macdClr   = s => s === "Bullish" ? T.green : s === "Bearish" ? T.red : T.text2;
+  const _stochClr  = s => s === "Bullish" ? T.green : s === "Bearish" ? T.red : T.text2;
+  const _trendClr  = t => t === "Bullish" ? T.green : t === "Bearish" ? T.red : T.text2;
+  const _candleClr = p => p?.includes("Bullish") ? T.green : p?.includes("Bearish") ? T.red : p?.includes("Doji") ? T.gold : T.text2;
+  const _scoreClr  = s => s >= 3 ? T.green : s >= 1 ? T.cyan : s <= -3 ? T.red : s <= -1 ? T.orange : T.text1;
+  const _rsiClr    = (r, s) => s === "Overbought" ? T.red : s === "Oversold" ? T.green : r > 60 ? T.orange : r < 40 ? T.cyan : T.text1;
+  const _bbClr     = s => s?.includes("Overextended") ? T.red : s?.includes("Bounce") ? T.green : T.text2;
+  const _instClr   = s => s?.includes("Accumulation") ? T.green : s?.includes("Distribution") ? T.red : T.text2;
+  const handleTechSort = key => {
+    if (techSortKey === key) setTechSortAsc(!techSortAsc);
+    else { setTechSortKey(key); setTechSortAsc(false); }
+  };
+
+  // ── RENDER ─────────────────────────────────────────────────────────────────
   return (
     <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:16 }}>
-      {/* Filter Controls */}
-      <div style={{ display:"flex", gap:7, flexWrap:"wrap", alignItems:"center" }}>
-        {["ALL","LONG","SHORT"].map(f=>(
-          <button key={f}
-            style={{ background:filter===f?T.cyanDim:T.bg2, border:`1px solid ${filter===f?T.cyanMid:T.border}`, color:filter===f?T.cyan:T.text2, borderRadius:5, padding:"5px 11px", cursor:"pointer", fontFamily:T.font, fontSize:9.5, letterSpacing:1, fontWeight:600 }}
-            onClick={()=>setFilter(f)}>{f}</button>
-        ))}
-        <div style={{ marginLeft:"auto", display:"flex", gap:7, alignItems:"center" }}>
-          <span style={{ color:T.text2, fontSize:9.5, fontFamily:T.font, fontWeight:600 }}>MIN STRENGTH</span>
-          {["WEAK","MEDIUM","STRONG"].map(s=>(
-            <button key={s}
-              className={minStrength===s?"btn-primary":"btn-ghost"}
-              style={{ fontSize:9, fontWeight:600 }}
-              onClick={()=>setMinStrength(s)}>{s}</button>
-          ))}
+
+      {/* ── TAB BAR + STATS + FILTERS — single unified row ── */}
+      <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+
+        {/* Tab toggle */}
+        <div style={{ display:"flex", background:T.bg0, border:`1px solid ${T.border}`, borderRadius:8, overflow:"hidden", boxShadow:`0 1px 4px ${T.bg0}` }}>
+          <button onClick={() => setSignalView("SIGNALS")}
+            style={{
+              background: signalView==="SIGNALS" ? T.cyan : "transparent",
+              color: signalView==="SIGNALS" ? "#000" : T.text2,
+              border:"none", borderRight:`1px solid ${T.border}`,
+              padding:"8px 20px", cursor:"pointer",
+              fontFamily:T.font, fontSize:10.5, letterSpacing:0.7, fontWeight:700,
+              transition:"all 0.15s",
+            }}>
+            ◉ SIGNALS
+          </button>
+          <button onClick={() => setSignalView("TECH")}
+            style={{
+              background: signalView==="TECH" ? T.cyan+"22" : "transparent",
+              color: signalView==="TECH" ? T.cyan : T.text2,
+              border:"none",
+              padding:"8px 20px", cursor:"pointer",
+              fontFamily:T.font, fontSize:10.5, letterSpacing:0.7, fontWeight:600,
+              transition:"all 0.15s",
+            }}>
+            ◈ TECH ANALYSIS
+          </button>
         </div>
+
+        {/* Divider */}
+        <div style={{ width:1, height:22, background:T.border, flexShrink:0 }}/>
+
+        {/* ── Inline stat badges (always visible, context-sensitive) ── */}
+        {signalView === "SIGNALS" && (
+          <>
+            {[
+              { lbl:"BUY",   val:proStats.buy,    clr:T.green  },
+              { lbl:"SELL",  val:proStats.sell,   clr:T.red    },
+              { lbl:"STRNG", val:proStats.strong, clr:T.purple },
+              { lbl:"WATCH", val:proData.length,  clr:T.cyan   },
+            ].map(s => (
+              <div key={s.lbl} style={{ display:"flex", alignItems:"center", gap:5,
+                background:T.bg2, border:`1px solid ${T.border}`, borderRadius:5, padding:"4px 10px" }}>
+                <span style={{ color:T.text2, fontSize:8.5, fontFamily:T.font, letterSpacing:0.8 }}>{s.lbl}</span>
+                <span style={{ color:s.clr, fontSize:14, fontFamily:T.font, fontWeight:800, lineHeight:1 }}>{s.val}</span>
+              </div>
+            ))}
+
+            {/* Divider */}
+            <div style={{ width:1, height:22, background:T.border, flexShrink:0 }}/>
+
+            {/* Filter pills */}
+            {[
+              ["ALL",    `ALL (${proStats.total})`      ],
+              ["BUY",    `▲ BUY (${proStats.buy})`      ],
+              ["SELL",   `▼ SELL (${proStats.sell})`    ],
+              ["STRONG", `⚡ STRONG (${proStats.strong})`],
+            ].map(([key, lbl]) => (
+              <button key={key} onClick={() => setProFilter(key)}
+                style={{
+                  background: proFilter===key ? T.cyan+"14" : "transparent",
+                  border: `1px solid ${proFilter===key ? T.cyan+"45" : T.border}`,
+                  color: proFilter===key ? T.cyan : T.text2,
+                  borderRadius:5, padding:"5px 11px", cursor:"pointer",
+                  fontFamily:T.font, fontSize:9.5, fontWeight:600,
+                }}>
+                {lbl}
+              </button>
+            ))}
+
+            {/* Warming up + refresh */}
+            <div style={{ marginLeft:"auto", display:"flex", gap:6, alignItems:"center" }}>
+              {proWarmingUp.length > 0 && (
+                <span style={{ color:T.text2, fontSize:9.5, fontFamily:T.font }}>
+                  ⏳ {proWarmingUp.length} warming
+                </span>
+              )}
+              <button onClick={fetchProData} disabled={proLoading}
+                style={{ background:T.bg2, border:`1px solid ${T.border}`, color:T.text1,
+                  borderRadius:5, padding:"5px 12px", cursor:proLoading?"wait":"pointer",
+                  fontFamily:T.font, fontSize:10, fontWeight:600, opacity:proLoading?0.5:1 }}>
+                {proLoading ? "⏳" : "🔄"} {proLoading ? "Loading…" : "Refresh"}
+              </button>
+            </div>
+          </>
+        )}
+
+        {/* ── TECH tab filters ── */}
+        {signalView === "TECH" && (
+          <>
+            {techStats && (
+              <>
+                {[
+                  { lbl:"BULL",  val:techStats.bullish,    clr:T.green },
+                  { lbl:"BEAR",  val:techStats.bearish,    clr:T.red   },
+                  { lbl:"ALERT", val:techStats.alerts,     clr:T.gold  },
+                ].map(s => (
+                  <div key={s.lbl} style={{ display:"flex", alignItems:"center", gap:5,
+                    background:T.bg2, border:`1px solid ${T.border}`, borderRadius:5, padding:"4px 10px" }}>
+                    <span style={{ color:T.text2, fontSize:8.5, fontFamily:T.font, letterSpacing:0.8 }}>{s.lbl}</span>
+                    <span style={{ color:s.clr, fontSize:14, fontFamily:T.font, fontWeight:800, lineHeight:1 }}>{s.val}</span>
+                  </div>
+                ))}
+                <div style={{ width:1, height:22, background:T.border, flexShrink:0 }}/>
+              </>
+            )}
+
+            {["ALL","BULLISH","BEARISH","ALERTS"].map(f => (
+              <button key={f} onClick={() => setTechFilter(f)}
+                style={{
+                  background: techFilter===f ? T.cyan+"14" : "transparent",
+                  border: `1px solid ${techFilter===f ? T.cyan+"45" : T.border}`,
+                  color: techFilter===f ? T.cyan : T.text2,
+                  borderRadius:5, padding:"5px 11px", cursor:"pointer",
+                  fontFamily:T.font, fontSize:9.5, fontWeight:600, letterSpacing:0.3,
+                }}>
+                {f==="BULLISH"?"▲ ":f==="BEARISH"?"▼ ":f==="ALERTS"?"🚨 ":""}
+                {f}
+                {techStats && f==="ALL"     ? ` (${techData.length})`    : ""}
+                {techStats && f==="BULLISH" ? ` (${techStats.bullish})`  : ""}
+                {techStats && f==="BEARISH" ? ` (${techStats.bearish})`  : ""}
+                {techStats && f==="ALERTS"  ? ` (${techStats.alerts})`   : ""}
+              </button>
+            ))}
+
+            <div style={{ marginLeft:"auto", display:"flex", gap:6, alignItems:"center" }}>
+              {techLastFetch && (
+                <span style={{ color:T.text2, fontSize:9.5, fontFamily:T.font }}>
+                  {techCached ? "📦" : "✅"} {techLastFetch.toLocaleTimeString()}
+                </span>
+              )}
+              <button onClick={() => fetchTechData(false)} disabled={techLoading}
+                style={{ background:T.bg2, border:`1px solid ${T.border}`, color:T.text1,
+                  borderRadius:5, padding:"5px 12px", cursor:techLoading?"wait":"pointer",
+                  fontFamily:T.font, fontSize:10, fontWeight:600, opacity:techLoading?0.5:1 }}>
+                {techLoading ? "⏳ Loading…" : "🔄 Refresh"}
+              </button>
+              <button onClick={() => fetchTechData(true)} disabled={techLoading}
+                style={{ background:T.cyanDim, border:`1px solid ${T.cyanMid}`, color:T.cyan,
+                  borderRadius:5, padding:"5px 12px", cursor:techLoading?"wait":"pointer",
+                  fontFamily:T.font, fontSize:10, fontWeight:700, opacity:techLoading?0.5:1 }}>
+                ⚡ Force
+              </button>
+            </div>
+          </>
+        )}
       </div>
 
-      {/* Signal Feed Card */}
-      <div className="card">
-        <SectionHeader title="Scalp Signals" T={T}>
-          <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-            {tickers.size > 0 ? (
-              <>
-                <span className="live-dot"/>
-                <span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:700 }}>LIVE</span>
-              </>
-            ) : (
-              <span style={{ color:T.text2, fontSize:12, fontFamily:T.font, fontWeight:600 }}>CONNECTING…</span>
-            )}
-          </div>
-        </SectionHeader>
+      {/* ═══ SIGNALS VIEW (Pro Scalp table) ═══ */}
+      {signalView === "SIGNALS" && (
+        <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
 
-        {/* Scrollable Signal List */}
-        <div style={{ maxHeight:"calc(100vh - 350px)", minHeight:"400px", overflowY:"auto", position:"relative" }}>
-          {filteredSignals.length === 0 ? (
-            <EmptyState 
-              icon="◉" 
-              label={tickers.size === 0 ? "CONNECTING TO BACKEND" : "NO SIGNALS"} 
-              sub={tickers.size === 0 ? "Waiting for live data stream..." : "Signals will appear when stocks show significant movement (>1% change)"} 
-              h={300} 
-              T={T}
-            />
-          ) : (
-            <>
-              <div style={{ padding:14, display:"flex", flexDirection:"column", gap:10 }}>
-                {filteredSignals.map((sig, i) => (
-                  <div key={i}
-                    style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:8, padding:14, transition:"all 0.2s" }}
-                    onMouseEnter={e => e.currentTarget.style.borderColor = T.borderHi}
-                    onMouseLeave={e => e.currentTarget.style.borderColor = T.border}>
-                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
-                      <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-                        <span style={{ color:T.text0, fontSize:16, fontFamily:T.font, fontWeight:700 }}>{sig.ticker}</span>
-                        <span style={{
-                          color: sig.direction === 'LONG' ? T.green : T.red,
-                          fontSize:10,
-                          fontFamily:T.font,
-                          fontWeight:700,
-                          padding:"3px 8px",
-                          background: sig.direction === 'LONG' ? T.greenDim : T.redDim,
-                          borderRadius:4
-                        }}>{sig.direction}</span>
-                        <span style={{
-                          color: sig.strength === 'STRONG' ? T.purple : sig.strength === 'MEDIUM' ? T.cyan : T.text2,
-                          fontSize:8,
-                          fontFamily:T.font,
-                          letterSpacing:1,
-                          fontWeight:700
-                        }}>{sig.strength}</span>
-                      </div>
-                      <div style={{ color:T.text2, fontSize:9, fontFamily:T.font, fontWeight:600 }}>
-                        {new Date(sig.timestamp).toLocaleTimeString()}
-                      </div>
-                    </div>
+          {/* Error */}
+          {proError && (
+            <div style={{ background:T.red+"10", border:`1px solid ${T.red}30`, borderRadius:8, padding:20, textAlign:"center" }}>
+              <div style={{ fontSize:24, marginBottom:8 }}>⚠️</div>
+              <div style={{ color:T.red, fontFamily:T.font, fontSize:13 }}>{proError}</div>
+            </div>
+          )}
 
-                    <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10, marginBottom:10 }}>
-                      {[
-                        ['PRICE', `$${fmt2(sig.price)}`, T.cyan],
-                        ['CHANGE', `${sig.change >= 0 ? '+' : ''}${fmt2(sig.change)}`, sig.change >= 0 ? T.green : T.red],
-                        ['% CHG', pct(sig.pct), sig.pct >= 0 ? T.green : T.red],
-                        ['VOLUME', fmtVol(sig.volume), T.text1]
-                      ].map(([label, value, color]) => (
-                        <div key={label}>
-                          <div style={{ color:T.text2, fontSize:8, fontFamily:T.font, marginBottom:4, fontWeight:600 }}>{label}</div>
-                          <div style={{ color, fontSize:13, fontFamily:T.font, fontWeight:700 }}>{value}</div>
-                        </div>
-                      ))}
-                    </div>
+          {/* Empty watchlist */}
+          {!proLoading && !proError && proData.length === 0 && (
+            <EmptyState icon="📊" label="NO WATCHLIST TICKERS"
+              sub="Star (★) some tickers in the Live Table. Signals run real-time indicator analysis on your ★ watchlist." h={240} T={T}/>
+          )}
 
-                    {sig.reasons.length > 0 && (
-                      <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
-                        {sig.reasons.map((reason, j) => (
-                          <span key={j} style={{
-                            color:T.text1,
-                            fontSize:8,
-                            fontFamily:T.font,
-                            background:T.bg0,
-                            padding:"4px 8px",
-                            borderRadius:4,
-                            fontWeight:600
-                          }}>• {reason}</span>
-                        ))}
-                      </div>
-                    )}
+          {/* Loading shimmer */}
+          {proLoading && proData.length === 0 && (
+            <div className="card" style={{ overflow:"hidden" }}>
+              {Array(6).fill(0).map((_,i) => (
+                <div key={i} style={{ display:"flex", gap:16, padding:"12px 16px", borderBottom:`1px solid ${T.border}` }}>
+                  {Array(8).fill(0).map((_,j) => (<div key={j} className="shimmer-box" style={{ height:14, flex:1 }}/>))}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Pro Scalp data table */}
+          {proRows.length > 0 && (
+            <div className="card" style={{ overflow:"hidden" }}>
+              {/* Sticky header */}
+              <div style={{ display:"grid", gridTemplateColumns:proGridCols, background:T.bg0, borderBottom:`2px solid ${T.border}`, position:"sticky", top:0, zIndex:5, overflowX:"auto" }}>
+                {PRO_COLS.map(col => (
+                  <div key={col.key} onClick={() => handleProSort(col.key)}
+                    style={{ padding:"10px 8px", color:T.text0, fontSize:9.5, letterSpacing:1, fontFamily:T.font, fontWeight:800, textTransform:"uppercase", cursor:"pointer", whiteSpace:"nowrap", background:proSort===col.key ? T.cyan+"08" : "transparent" }}>
+                    {col.label}{proSort===col.key ? (proSortAsc?" ↑":" ↓") : ""}
                   </div>
                 ))}
               </div>
-              
-              {/* Bottom fade gradient — purely decorative */}
-              {filteredSignals.length >= 5 && (
-                <div style={{ 
-                  position:"sticky", 
-                  bottom:0, 
-                  left:0, 
-                  right:0, 
-                  height:40,
-                  background:`linear-gradient(to bottom, transparent, ${T.bg1})`,
-                  pointerEvents:"none"
-                }}/>
-              )}
-            </>
+
+              {/* Rows */}
+              <div style={{ maxHeight:"calc(100vh - 420px)", overflowY:"auto", overflowX:"auto" }}>
+                {proRows.map(row => (
+                  <div key={row.ticker} className="tr-hover"
+                    style={{ display:"grid", gridTemplateColumns:proGridCols, borderBottom:`1px solid ${T.border}` }}>
+                    {/* Ticker */}
+                    <div style={{ padding:"10px 8px" }}>
+                      <span style={{ color:T.cyan, fontSize:12, fontWeight:700, fontFamily:T.font }}>{row.ticker}</span>
+                    </div>
+                    {/* Price */}
+                    <div style={{ padding:"10px 8px", color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:600, display:"flex", alignItems:"center" }}>
+                      ${fmt2(row.price)}
+                    </div>
+                    {/* Signal */}
+                    <div style={{ padding:"10px 8px", display:"flex", alignItems:"center" }}>
+                      <span style={{ color:_sigClr(row.signal), fontSize:11, fontWeight:800, fontFamily:T.font, padding:"2px 8px", borderRadius:4, background:_sigBg(row.signal), letterSpacing:0.5 }}>
+                        {row.signal === "BUY" ? "▲ BUY" : row.signal === "SELL" ? "▼ SELL" : "◈ HOLD"}
+                      </span>
+                    </div>
+                    {/* Prediction % */}
+                    <div style={{ padding:"10px 8px", display:"flex", alignItems:"center" }}>
+                      <span style={{ color:_sigClr(row.signal), fontSize:12, fontWeight:700, fontFamily:T.font }}>
+                        {row.prediction}%
+                      </span>
+                    </div>
+                    {/* VWAP */}
+                    <div style={{ padding:"10px 8px", display:"flex", alignItems:"center" }}>
+                      <span style={{ color:_vwapClr(row.vwap_status), fontSize:10, fontWeight:700, fontFamily:T.font, padding:"2px 6px", borderRadius:4, background:_vwapClr(row.vwap_status)+"15" }}>
+                        {row.vwap_status}
+                      </span>
+                    </div>
+                    {/* Support */}
+                    <div style={{ padding:"10px 8px", color:T.green, fontSize:11, fontFamily:T.font, fontWeight:600, display:"flex", alignItems:"center" }}>
+                      ${fmt2(row.support)}
+                    </div>
+                    {/* Resistance */}
+                    <div style={{ padding:"10px 8px", color:T.red, fontSize:11, fontFamily:T.font, fontWeight:600, display:"flex", alignItems:"center" }}>
+                      ${fmt2(row.resistance)}
+                    </div>
+                    {/* Candle */}
+                    <div style={{ padding:"10px 8px", color:_candleClr(row.candle), fontSize:9.5, fontWeight:600, fontFamily:T.font, display:"flex", alignItems:"center" }}>
+                      {row.candle}
+                    </div>
+                    {/* MACD */}
+                    <div style={{ padding:"10px 8px", display:"flex", alignItems:"center" }}>
+                      <span style={{ color:_macdClr(row.macd_signal), fontSize:9.5, fontWeight:700, fontFamily:T.font, padding:"2px 6px", borderRadius:4, background:_macdClr(row.macd_signal)+"15" }}>
+                        {row.macd_signal}
+                      </span>
+                    </div>
+                    {/* RSI */}
+                    <div style={{ padding:"10px 8px", display:"flex", flexDirection:"column", gap:2, justifyContent:"center" }}>
+                      <span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{row.rsi}</span>
+                      <span style={{ color:_rsiClr(row.rsi, row.rsi_signal), fontSize:9, fontFamily:T.font }}>{row.rsi_signal}</span>
+                    </div>
+                    {/* Stoch */}
+                    <div style={{ padding:"10px 8px", display:"flex", alignItems:"center" }}>
+                      <span style={{ color:_stochClr(row.stoch_signal), fontSize:9.5, fontWeight:700, fontFamily:T.font, padding:"2px 6px", borderRadius:4, background:_stochClr(row.stoch_signal)+"15" }}>
+                        {row.stoch_signal}
+                      </span>
+                    </div>
+                    {/* Volume RVOL */}
+                    <div style={{ padding:"10px 8px", fontSize:11, fontFamily:T.font, fontWeight:600, display:"flex", alignItems:"center", color:row.volume >= 2.0 ? T.orange : T.text1 }}>
+                      {row.volume?.toFixed(1)}x
+                    </div>
+                    {/* Trend */}
+                    <div style={{ padding:"10px 8px", display:"flex", alignItems:"center" }}>
+                      <span style={{ color:_trendClr(row.trend), fontSize:10, fontWeight:700, fontFamily:T.font, padding:"2px 6px", borderRadius:4, background:_trendClr(row.trend)+"12" }}>
+                        {row.trend === "Bullish" ? "▲" : row.trend === "Bearish" ? "▼" : "—"} {row.trend}
+                      </span>
+                    </div>
+                    {/* ADX */}
+                    <div style={{ padding:"10px 8px", display:"flex", flexDirection:"column", gap:2, justifyContent:"center" }}>
+                      <span style={{ color:row.adx >= 40 ? T.purple : row.adx >= 25 ? T.cyan : T.text2, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{row.adx}</span>
+                      <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>{row.adx_label}</span>
+                    </div>
+                    {/* Confluence */}
+                    <div style={{ padding:"10px 8px", display:"flex", alignItems:"center", gap:4 }}>
+                      <span style={{ color:row.confluence >= 5 ? T.green : row.confluence >= 3 ? T.cyan : T.text2, fontSize:13, fontFamily:T.font, fontWeight:800 }}>
+                        {row.confluence}
+                      </span>
+                      <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>/6</span>
+                    </div>
+                    {/* TP | SL */}
+                    <div style={{ padding:"10px 8px", display:"flex", flexDirection:"column", gap:2, justifyContent:"center" }}>
+                      <span style={{ color:T.green, fontSize:10, fontFamily:T.font, fontWeight:600 }}>TP ${fmt2(row.tp)}</span>
+                      <span style={{ color:T.red,   fontSize:10, fontFamily:T.font, fontWeight:600 }}>SL ${fmt2(row.sl)}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Footer */}
+              <div style={{ padding:"10px 16px", borderTop:`2px solid ${T.border}`, display:"flex", justifyContent:"space-between", alignItems:"center", background:T.bg0 }}>
+                <span style={{ color:T.text1, fontSize:12, fontFamily:T.font, fontWeight:600 }}>
+                  {proRows.length} of {proStats.total} ready · {proWarmingUp.length} warming up
+                </span>
+                <span style={{ color:T.text2, fontSize:10, fontFamily:T.font }}>
+                  ★ Watchlist · Live indicators · Auto-refresh 30s
+                </span>
+              </div>
+            </div>
           )}
         </div>
-      </div>
+      )}
+
+      {/* ═══ TECH ANALYSIS VIEW ═══ */}
+      {signalView === "TECH" && (
+        <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+
+          {/* Active alerts banner */}
+          {techData.some(r => r.alerts?.length > 0) && (
+            <div style={{ background:T.gold+"08", border:`1px solid ${T.gold}30`, borderRadius:8, padding:"10px 16px" }}>
+              <div style={{ color:T.gold, fontSize:11, fontWeight:700, fontFamily:T.font, marginBottom:6 }}>🚨 ACTIVE ALERTS</div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                {techData.filter(r => r.alerts?.length > 0).flatMap(r =>
+                  r.alerts.map((a, i) => (
+                    <span key={`${r.ticker}-${i}`} style={{
+                      background: a.type==="whale" ? T.cyan+"18" : a.type==="triple_bounce" ? T.green+"18" : T.gold+"18",
+                      border: `1px solid ${a.type==="whale" ? T.cyan+"40" : a.type==="triple_bounce" ? T.green+"40" : T.gold+"40"}`,
+                      color: a.type==="whale" ? T.cyan : a.type==="triple_bounce" ? T.green : T.gold,
+                      borderRadius:5, padding:"3px 8px", fontSize:10, fontWeight:700, fontFamily:T.font,
+                    }}>
+                      {a.type==="whale"?"🐋":a.type==="triple_bounce"?"💎":"🚨"} {r.ticker}: {a.text}
+                    </span>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Error state */}
+          {techError && (
+            <div style={{ background:T.red+"10", border:`1px solid ${T.red}30`, borderRadius:8, padding:20, textAlign:"center" }}>
+              <div style={{ fontSize:28, marginBottom:8 }}>⚠️</div>
+              <div style={{ color:T.red, fontFamily:T.font, fontSize:13, fontWeight:600 }}>{techError}</div>
+            </div>
+          )}
+
+          {/* Empty watchlist */}
+          {!techLoading && !techError && techData.length === 0 && (
+            <EmptyState icon="◇" label="NO WATCHLIST TICKERS"
+              sub="Star (★) some tickers in the Live Table first. Tech analysis uses yfinance 3mo data on your ★ watchlist." h={240} T={T}/>
+          )}
+
+          {/* Loading shimmer */}
+          {techLoading && techData.length === 0 && (
+            <div className="card" style={{ overflow:"hidden" }}>
+              {Array(8).fill(0).map((_,i) => (
+                <div key={i} style={{ display:"flex", gap:16, padding:"12px 16px", borderBottom:`1px solid ${T.border}` }}>
+                  {Array(6).fill(0).map((_,j) => (<div key={j} className="shimmer-box" style={{ height:14, flex:1 }}/>))}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Tech Analysis data table */}
+          {techRows.length > 0 && (
+            <div className="card" style={{ overflow:"hidden" }}>
+              {/* Sticky header */}
+              <div style={{ display:"grid", gridTemplateColumns:techGridCols, background:T.bg0, borderBottom:`2px solid ${T.border}`, position:"sticky", top:0, zIndex:5, overflowX:"auto" }}>
+                {TECH_COLS.map(col => (
+                  <div key={col.key} onClick={() => handleTechSort(col.key)}
+                    style={{ padding:"10px 8px", color:T.text0, fontSize:9.5, letterSpacing:1, fontFamily:T.font, fontWeight:800, textTransform:"uppercase", cursor:"pointer", whiteSpace:"nowrap", background:techSortKey===col.key ? T.cyan+"08" : "transparent" }}>
+                    {col.label}{techSortKey===col.key ? (techSortAsc?" ↑":" ↓") : ""}
+                  </div>
+                ))}
+              </div>
+
+              {/* Scrollable rows */}
+              <div style={{ maxHeight:"calc(100vh - 420px)", overflowY:"auto", overflowX:"auto" }}>
+                {techRows.map(row => (
+                  <div key={row.ticker} className="tr-hover"
+                    style={{ display:"grid", gridTemplateColumns:techGridCols, borderBottom:`1px solid ${T.border}` }}>
+                    {/* Ticker + alert badges */}
+                    <div style={{ padding:"9px 8px" }}>
+                      <span style={{ color:T.cyan, fontSize:12, fontWeight:700, fontFamily:T.font }}>{row.ticker}</span>
+                      {row.alerts?.length > 0 && (
+                        <div style={{ display:"flex", gap:2, marginTop:2 }}>
+                          {row.alerts.map((a,j) => (
+                            <span key={j} style={{ fontSize:8, padding:"1px 4px", borderRadius:3, background:T.gold+"15", color:T.gold, fontWeight:700 }}>
+                              {a.type==="whale"?"🐋":a.type==="triple_bounce"?"💎":"🚨"}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ padding:"9px 8px", color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:600, display:"flex", alignItems:"center" }}>${fmt2(row.price)}</div>
+                    <div style={{ padding:"9px 8px", display:"flex", alignItems:"center", justifyContent:"center" }}>
+                      <span style={{ color:_scoreClr(row.score), fontSize:13, fontWeight:800, fontFamily:T.font }}>{row.score >= 0 ? "+" : ""}{row.score?.toFixed(1)}</span>
+                    </div>
+                    <div style={{ padding:"9px 8px", display:"flex", alignItems:"center" }}>
+                      <span style={{ color:_trendClr(row.trend), fontSize:10, fontWeight:700, fontFamily:T.font, padding:"2px 6px", borderRadius:4, background:_trendClr(row.trend)+"12" }}>
+                        {row.trend==="Bullish"?"▲":"▼"} {row.trend}
+                      </span>
+                    </div>
+                    <div style={{ padding:"9px 8px", color:_rsiClr(row.rsi, row.rsi_signal), fontSize:12, fontFamily:T.font, fontWeight:700, display:"flex", alignItems:"center" }}>{row.rsi != null ? row.rsi.toFixed(1) : "—"}</div>
+                    <div style={{ padding:"9px 8px", display:"flex", alignItems:"center" }}>
+                      <span style={{ color:_rsiClr(row.rsi, row.rsi_signal), fontSize:9, fontWeight:700, fontFamily:T.font, padding:"2px 6px", borderRadius:4, background:_rsiClr(row.rsi, row.rsi_signal)+"15" }}>{row.rsi_signal}</span>
+                    </div>
+                    <div style={{ padding:"9px 8px", color:_bbClr(row.bb_status), fontSize:9.5, fontWeight:600, fontFamily:T.font, display:"flex", alignItems:"center" }}>
+                      {row.bb_status?.includes("Overextended")?"⚠️ ":row.bb_status?.includes("Bounce")?"💡 ":""}{row.bb_status}
+                    </div>
+                    <div style={{ padding:"9px 8px", color:_candleClr(row.candlestick), fontSize:9.5, fontWeight:600, fontFamily:T.font, display:"flex", alignItems:"center" }}>{row.candlestick}</div>
+                    <div style={{ padding:"9px 8px", color:T.text1, fontSize:11, fontFamily:T.font, display:"flex", alignItems:"center" }}>{row.atr != null ? row.atr.toFixed(2) : "—"}</div>
+                    <div style={{ padding:"9px 8px", fontSize:11, fontFamily:T.font, fontWeight:600, display:"flex", alignItems:"center", color:row.rvol >= 2.0 ? T.orange : T.text1 }}>{row.rvol ? `${row.rvol.toFixed(1)}x` : "—"}</div>
+                    <div style={{ padding:"9px 8px", color:_instClr(row.inst_footprint), fontSize:9.5, fontWeight:600, fontFamily:T.font, display:"flex", alignItems:"center" }}>
+                      {row.inst_footprint?.includes("Accumulation")?"🐋 ":row.inst_footprint?.includes("Distribution")?"🔻 ":""}{row.inst_footprint}
+                    </div>
+                    <div style={{ padding:"9px 8px", color:T.text1, fontSize:11, fontFamily:T.font, display:"flex", alignItems:"center" }}>{row.fcf_yield != null ? `${row.fcf_yield}%` : "—"}</div>
+                    <div style={{ padding:"9px 8px", color:T.text1, fontSize:11, fontFamily:T.font, display:"flex", alignItems:"center" }}>{row.de_ratio != null ? row.de_ratio.toFixed(2) : "—"}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Table footer */}
+              <div style={{ padding:"10px 16px", borderTop:`2px solid ${T.border}`, display:"flex", justifyContent:"space-between", alignItems:"center", background:T.bg0 }}>
+                <span style={{ color:T.text1, fontSize:12, fontFamily:T.font, fontWeight:600 }}>
+                  {techRows.length} of {techData.length} tickers{techFilter !== "ALL" ? ` · ${techFilter}` : ""}
+                </span>
+                <span style={{ color:T.text2, fontSize:10, fontFamily:T.font }}>
+                  Sorted by {techSortKey} {techSortAsc ? "↑" : "↓"} · Data: yfinance 3mo · ★ Watchlist tickers
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -2685,7 +3105,7 @@ function PagePortfolio({ tickers = new Map(), marketSession = "market", T }) {
 }
 
 // ─── App Shell ────────────────────────────────────────────────────────────────
-export default function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp = 'all', sector: sectorProp = 'ALL', onSourceChange, onSectorChange, onThemeChange, currentTheme = 'auto' }) {
+export default function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp = 'all', sector: sectorProp = 'ALL', onSourceChange, onSectorChange, onThemeChange, currentTheme = 'auto', onSignOut, user }) {
   // Active page state - persisted in localStorage
   const [quickFilter, setQuickFilter] = useState(null);
   const [page, setPage] = useState(() => {
@@ -3229,10 +3649,42 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
             </div>
           )}
 
-          {/* User Avatar */}
-          <div style={{ width:32, height:32, borderRadius:6, background:T.cyanDim, border:`1px solid ${T.cyanMid}`, display:"flex", alignItems:"center", justifyContent:"center", color:T.cyan, fontWeight:800, fontSize:13, cursor:"pointer", letterSpacing:0.5 }}
-            title="Account"
-          >S</div>
+          {/* User Avatar + Dropdown */}
+          <div style={{ position:"relative" }}>
+            <div
+              onClick={() => setHeaderPanel(p => p === "user" ? null : "user")}
+              style={{ width:32, height:32, borderRadius:6, background:T.cyanDim, border:`1px solid ${headerPanel==="user" ? T.cyan : T.cyanMid}`, display:"flex", alignItems:"center", justifyContent:"center", color:T.cyan, fontWeight:800, fontSize:13, cursor:"pointer", letterSpacing:0.5, transition:"all 0.15s" }}
+              title="Account"
+            >
+              {user?.email ? user.email[0].toUpperCase() : "S"}
+            </div>
+
+            {/* User dropdown panel */}
+            {headerPanel === "user" && (
+              <div style={{ position:"absolute", right:0, top:"calc(100% + 8px)", width:240, background:T.bg1, border:`1px solid ${T.border}`, borderRadius:10, boxShadow:"0 12px 40px rgba(0,0,0,0.5)", zIndex:10000, overflow:"hidden" }}>
+                {/* User info */}
+                <div style={{ padding:"14px 16px", borderBottom:`1px solid ${T.border}` }}>
+                  <div style={{ color:T.text0, fontFamily:T.font, fontWeight:700, fontSize:13, marginBottom:2 }}>
+                    {user?.user_metadata?.full_name || "Trader"}
+                  </div>
+                  <div style={{ color:T.text2, fontFamily:T.font, fontSize:11, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                    {user?.email || ""}
+                  </div>
+                </div>
+                {/* Sign out */}
+                <div style={{ padding:6 }}>
+                  <button
+                    onClick={() => { setHeaderPanel(null); if (onSignOut) onSignOut(); }}
+                    style={{ width:"100%", display:"flex", alignItems:"center", gap:10, padding:"10px 12px", background:"transparent", border:"none", borderRadius:6, cursor:"pointer", color:T.red, fontFamily:T.font, fontSize:13, fontWeight:600, transition:"background 0.15s", textAlign:"left" }}
+                    onMouseEnter={e => e.currentTarget.style.background = T.red+"15"}
+                    onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+                  >
+                    <span style={{ fontSize:15 }}>⎋</span> Sign Out
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
 
           {/* ── Dropdown Panels ── */}
           {headerPanel && (

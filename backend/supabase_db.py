@@ -46,7 +46,7 @@ _PAGE = 1000
 
 # Max tickers sent to the frontend live table at once.
 # 1 500 visible + 100 buffer for frontend sort/filter headroom.
-LIVE_DISPLAY_CAP = 1600
+LIVE_DISPLAY_CAP = 6200
 
 
 def _get_client() -> Client:

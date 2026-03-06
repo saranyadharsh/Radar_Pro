@@ -1,46 +1,88 @@
 /**
- * App.jsx — NexRadar Pro v4.3
- * Unified dashboard with NexRadarDashboard only
+ * App.jsx — NexRadar Pro v4.4
+ * Auth gate → Dashboard
  */
 
 import { useState, useEffect } from 'react'
+import { createClient } from '@supabase/supabase-js'
 import NexRadarDashboard from './components/NexRadarDashboard'
+import NexRadarAuth from './components/nexradar-auth'
 import { STORAGE_KEYS } from './config'
 
+// ── Supabase client ────────────────────────────────────────────────────────────
+// Add to your .env file (same file where SUPABASE_URL already lives):
+//   VITE_SUPABASE_URL=https://xxxxxxxxxxxx.supabase.co
+//   VITE_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_ANON_KEY,
+  { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } }
+)
+
 export default function App() {
-  // Theme system: 'light', 'dark', 'high-contrast', 'auto'
+  // ── Auth state ──────────────────────────────────────────────────────────────
+  // undefined = still checking, null = not logged in, object = logged in
+  const [user, setUser] = useState(undefined)
+
+  useEffect(() => {
+    // onAuthStateChange fires immediately with the current session AND
+    // also fires when Google OAuth redirects back to the app (SIGNED_IN event).
+    // This single listener handles all cases: page refresh, OAuth redirect, sign out.
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'INITIAL_SESSION' || event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
+        setUser(session?.user ?? null)
+      } else if (event === 'SIGNED_OUT') {
+        setUser(null)
+      }
+    })
+
+    return () => subscription.unsubscribe()
+  }, [])
+
+  // ── Theme system ────────────────────────────────────────────────────────────
   const [theme, setTheme] = useState(() => {
     const saved = localStorage.getItem(STORAGE_KEYS.THEME)
     return saved || 'auto'
   })
-  
-  // Compute actual dark mode based on theme setting
   const [darkMode, setDarkMode] = useState(true)
-  
+
   useEffect(() => {
     let actualDarkMode = true
-    
     if (theme === 'light') {
       actualDarkMode = false
     } else if (theme === 'dark' || theme === 'high-contrast') {
       actualDarkMode = true
     } else if (theme === 'auto') {
-      // Auto mode: check system time (6 AM - 6 PM = light, otherwise dark)
       const hour = new Date().getHours()
       actualDarkMode = hour < 6 || hour >= 18
     }
-    
     setDarkMode(actualDarkMode)
-    
-    // Save theme preference
     localStorage.setItem(STORAGE_KEYS.THEME, theme)
   }, [theme])
 
+  // ── Sign out ────────────────────────────────────────────────────────────────
+  const handleSignOut = async () => {
+    await supabase.auth.signOut()
+    // onAuthStateChange SIGNED_OUT handler sets user → null → auth page renders
+  }
+
+  // ── Render ──────────────────────────────────────────────────────────────────
+  // undefined = still resolving session (blank screen avoids flash)
+  if (user === undefined) return null
+
+  // Not logged in → show auth page
+  if (!user) {
+    return <NexRadarAuth onAuthenticated={setUser} supabase={supabase} />
+  }
+
+  // Logged in → show dashboard
   return (
-    <NexRadarDashboard 
+    <NexRadarDashboard
       darkMode={darkMode}
       onThemeChange={setTheme}
       currentTheme={theme}
+      user={user}
+      onSignOut={handleSignOut}
     />
   )
 }
