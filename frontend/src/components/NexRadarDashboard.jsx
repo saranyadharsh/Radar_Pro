@@ -139,10 +139,12 @@ function getWeekDates(offsetWeeks = 0) {
   return ["MON","TUE","WED","THU","FRI"].map((d, i) => {
     const dt = new Date(monday);
     dt.setDate(monday.getDate() + i);
+    // Use LOCAL date parts to avoid UTC timezone shift
+    const iso = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
     return {
       day: d,
       date: dt.toLocaleDateString("en-US", { month: "short", day: "numeric" }),
-      isoDate: dt.toISOString().slice(0, 10),
+      isoDate: iso,
       isToday: dt.toDateString() === today.toDateString(),
     };
   });
@@ -288,11 +290,7 @@ const getCSS = (T) => `
     box-shadow: 0 0 0 3px ${T.cyanDim};
   }
   
-  /* Theme selector dropdown */
-  .theme-selector-group:hover .theme-dropdown {
-    opacity: 1 !important;
-    visibility: visible !important;
-  }
+
 `;
 
 // ─── Primitives (accept T as prop or use default colors) ────────────────────
@@ -524,6 +522,244 @@ function SectorPills({ selectedSectors, onChange, showCounts=false, actualCount=
   );
 }
 
+// ─── AppearanceModal ─────────────────────────────────────────────────────────
+function AppearanceModal({ onClose, currentTheme, onThemeChange, T }) {
+  const [selected, setSelected] = useState(currentTheme || "dark");
+
+  const options = [
+    {
+      id: "light",
+      label: "Light mode",
+      preview: (
+        <div style={{ width:"100%", height:90, background:"#ffffff", borderRadius:8,
+          display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:6, padding:10 }}>
+          <div style={{ width:"60%", height:10, background:"#d1d5db", borderRadius:4 }}/>
+          <div style={{ width:"80%", height:36, background:"#9ca3af", borderRadius:6 }}/>
+          <div style={{ width:"70%", height:8, background:"#d1d5db", borderRadius:4 }}/>
+          <div style={{ width:"70%", height:8, background:"#d1d5db", borderRadius:4 }}/>
+        </div>
+      ),
+    },
+    {
+      id: "dark",
+      label: "Dark mode",
+      preview: (
+        <div style={{ width:"100%", height:90, background:"#111827", borderRadius:8,
+          display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:6, padding:10 }}>
+          <div style={{ width:"60%", height:10, background:"#374151", borderRadius:4 }}/>
+          <div style={{ width:"80%", height:36, background:"#4b5563", borderRadius:6 }}/>
+          <div style={{ width:"70%", height:8, background:"#374151", borderRadius:4 }}/>
+          <div style={{ width:"70%", height:8, background:"#374151", borderRadius:4 }}/>
+        </div>
+      ),
+    },
+    {
+      id: "auto",
+      label: "Device default",
+      preview: (
+        <div style={{ width:"100%", height:90, borderRadius:8, overflow:"hidden",
+          display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:6, padding:10,
+          background:"linear-gradient(135deg, #f9fafb 50%, #111827 50%)" }}>
+          <div style={{ width:"60%", height:10, background:"rgba(100,100,100,0.4)", borderRadius:4 }}/>
+          <div style={{ width:"80%", height:36, background:"rgba(100,100,100,0.5)", borderRadius:6 }}/>
+          <div style={{ width:"70%", height:8, background:"rgba(100,100,100,0.4)", borderRadius:4 }}/>
+          <div style={{ width:"70%", height:8, background:"rgba(100,100,100,0.4)", borderRadius:4 }}/>
+        </div>
+      ),
+    },
+  ];
+
+  const handleOK = () => {
+    onThemeChange(selected);
+    onClose();
+  };
+
+  return (
+    <div style={{ position:"fixed", inset:0, zIndex:99999, display:"flex", alignItems:"center",
+      justifyContent:"center", background:"rgba(0,0,0,0.55)", backdropFilter:"blur(4px)" }}
+      onClick={onClose}>
+      <div style={{ background:T.bg1, border:`1px solid ${T.border}`, borderRadius:16,
+        padding:"32px 36px", width:520, maxWidth:"95vw", boxShadow:"0 20px 60px rgba(0,0,0,0.5)" }}
+        onClick={e => e.stopPropagation()}>
+
+        {/* Header */}
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:28 }}>
+          <span style={{ color:T.text0, fontFamily:T.font, fontWeight:700, fontSize:20 }}>Appearance</span>
+          <button onClick={onClose} style={{ background:"none", border:"none", color:T.text2,
+            cursor:"pointer", fontSize:18, lineHeight:1, padding:4 }}>✕</button>
+        </div>
+
+        {/* Theme options */}
+        <div style={{ display:"flex", gap:16, marginBottom:32 }}>
+          {options.map(opt => (
+            <div key={opt.id} onClick={() => setSelected(opt.id)}
+              style={{ flex:1, cursor:"pointer", display:"flex", flexDirection:"column", gap:10 }}>
+              <div style={{
+                border: `2px solid ${selected===opt.id ? "#0d9488" : T.border}`,
+                borderRadius:10, overflow:"hidden", padding:6,
+                background: selected===opt.id ? "#0d948812" : T.bg2,
+                transition:"all 0.15s",
+              }}>
+                {opt.preview}
+              </div>
+              <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                <div style={{
+                  width:18, height:18, borderRadius:"50%", flexShrink:0,
+                  border: `2px solid ${selected===opt.id ? "#0d9488" : T.border}`,
+                  background: selected===opt.id ? "#0d948820" : "transparent",
+                  display:"flex", alignItems:"center", justifyContent:"center",
+                }}>
+                  {selected===opt.id && (
+                    <div style={{ width:8, height:8, borderRadius:"50%", background:"#0d9488" }}/>
+                  )}
+                </div>
+                <span style={{ color:T.text0, fontFamily:T.font, fontSize:13, fontWeight:500 }}>{opt.label}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* OK button */}
+        <button onClick={handleOK}
+          style={{ width:"100%", padding:"13px 0", borderRadius:30, background:"#0d9488",
+            border:"none", color:"#ffffff", fontFamily:T.font, fontSize:15, fontWeight:700,
+            cursor:"pointer", transition:"opacity 0.15s" }}
+          onMouseEnter={e => e.currentTarget.style.opacity="0.9"}
+          onMouseLeave={e => e.currentTarget.style.opacity="1"}>
+          OK
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── EarningsSubPanel (used inside PageSignals) ───────────────────────────────
+function EarningsSubPanel({ T }) {
+  const [weekOffset,   setWeekOffset]   = useState(0);
+  const [selectedDay,  setSelectedDay]  = useState(null);
+  const [earningsData, setEarningsData] = useState([]);
+  const [loading,      setLoading]      = useState(true);
+  const [error,        setError]        = useState(null);
+
+  const weekDates = useMemo(() => getWeekDates(weekOffset), [weekOffset]);
+
+  useEffect(() => {
+    setLoading(true); setError(null);
+    const start = weekDates[0]?.isoDate;
+    const end   = weekDates[weekDates.length - 1]?.isoDate;
+    fetch(`${API_BASE}/api/earnings?start=${start}&end=${end}`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then(d => { setEarningsData(d || []); setLoading(false); })
+      .catch(e => { setError(e.message); setLoading(false); });
+  }, [weekOffset, weekDates]);
+
+  useEffect(() => {
+    const today = weekDates.find(d => d.isToday);
+    if (today) setSelectedDay(today.isoDate);
+    else if (weekOffset === 0) setSelectedDay(null);
+  }, [weekOffset, weekDates]);
+
+  const activeDay = selectedDay || weekDates.find(d => d.isToday)?.isoDate || weekDates[0]?.isoDate;
+
+  const dayEarnings = useMemo(() =>
+    earningsData.filter(e => e.date === activeDay || e.earnings_date === activeDay),
+  [earningsData, activeDay]);
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+      {/* Week nav + day pills */}
+      <div style={{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" }}>
+        <button className="btn-ghost" style={{ fontSize:9 }} onClick={() => setWeekOffset(o => o - 1)}>← PREV</button>
+        {weekDates.map(d => (
+          <button key={d.isoDate} onClick={() => setSelectedDay(d.isoDate)}
+            style={{ background: activeDay===d.isoDate ? T.cyanDim : T.bg2,
+              border: `1px solid ${activeDay===d.isoDate ? T.cyanMid : d.isToday ? T.borderHi : T.border}`,
+              color: activeDay===d.isoDate ? T.cyan : d.isToday ? T.text0 : T.text2,
+              borderRadius:5, padding:"5px 12px", cursor:"pointer",
+              fontFamily:T.font, fontSize:9,
+              display:"flex", flexDirection:"column", alignItems:"center", gap:1 }}>
+            <span>{d.day}</span>
+            <span style={{ fontSize:8, opacity:0.7 }}>{d.date}</span>
+            {d.isToday && <span style={{ fontSize:7, color:T.cyan }}>TODAY</span>}
+          </button>
+        ))}
+        <button className="btn-ghost" style={{ fontSize:9 }} onClick={() => setWeekOffset(o => o + 1)}>NEXT →</button>
+        {weekOffset !== 0 && (
+          <button className="btn-ghost" style={{ fontSize:9 }} onClick={() => setWeekOffset(0)}>THIS WEEK</button>
+        )}
+        <span style={{ marginLeft:"auto", color:T.text2, fontSize:10, fontFamily:T.font }}>
+          {loading ? "Loading…" : `${dayEarnings.length} earnings`}
+        </span>
+      </div>
+
+      {/* Table */}
+      <div className="card" style={{ overflow:"hidden" }}>
+        <div style={{ display:"grid", gridTemplateColumns:"90px 1fr 80px 70px 80px 80px 100px",
+          background:T.bg0, borderBottom:`2px solid ${T.border}` }}>
+          {["SYMBOL","COMPANY","DATE","TIME","EPS EST","REV EST","SECTOR"].map(h => (
+            <div key={h} style={{ padding:"9px 10px", color:T.text1, fontSize:9,
+              letterSpacing:1, fontFamily:T.font, fontWeight:800 }}>{h}</div>
+          ))}
+        </div>
+        <div style={{ maxHeight:"calc(100vh - 480px)", overflowY:"auto" }}>
+          {error ? (
+            <EmptyState icon="⚠" label="ERROR" sub={error} h={120} T={T}/>
+          ) : loading ? (
+            Array(8).fill(0).map((_, i) => (
+              <div key={i} style={{ display:"grid",
+                gridTemplateColumns:"90px 1fr 80px 70px 80px 80px 100px",
+                borderBottom:`1px solid ${T.border}`, padding:"10px 0" }}>
+                {Array(7).fill(0).map((_, j) => (
+                  <div key={j} className="shimmer-box" style={{ height:11, margin:"0 10px" }}/>
+                ))}
+              </div>
+            ))
+          ) : dayEarnings.length === 0 ? (
+            <EmptyState icon="◎" label="NO EARNINGS" sub="No earnings scheduled for this day" h={140} T={T}/>
+          ) : (
+            dayEarnings.map((e, i) => (
+              <div key={i} className="tr-hover"
+                style={{ display:"grid", gridTemplateColumns:"90px 1fr 80px 70px 80px 80px 100px",
+                  borderBottom:`1px solid ${T.border}` }}>
+                <div style={{ padding:"10px", color:T.cyan, fontSize:12, fontFamily:T.font, fontWeight:700 }}>
+                  {e.ticker || e.symbol}
+                </div>
+                <div style={{ padding:"10px", color:T.text1, fontSize:11, fontFamily:T.font,
+                  whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                  {e.company_name || "—"}
+                </div>
+                <div style={{ padding:"10px", color:T.text2, fontSize:11, fontFamily:T.font }}>
+                  {e.date || e.earnings_date || "—"}
+                </div>
+                <div style={{ padding:"10px", fontSize:10, fontFamily:T.font, fontWeight:600,
+                  color: e.earnings_time==="BMO" ? T.gold : e.earnings_time==="AMC" ? T.purple : T.text2 }}>
+                  {e.earnings_time || e.time || "—"}
+                </div>
+                <div style={{ padding:"10px", color:T.text1, fontSize:11, fontFamily:T.font }}>
+                  {e.eps_estimate || e.eps_est || "—"}
+                </div>
+                <div style={{ padding:"10px", color:T.text1, fontSize:11, fontFamily:T.font }}>
+                  {e.revenue_estimate || e.rev_est || "—"}
+                </div>
+                <div style={{ padding:"10px", color:T.text2, fontSize:10, fontFamily:T.font }}>
+                  {e.sector || "—"}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+        <div style={{ padding:"10px 16px", borderTop:`2px solid ${T.border}`,
+          display:"flex", justifyContent:"space-between", background:T.bg0 }}>
+          <span style={{ color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>
+            {dayEarnings.length} earnings · {weekDates.find(d => d.isoDate === activeDay)?.date || ""}
+          </span>
+          <span style={{ color:T.text2, fontSize:10, fontFamily:T.font }}>BMO = Before Open · AMC = After Close</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── PAGE: Dashboard ──────────────────────────────────────────────────────────
 // Market Breadth now includes EARNINGS tile with real-time sector performance
 function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerformance = {}, tickers, T }) {
@@ -549,25 +785,32 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
       .then(data => setWatchlist(new Set(data.watchlist ?? [])))
       .catch(err => console.warn('[NexRadar Dashboard] Failed to load watchlist:', err));
     
-    // Fetch only today's earnings
-    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
+    // Fetch only today's earnings — use LOCAL date not UTC to avoid timezone mismatch
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
     fetch(`${API_BASE}/api/earnings?start=${today}&end=${today}`)
-      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
       .then(data => {
-        // Backend returns array directly, not wrapped in object
-        const earningsArray = Array.isArray(data) ? data : [];
-        // Map backend field names to frontend expected names
+        // Handle all response shapes: bare array, {data:[]}, {earnings:[]}, {results:[]}
+        const earningsArray = Array.isArray(data) ? data :
+                              Array.isArray(data?.data) ? data.data :
+                              Array.isArray(data?.earnings) ? data.earnings :
+                              Array.isArray(data?.results) ? data.results : [];
         const mappedEarnings = earningsArray.map(e => ({
-          ticker: e.ticker,
-          company_name: e.company_name,
-          date: e.earnings_date,
-          time: e.earnings_time
+          ticker:       e.ticker        || e.symbol       || "",
+          company_name: e.company_name  || e.name         || "",
+          date:         e.earnings_date || e.date         || today,
+          time:         e.earnings_time || e.time         || "TNS",
         }));
         setEarnings(mappedEarnings);
         setEarningsLoading(false);
       })
       .catch(err => {
-        console.error('[NexRadar Dashboard] Failed to load earnings:', err);
+        console.warn('[NexRadar Dashboard] Earnings fetch failed:', err);
+        setEarnings([]);
         setEarningsLoading(false);
       });
   }, []);
@@ -1111,19 +1354,18 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
   const [earningsTickers, setEarningsTickers] = useState(new Set());
   
   useEffect(() => {
-    // Fetch only today's earnings
-    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
     fetch(`${API_BASE}/api/earnings?start=${today}&end=${today}`)
-      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
       .then(data => {
-        const earningsArray = Array.isArray(data) ? data : [];
-        // Get all tickers with earnings today
-        const todayEarningsTickers = new Set(
-          earningsArray.map(e => e.ticker)
-        );
-        setEarningsTickers(todayEarningsTickers);
+        const arr = Array.isArray(data) ? data :
+                    Array.isArray(data?.data) ? data.data :
+                    Array.isArray(data?.earnings) ? data.earnings :
+                    Array.isArray(data?.results) ? data.results : [];
+        setEarningsTickers(new Set(arr.map(e => e.ticker || e.symbol).filter(Boolean)));
       })
-      .catch(err => console.warn('[NexRadar Live Table] Failed to load earnings:', err));
+      .catch(err => { console.warn('[NexRadar Live Table] Earnings fetch failed:', err); setEarningsTickers(new Set()); });
   }, []);
 
   // ── Load watchlist from backend on mount ─────────────────────────────────
@@ -1901,7 +2143,7 @@ function PageChart({ T }) {
 
 // ─── PAGE: Signals - Scalp Signals + Pro Scalp Analysis + Tech Analysis ───────
 function PageSignals({ tickers = new Map(), selectedSectors = ["ALL"], T }) {
-  const [signalView, setSignalView] = useState("SIGNALS"); // "SIGNALS" | "TECH"
+  const [signalView, setSignalView] = useState("SIGNALS"); // "SIGNALS" | "TECH" | "EARNINGS"
 
   // ── PRO SCALP (Signals tab) state ──────────────────────────────────────────
   const [proData,    setProData]    = useState([]);
@@ -2072,151 +2314,136 @@ function PageSignals({ tickers = new Map(), selectedSectors = ["ALL"], T }) {
   return (
     <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:16 }}>
 
-      {/* ── TAB BAR + STATS + FILTERS — single unified row ── */}
-      <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+      {/* ── TAB BAR: SIGNALS primary, TECH ANALYSIS as child sub-tab ── */}
+      <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
 
-        {/* Tab toggle */}
-        <div style={{ display:"flex", background:T.bg0, border:`1px solid ${T.border}`, borderRadius:8, overflow:"hidden", boxShadow:`0 1px 4px ${T.bg0}` }}>
-          <button onClick={() => setSignalView("SIGNALS")}
-            style={{
-              background: signalView==="SIGNALS" ? T.cyan : "transparent",
-              color: signalView==="SIGNALS" ? "#000" : T.text2,
-              border:"none", borderRight:`1px solid ${T.border}`,
-              padding:"8px 20px", cursor:"pointer",
-              fontFamily:T.font, fontSize:10.5, letterSpacing:0.7, fontWeight:700,
-              transition:"all 0.15s",
-            }}>
-            ◉ SIGNALS
-          </button>
-          <button onClick={() => setSignalView("TECH")}
-            style={{
-              background: signalView==="TECH" ? T.cyan+"22" : "transparent",
-              color: signalView==="TECH" ? T.cyan : T.text2,
-              border:"none",
-              padding:"8px 20px", cursor:"pointer",
-              fontFamily:T.font, fontSize:10.5, letterSpacing:0.7, fontWeight:600,
-              transition:"all 0.15s",
-            }}>
-            ◈ TECH ANALYSIS
-          </button>
+        {/* Row 1 — Primary SIGNALS tab + its inline stats/filters */}
+        <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+
+          <div style={{ display:"flex", background:T.bg0, border:`1px solid ${T.border}`, borderRadius:8, overflow:"hidden", boxShadow:`0 1px 4px ${T.bg0}` }}>
+            <button onClick={() => setSignalView("SIGNALS")}
+              style={{
+                background: (signalView==="SIGNALS" || signalView==="TECH") ? T.cyan : "transparent",
+                color: (signalView==="SIGNALS" || signalView==="TECH") ? "#000" : T.text2,
+                border:"none", padding:"8px 20px", cursor:"pointer",
+                fontFamily:T.font, fontSize:10.5, letterSpacing:0.7, fontWeight:700,
+                transition:"all 0.15s",
+              }}>
+              ◉ SIGNALS
+            </button>
+          </div>
+
+          {(signalView === "SIGNALS" || signalView === "TECH") && (
+            <>
+              <div style={{ width:1, height:22, background:T.border, flexShrink:0 }}/>
+              {[
+                { lbl:"BUY",   val:proStats.buy,    clr:T.green  },
+                { lbl:"SELL",  val:proStats.sell,   clr:T.red    },
+                { lbl:"STRNG", val:proStats.strong, clr:T.purple },
+                { lbl:"WATCH", val:proData.length,  clr:T.cyan   },
+              ].map(s => (
+                <div key={s.lbl} style={{ display:"flex", alignItems:"center", gap:5,
+                  background:T.bg2, border:`1px solid ${T.border}`, borderRadius:5, padding:"4px 10px" }}>
+                  <span style={{ color:T.text2, fontSize:8.5, fontFamily:T.font, letterSpacing:0.8 }}>{s.lbl}</span>
+                  <span style={{ color:s.clr, fontSize:14, fontFamily:T.font, fontWeight:800, lineHeight:1 }}>{s.val}</span>
+                </div>
+              ))}
+              <div style={{ width:1, height:22, background:T.border, flexShrink:0 }}/>
+              {[
+                ["ALL",    `ALL (${proStats.total})`       ],
+                ["BUY",    `▲ BUY (${proStats.buy})`       ],
+                ["SELL",   `▼ SELL (${proStats.sell})`     ],
+                ["STRONG", `⚡ STRONG (${proStats.strong})`],
+              ].map(([key, lbl]) => (
+                <button key={key} onClick={() => setProFilter(key)}
+                  style={{
+                    background: proFilter===key ? T.cyan+"14" : "transparent",
+                    border: `1px solid ${proFilter===key ? T.cyan+"45" : T.border}`,
+                    color: proFilter===key ? T.cyan : T.text2,
+                    borderRadius:5, padding:"5px 11px", cursor:"pointer",
+                    fontFamily:T.font, fontSize:9.5, fontWeight:600,
+                  }}>
+                  {lbl}
+                </button>
+              ))}
+            </>
+          )}
         </div>
 
-        {/* Divider */}
-        <div style={{ width:1, height:22, background:T.border, flexShrink:0 }}/>
+        {/* Row 2 — TECH ANALYSIS sub-tab */}
+        {(signalView === "SIGNALS" || signalView === "TECH") && (
+        <div style={{ display:"flex", alignItems:"center", gap:4, flexWrap:"wrap",
+          paddingLeft:12, borderLeft:`2px solid ${T.border}`, marginLeft:6 }}>
+          <span style={{ color:T.text2, fontSize:10, marginRight:2 }}>└</span>
 
-        {/* ── Inline stat badges (always visible, context-sensitive) ── */}
-        {signalView === "SIGNALS" && (
-          <>
-            {[
-              { lbl:"BUY",   val:proStats.buy,    clr:T.green  },
-              { lbl:"SELL",  val:proStats.sell,   clr:T.red    },
-              { lbl:"STRNG", val:proStats.strong, clr:T.purple },
-              { lbl:"WATCH", val:proData.length,  clr:T.cyan   },
-            ].map(s => (
-              <div key={s.lbl} style={{ display:"flex", alignItems:"center", gap:5,
-                background:T.bg2, border:`1px solid ${T.border}`, borderRadius:5, padding:"4px 10px" }}>
-                <span style={{ color:T.text2, fontSize:8.5, fontFamily:T.font, letterSpacing:0.8 }}>{s.lbl}</span>
-                <span style={{ color:s.clr, fontSize:14, fontFamily:T.font, fontWeight:800, lineHeight:1 }}>{s.val}</span>
+          {/* TECH ANALYSIS sub-tab */}
+          <button onClick={() => setSignalView(signalView === "TECH" ? "SIGNALS" : "TECH")}
+            style={{
+              background: signalView==="TECH" ? T.cyan+"14" : "transparent",
+              border: `1px solid ${signalView==="TECH" ? T.cyan+"45" : T.border}`,
+              color: signalView==="TECH" ? T.cyan : T.text2,
+              borderRadius:5, padding:"5px 14px", cursor:"pointer",
+              fontFamily:T.font, fontSize:10, letterSpacing:0.4,
+              fontWeight: signalView==="TECH" ? 700 : 500,
+              transition:"all 0.15s",
+            }}>
+            ◈ TECH ANALYSIS{techData.length > 0 ? ` (${techData.length})` : ""}
+          </button>
+
+          {/* Inline filters when TECH sub-tab is active */}
+          {signalView === "TECH" && (
+            <>
+              <div style={{ width:1, height:18, background:T.border, flexShrink:0, marginLeft:4 }}/>
+              {techStats && [
+                { lbl:"BULL", val:techStats.bullish, clr:T.green },
+                { lbl:"BEAR", val:techStats.bearish, clr:T.red   },
+                { lbl:"ALRT", val:techStats.alerts,  clr:T.gold  },
+              ].map(s => (
+                <div key={s.lbl} style={{ display:"flex", alignItems:"center", gap:4,
+                  background:T.bg2, border:`1px solid ${T.border}`, borderRadius:5, padding:"3px 8px" }}>
+                  <span style={{ color:T.text2, fontSize:8, fontFamily:T.font }}>{s.lbl}</span>
+                  <span style={{ color:s.clr, fontSize:12, fontFamily:T.font, fontWeight:800 }}>{s.val}</span>
+                </div>
+              ))}
+              {["ALL","BULLISH","BEARISH","ALERTS"].map(f => (
+                <button key={f} onClick={() => setTechFilter(f)}
+                  style={{
+                    background: techFilter===f ? T.cyan+"14" : "transparent",
+                    border: `1px solid ${techFilter===f ? T.cyan+"45" : T.border}`,
+                    color: techFilter===f ? T.cyan : T.text2,
+                    borderRadius:5, padding:"4px 9px", cursor:"pointer",
+                    fontFamily:T.font, fontSize:9, fontWeight:600,
+                  }}>
+                  {f==="BULLISH"?"▲ ":f==="BEARISH"?"▼ ":f==="ALERTS"?"🚨 ":""}
+                  {f}
+                  {techStats && f==="ALL"     ? ` (${techData.length})`   : ""}
+                  {techStats && f==="BULLISH" ? ` (${techStats.bullish})` : ""}
+                  {techStats && f==="BEARISH" ? ` (${techStats.bearish})` : ""}
+                  {techStats && f==="ALERTS"  ? ` (${techStats.alerts})`  : ""}
+                </button>
+              ))}
+              <div style={{ marginLeft:"auto", display:"flex", gap:6, alignItems:"center" }}>
+                {techLastFetch && (
+                  <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>
+                    {techCached?"📦":"✅"} {techLastFetch.toLocaleTimeString()}
+                  </span>
+                )}
+                <button onClick={() => fetchTechData(false)} disabled={techLoading}
+                  style={{ background:T.bg2, border:`1px solid ${T.border}`, color:T.text1,
+                    borderRadius:5, padding:"4px 10px", cursor:techLoading?"wait":"pointer",
+                    fontFamily:T.font, fontSize:9, fontWeight:600, opacity:techLoading?0.5:1 }}>
+                  {techLoading?"⏳":"🔄"} Refresh
+                </button>
+                <button onClick={() => fetchTechData(true)} disabled={techLoading}
+                  style={{ background:T.cyanDim, border:`1px solid ${T.cyanMid}`, color:T.cyan,
+                    borderRadius:5, padding:"4px 10px", cursor:techLoading?"wait":"pointer",
+                    fontFamily:T.font, fontSize:9, fontWeight:700, opacity:techLoading?0.5:1 }}>
+                  ⚡ Force
+                </button>
               </div>
-            ))}
-
-            {/* Divider */}
-            <div style={{ width:1, height:22, background:T.border, flexShrink:0 }}/>
-
-            {/* Filter pills */}
-            {[
-              ["ALL",    `ALL (${proStats.total})`      ],
-              ["BUY",    `▲ BUY (${proStats.buy})`      ],
-              ["SELL",   `▼ SELL (${proStats.sell})`    ],
-              ["STRONG", `⚡ STRONG (${proStats.strong})`],
-            ].map(([key, lbl]) => (
-              <button key={key} onClick={() => setProFilter(key)}
-                style={{
-                  background: proFilter===key ? T.cyan+"14" : "transparent",
-                  border: `1px solid ${proFilter===key ? T.cyan+"45" : T.border}`,
-                  color: proFilter===key ? T.cyan : T.text2,
-                  borderRadius:5, padding:"5px 11px", cursor:"pointer",
-                  fontFamily:T.font, fontSize:9.5, fontWeight:600,
-                }}>
-                {lbl}
-              </button>
-            ))}
-
-            {/* Warming up + refresh */}
-            <div style={{ marginLeft:"auto", display:"flex", gap:6, alignItems:"center" }}>
-              {proWarmingUp.length > 0 && (
-                <span style={{ color:T.text2, fontSize:9.5, fontFamily:T.font }}>
-                  ⏳ {proWarmingUp.length} warming
-                </span>
-              )}
-              <button onClick={fetchProData} disabled={proLoading}
-                style={{ background:T.bg2, border:`1px solid ${T.border}`, color:T.text1,
-                  borderRadius:5, padding:"5px 12px", cursor:proLoading?"wait":"pointer",
-                  fontFamily:T.font, fontSize:10, fontWeight:600, opacity:proLoading?0.5:1 }}>
-                {proLoading ? "⏳" : "🔄"} {proLoading ? "Loading…" : "Refresh"}
-              </button>
-            </div>
-          </>
-        )}
-
-        {/* ── TECH tab filters ── */}
-        {signalView === "TECH" && (
-          <>
-            {techStats && (
-              <>
-                {[
-                  { lbl:"BULL",  val:techStats.bullish,    clr:T.green },
-                  { lbl:"BEAR",  val:techStats.bearish,    clr:T.red   },
-                  { lbl:"ALERT", val:techStats.alerts,     clr:T.gold  },
-                ].map(s => (
-                  <div key={s.lbl} style={{ display:"flex", alignItems:"center", gap:5,
-                    background:T.bg2, border:`1px solid ${T.border}`, borderRadius:5, padding:"4px 10px" }}>
-                    <span style={{ color:T.text2, fontSize:8.5, fontFamily:T.font, letterSpacing:0.8 }}>{s.lbl}</span>
-                    <span style={{ color:s.clr, fontSize:14, fontFamily:T.font, fontWeight:800, lineHeight:1 }}>{s.val}</span>
-                  </div>
-                ))}
-                <div style={{ width:1, height:22, background:T.border, flexShrink:0 }}/>
-              </>
-            )}
-
-            {["ALL","BULLISH","BEARISH","ALERTS"].map(f => (
-              <button key={f} onClick={() => setTechFilter(f)}
-                style={{
-                  background: techFilter===f ? T.cyan+"14" : "transparent",
-                  border: `1px solid ${techFilter===f ? T.cyan+"45" : T.border}`,
-                  color: techFilter===f ? T.cyan : T.text2,
-                  borderRadius:5, padding:"5px 11px", cursor:"pointer",
-                  fontFamily:T.font, fontSize:9.5, fontWeight:600, letterSpacing:0.3,
-                }}>
-                {f==="BULLISH"?"▲ ":f==="BEARISH"?"▼ ":f==="ALERTS"?"🚨 ":""}
-                {f}
-                {techStats && f==="ALL"     ? ` (${techData.length})`    : ""}
-                {techStats && f==="BULLISH" ? ` (${techStats.bullish})`  : ""}
-                {techStats && f==="BEARISH" ? ` (${techStats.bearish})`  : ""}
-                {techStats && f==="ALERTS"  ? ` (${techStats.alerts})`   : ""}
-              </button>
-            ))}
-
-            <div style={{ marginLeft:"auto", display:"flex", gap:6, alignItems:"center" }}>
-              {techLastFetch && (
-                <span style={{ color:T.text2, fontSize:9.5, fontFamily:T.font }}>
-                  {techCached ? "📦" : "✅"} {techLastFetch.toLocaleTimeString()}
-                </span>
-              )}
-              <button onClick={() => fetchTechData(false)} disabled={techLoading}
-                style={{ background:T.bg2, border:`1px solid ${T.border}`, color:T.text1,
-                  borderRadius:5, padding:"5px 12px", cursor:techLoading?"wait":"pointer",
-                  fontFamily:T.font, fontSize:10, fontWeight:600, opacity:techLoading?0.5:1 }}>
-                {techLoading ? "⏳ Loading…" : "🔄 Refresh"}
-              </button>
-              <button onClick={() => fetchTechData(true)} disabled={techLoading}
-                style={{ background:T.cyanDim, border:`1px solid ${T.cyanMid}`, color:T.cyan,
-                  borderRadius:5, padding:"5px 12px", cursor:techLoading?"wait":"pointer",
-                  fontFamily:T.font, fontSize:10, fontWeight:700, opacity:techLoading?0.5:1 }}>
-                ⚡ Force
-              </button>
-            </div>
-          </>
+            </>
+          )}
+        </div>
         )}
       </div>
 
@@ -2367,6 +2594,11 @@ function PageSignals({ tickers = new Map(), selectedSectors = ["ALL"], T }) {
         </div>
       )}
 
+      {/* ═══ EARNINGS SUB-TAB VIEW ═══ */}
+      {signalView === "EARNINGS" && (
+        <EarningsSubPanel T={T} />
+      )}
+
       {/* ═══ TECH ANALYSIS VIEW ═══ */}
       {signalView === "TECH" && (
         <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
@@ -2511,22 +2743,45 @@ function PageEarnings({ T }) {
         setError(null);
         const startDate = weekDates[0]?.isoDate;
         const endDate = weekDates[weekDates.length - 1]?.isoDate;
-        
-        console.log('[Earnings] Fetching data:', { startDate, endDate, url: `${API_BASE}/api/earnings?start=${startDate}&end=${endDate}` });
-        
+
+        const normalize = (data) => {
+          const arr = Array.isArray(data) ? data :
+                      Array.isArray(data?.data) ? data.data :
+                      Array.isArray(data?.earnings) ? data.earnings :
+                      Array.isArray(data?.results) ? data.results : [];
+          return arr.map(e => ({
+            ...e,
+            ticker:       e.ticker        || e.symbol       || "",
+            company_name: e.company_name  || e.name         || "",
+            date:         e.earnings_date || e.date         || e.report_date || "",
+            time:         e.earnings_time || e.time         || e.when        || "TNS",
+            eps_est:      e.eps_estimate  || e.eps_est      || e.epsEstimate || null,
+            rev_est:      e.rev_estimate  || e.rev_est      || e.revenueEstimate || null,
+          }));
+        };
+
+        // Try full week range first
         const res = await fetch(`${API_BASE}/api/earnings?start=${startDate}&end=${endDate}`);
-        console.log('[Earnings] Response status:', res.status, res.statusText);
-        
-        if (!res.ok) {
-          const errorText = await res.text();
-          console.error('[Earnings] HTTP error:', res.status, errorText);
-          throw new Error(`HTTP ${res.status}: ${errorText}`);
-        }
-        
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        console.log('[Earnings] Data received:', { count: data?.length || 0, sample: data?.[0] });
-        
-        setEarningsData(data || []);
+        let normalized = normalize(data);
+
+        // If week range returned nothing, fall back to fetching each day individually
+        if (normalized.length === 0) {
+          console.log('[Earnings] Week range empty — trying per-day fetches');
+          const perDayResults = await Promise.all(
+            weekDates.map(d =>
+              fetch(`${API_BASE}/api/earnings?start=${d.isoDate}&end=${d.isoDate}`)
+                .then(r => r.ok ? r.json() : [])
+                .then(d => normalize(d))
+                .catch(() => [])
+            )
+          );
+          normalized = perDayResults.flat();
+          console.log('[Earnings] Per-day fallback total:', normalized.length);
+        }
+
+        setEarningsData(normalized);
         setLoading(false);
       } catch (err) {
         console.error('[Earnings] Fetch error:', err);
@@ -2552,7 +2807,7 @@ function PageEarnings({ T }) {
   // Filter earnings by selected day
   const dayEarnings = useMemo(() => {
     if (!activeDay) return [];
-    return earningsData.filter(e => e.date === activeDay || e.earnings_date === activeDay);
+    return earningsData.filter(e => e.date === activeDay);
   }, [earningsData, activeDay]);
 
   return (
@@ -3108,6 +3363,7 @@ function PagePortfolio({ tickers = new Map(), marketSession = "market", T }) {
 export default function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp = 'all', sector: sectorProp = 'ALL', onSourceChange, onSectorChange, onThemeChange, currentTheme = 'auto', onSignOut, user }) {
   // Active page state - persisted in localStorage
   const [quickFilter, setQuickFilter] = useState(null);
+  const [showAppearance, setShowAppearance] = useState(false);
   const [page, setPage] = useState(() => {
     try {
       const saved = localStorage.getItem('nexradar_active_page');
@@ -3166,6 +3422,23 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
   // WebSocket state for live ticker data
   const [tickers, setTickers] = useState(new Map());
   const wsRef = useRef(null);
+
+  // ── Signal Engine stats (sidebar) ─────────────────────────────────────────
+  const [sideWatchlist, setSideWatchlist] = useState(0);
+  useEffect(() => {
+    fetch(`${API_BASE}/api/watchlist`)
+      .then(r => r.ok ? r.json() : {})
+      .then(d => setSideWatchlist((d.watchlist ?? []).length))
+      .catch(() => {});
+  }, []);
+  const sideSignalCount = useMemo(() => {
+    let count = 0;
+    for (const t of tickers.values()) {
+      if (t.signal === "BUY" || t.signal === "SELL") count++;
+    }
+    return count;
+  }, [tickers]);
+  const sideBarsCount = tickers.size;
   // Ref that carries the PageLiveTable watchlist setter into the WS closure.
   // The WS handler is created once on mount; without a ref it would capture a
   // stale setWatchlistFromWS that does nothing.
@@ -3277,6 +3550,7 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
             if (wsWatchlistRef.current) {
               wsWatchlistRef.current(new Set(msg.watchlist ?? []));
             }
+            setSideWatchlist((msg.watchlist ?? []).length);
             return;
           }
 
@@ -3470,7 +3744,7 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
 
         {/* Nav */}
         <nav style={{ padding:"9px 7px", flex:1, display:"flex", flexDirection:"column", gap:2 }}>
-          {NAV.map(n=>(
+          {NAV.map(n => (
             <button key={n.id} className={`nav-btn${page===n.id?" active":""}`} onClick={()=>setPage(n.id)} title={sideCollapsed?n.label:""}>
               <span className="icon">{n.icon}</span>
               {!sideCollapsed && <span style={{ whiteSpace:"nowrap" }}>{n.label}</span>}
@@ -3483,14 +3757,27 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
           <div style={{ padding:13, borderTop:`1px solid ${T.border}`, flexShrink:0 }}>
             <div style={{ color:T.text2, fontSize:8.5, letterSpacing:2, marginBottom:9 }}>SIGNAL ENGINE</div>
             <div style={{ display:"flex", gap:7, marginBottom:8 }}>
-              {[["WATCHING","—"],["SIGNALS","—"],["BARS","—"]].map(([l,v])=>(
+              {[
+                ["WATCHING", sideWatchlist,   T.gold],
+                ["SIGNALS",  sideSignalCount, T.green],
+                ["BARS",     sideBarsCount,   T.cyan],
+              ].map(([l, v, c]) => (
                 <div key={l} style={{ flex:1, background:T.bg2, border:`1px solid ${T.border}`, borderRadius:5, padding:"5px 7px", textAlign:"center" }}>
                   <div style={{ color:T.text2, fontSize:7.5, letterSpacing:1 }}>{l}</div>
-                  <div style={{ color:T.cyan, fontFamily:T.font, fontSize:14, fontWeight:700, marginTop:2 }}>{v}</div>
+                  <div style={{ color: v > 0 ? c : T.text2, fontFamily:T.font, fontSize:14, fontWeight:700, marginTop:2 }}>
+                    {v > 0 ? v.toLocaleString() : "—"}
+                  </div>
                 </div>
               ))}
             </div>
-            <button className="btn-primary" style={{ width:"100%", padding:"8px 0", fontSize:10 }}>✓ APPLY WATCHLIST</button>
+            <button
+              className="btn-primary"
+              style={{ width:"100%", padding:"8px 0", fontSize:10 }}
+              onClick={() => setPage("live")}
+              title="Go to Live Table filtered by your watchlist"
+            >
+              ✓ APPLY WATCHLIST
+            </button>
           </div>
         )}
 
@@ -3602,52 +3889,6 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
             ⚡
           </button>
 
-          {/* Theme Selector */}
-          {onThemeChange && (
-            <div style={{ position:"relative", display:"inline-block" }} className="theme-selector-group">
-              <button 
-                style={{ 
-                  width:36, height:36, borderRadius:6, background:T.bg2, border:`1px solid ${T.border}`, 
-                  display:"flex", alignItems:"center", justifyContent:"center", 
-                  cursor:"pointer", color:T.text1, fontSize:16, transition:"all 0.2s"
-                }}
-                onMouseEnter={e => { e.currentTarget.style.borderColor=T.cyanMid; e.currentTarget.style.color=T.cyan; }}
-                onMouseLeave={e => { e.currentTarget.style.borderColor=T.border; e.currentTarget.style.color=T.text1; }}
-                title="Change theme"
-              >
-                {currentTheme === 'light' ? '☀️' : currentTheme === 'dark' ? '🌙' : currentTheme === 'high-contrast' ? '◐' : '⚡'}
-              </button>
-              <div className="theme-dropdown" style={{ 
-                position:"absolute", right:0, top:"calc(100% + 8px)", width:220, 
-                background:T.bg1, border:`1px solid ${T.border}`, borderRadius:8, 
-                boxShadow:"0 8px 24px rgba(0,0,0,0.4)", zIndex:9999,
-                opacity:0, visibility:"hidden", transition:"opacity 0.2s, visibility 0.2s", padding:8
-              }}>
-                {[
-                  { id:'light', icon:'☀️', label:'Light' },
-                  { id:'dark', icon:'🌙', label:'Dark' },
-                  { id:'high-contrast', icon:'◐', label:'High Contrast' },
-                  { id:'auto', icon:'⚡', label:'Auto (Day/Night)' },
-                ].map(({ id, icon, label }) => (
-                  <div key={id} onClick={() => onThemeChange(id)}
-                    style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:10,
-                      padding:"10px 14px", borderRadius:6, cursor:"pointer",
-                      background: currentTheme===id ? T.cyan+"14" : "transparent",
-                      color: currentTheme===id ? T.cyan : T.text1,
-                      fontFamily:T.font, fontSize:13, fontWeight:500, transition:"all 0.15s"
-                    }}
-                    onMouseEnter={e => { if(currentTheme!==id) e.currentTarget.style.background=T.bg2; }}
-                    onMouseLeave={e => { if(currentTheme!==id) e.currentTarget.style.background="transparent"; }}
-                  >
-                    <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-                      <span style={{ fontSize:16 }}>{icon}</span><span>{label}</span>
-                    </div>
-                    {currentTheme===id && <span style={{ color:T.cyan, fontSize:14, fontWeight:700 }}>✓</span>}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
 
           {/* User Avatar + Dropdown */}
           <div style={{ position:"relative" }}>
@@ -3670,6 +3911,20 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
                   <div style={{ color:T.text2, fontFamily:T.font, fontSize:11, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
                     {user?.email || ""}
                   </div>
+                </div>
+                {/* Appearance */}
+                <div style={{ padding:"6px 6px 0" }}>
+                  <button
+                    onClick={() => { setHeaderPanel(null); setShowAppearance(true); }}
+                    style={{ width:"100%", display:"flex", alignItems:"center", gap:10,
+                      padding:"10px 12px", background:"transparent", border:"none",
+                      borderRadius:6, cursor:"pointer", color:T.text1, fontFamily:T.font,
+                      fontSize:13, fontWeight:500, transition:"background 0.15s", textAlign:"left" }}
+                    onMouseEnter={e => e.currentTarget.style.background = T.bg2}
+                    onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+                  >
+                    <span style={{ fontSize:15 }}>🎨</span> Appearance
+                  </button>
                 </div>
                 {/* Sign out */}
                 <div style={{ padding:6 }}>
@@ -3776,17 +4031,6 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
                   <div style={{ color:T.text2, fontFamily:T.font, fontSize:10, marginTop:3 }}>{s.note}</div>
                 </div>
               ))}
-              <div style={{ padding:"12px 16px", borderBottom:`1px solid ${T.border}` }}>
-                <div style={{ color:T.text1, fontFamily:T.font, fontSize:12, fontWeight:600, marginBottom:8 }}>Theme</div>
-                <div style={{ display:"flex", gap:6 }}>
-                  {[["🌙","dark"],["☀️","light"],["⚡","auto"]].map(([icon,id]) => (
-                    <button key={id} onClick={() => onThemeChange && onThemeChange(id)}
-                      style={{ flex:1, padding:"6px 0", borderRadius:6, border:`1px solid ${currentTheme===id ? T.cyanMid : T.border}`, background:currentTheme===id ? T.cyanDim : T.bg2, color:currentTheme===id ? T.cyan : T.text2, fontFamily:T.font, fontSize:12, cursor:"pointer", transition:"all 0.15s" }}>
-                      {icon} {id}
-                    </button>
-                  ))}
-                </div>
-              </div>
               <div style={{ padding:"12px 16px", display:"flex", gap:8 }}>
                 <button onClick={() => setHeaderPanel(null)} style={{ flex:1, padding:"8px 0", borderRadius:6, border:`1px solid ${T.border}`, background:T.bg2, color:T.text1, fontFamily:T.font, fontSize:12, cursor:"pointer" }}>Close</button>
                 <button onClick={() => { setPage("dashboard"); setHeaderPanel(null); }} style={{ flex:1, padding:"8px 0", borderRadius:6, border:"none", background:T.cyan, color:"#000", fontFamily:T.font, fontSize:12, fontWeight:700, cursor:"pointer" }}>Dashboard</button>
@@ -3856,7 +4100,17 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
           </div>
         )}
 
-        {/* Page content */}
+        {/* Appearance Modal */}
+        {showAppearance && (
+          <AppearanceModal
+            T={T}
+            currentTheme={currentTheme}
+            onThemeChange={t => { if (onThemeChange) onThemeChange(t); }}
+            onClose={() => setShowAppearance(false)}
+          />
+        )}
+
+      {/* Page content */}
         <div key={page} style={{ flex:1, overflowY:"auto", padding:18 }}>
           {renderPage()}
         </div>
