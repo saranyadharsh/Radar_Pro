@@ -530,3 +530,72 @@ async def get_news(symbol: str):
     except Exception as e:
         from fastapi import HTTPException
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# ── Polygon.io Proxy — 1-min OHLCV bars for real-time candlestick chart ───────
+@app.get("/api/chart/{symbol}")
+async def get_chart_bars(symbol: str, interval: str = "1", range: str = "1d"):
+    """
+    Proxy to Polygon.io aggregates API — returns OHLCV bars for the chart.
+    Uses the server-side MASSIVE_API_KEY so the key is never exposed to the browser.
+    Called by TVChart (custom canvas candlestick) in the React frontend.
+
+    Query params:
+      interval : bar size in minutes (1, 5, 15, 60) — default 1
+      range    : lookback period (1d, 5d, 1mo) — default 1d
+
+    Returns: { bars: [{t, o, h, l, c, v}, ...], symbol, interval }
+    """
+    import os
+    from datetime import datetime, timedelta
+    import pytz
+
+    api_key = os.getenv("MASSIVE_API_KEY", "")
+    if not api_key:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=503, detail="Polygon API key not configured")
+
+    sym = symbol.upper()
+    multiplier = int(interval) if interval.isdigit() else 1
+    timespan   = "minute" if multiplier < 60 else "hour"
+    if multiplier == 60:
+        multiplier = 1
+
+    # Compute date range
+    et = pytz.timezone("America/New_York")
+    now_et = datetime.now(et)
+    if range == "5d":
+        from_dt = now_et - timedelta(days=7)
+    elif range == "1mo":
+        from_dt = now_et - timedelta(days=35)
+    else:  # 1d default
+        from_dt = now_et - timedelta(days=1)
+
+    from_str = from_dt.strftime("%Y-%m-%d")
+    to_str   = now_et.strftime("%Y-%m-%d")
+
+    url = (
+        f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/{multiplier}/{timespan}"
+        f"/{from_str}/{to_str}"
+        f"?adjusted=true&sort=asc&limit=50000&apiKey={api_key}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            data = r.json()
+
+        results = data.get("results") or []
+        bars = [
+            {"t": b["t"], "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b.get("v", 0)}
+            for b in results
+        ]
+        return {"bars": bars, "symbol": sym, "interval": multiplier, "count": len(bars)}
+
+    except httpx.HTTPStatusError as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=e.response.status_code, detail=f"Polygon error: {e.response.status_code}")
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=502, detail=str(e))

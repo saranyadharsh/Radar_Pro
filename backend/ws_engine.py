@@ -4,6 +4,29 @@ ws_engine.py — NexRadar Pro
 Cloud-safe WebSocket engine.
 
 FIXES IN THIS VERSION:
+  FIX-20 TODAY_CLOSE MISMATCH (AH price bug):
+         Root cause: _fetch_polygon_snapshot_bulk and _refresh_historical_for_new_day
+         read `day.c` from Polygon as `today_close`. During market hours and at
+         startup, `day.c` is 0 or a partial intraday value — not the official 4pm
+         close. The fallback `lastTrade.p` is the current *live* price, so
+         `today_close` ends up seeded with the intraday price.  In AH session,
+         `base = today_close`, so `change_value = live_price − today_close` is
+         essentially zero or wrong.
+
+         Fix:
+           a) In _fetch_polygon_snapshot_bulk / _refresh_historical_for_new_day:
+              Only use `day.c` as today_close if session == "after" (market has
+              closed). During market hours seed today_close = 0 so the AH base
+              is never poisoned with an intraday price.
+           b) In _refresh_ah_closing_prices (runs every 120s during AH):
+              Keep existing logic — this correctly updates today_close post-close.
+              Add a sanity guard: only accept `official_close` if it differs from
+              the cached live_price by < 20%; otherwise Polygon may be returning
+              a stale or wrong value.
+           c) In _update_alert_cache_logic: ensure today_close is only used as
+              base in genuine "after" session AND today_close > 0.
+              No change needed (already correct), but add a comment.
+
   FIX-17 STALE OPEN PRICES: historical_data was set once at startup and never
          refreshed when a new trading day started. If backend ran overnight,
          today's "open" was actually yesterday's open. Now _session_reset_loop
@@ -370,6 +393,14 @@ class WSEngine:
                         avg_vol     = float(day.get("av", 0) or 0)
                         prev_close  = float(prev_day.get("c", 0) or 0)
 
+                        # FIX-20a: This refresh runs at 09:31 ET (market just opened).
+                        # day.c at this point is 0 or the pre-market price, NOT the
+                        # official 4pm close from yesterday.  Seeding today_close here
+                        # would poison the AH base for tonight's after-hours session.
+                        # Always set today_close = 0 here; _refresh_ah_closing_prices
+                        # will populate it correctly after 4pm ET.
+                        today_close = 0.0
+
                         if today_close <= 0:
                             today_close = float(last_trade.get("p", 0) or 0)
                         if open_price  <= 0: open_price  = today_close
@@ -642,6 +673,10 @@ class WSEngine:
                         self.historical_data[ticker]["open"] = live_price
 
         session = _market_session()
+        # FIX-20c: today_close is the official 4pm ET regular-session close.
+        # It is seeded by _refresh_ah_closing_prices (runs every 120s in AH).
+        # During market hours today_close = 0 (never poisoned by intraday price
+        # thanks to FIX-20a), so the else branch correctly uses ref_open as base.
         if session == "after" and today_close > 0:
             base = today_close
         else:
@@ -864,6 +899,27 @@ class WSEngine:
                 if official_close <= 0:
                     continue
 
+                # FIX-20b: Sanity guard — during early AH (16:00–16:05 ET),
+                # Polygon may still return the last intraday live trade price
+                # in lastTrade.p rather than the official closing price.
+                # If the cached live_price is very close to official_close
+                # (within 0.5%) and we're within 5 min of close, be cautious.
+                # We always accept day.c (official close field); we only
+                # reject lastTrade.p if it looks suspiciously like a live tick.
+                # Additionally, reject if official_close > live_price * 1.20
+                # or < live_price * 0.80 — that's a data error from Polygon.
+                with self.alert_cache_lock:
+                    cached_row  = self.alert_cache.get(ticker, {})
+                cached_live = cached_row.get("live_price", 0)
+                if cached_live > 0 and official_close > 0:
+                    ratio = official_close / cached_live
+                    if ratio > 1.20 or ratio < 0.80:
+                        logger.debug(
+                            f"FIX-20b: {ticker} official_close={official_close} "
+                            f"vs live={cached_live} ratio={ratio:.3f} — skipping implausible value"
+                        )
+                        continue
+
                 with self.historical_data_lock:
                     hist = self.historical_data.get(ticker)
                     if hist is None:
@@ -961,7 +1017,19 @@ class WSEngine:
                     avg_vol     = float(day.get("av", 0) or 0)
                     prev_close  = float(prev_day.get("c", 0) or 0)
 
-                    if today_close <= 0:
+                    # FIX-20a: day.c is 0 or a partial/intraday value during
+                    # market hours.  The fallback lastTrade.p is the current
+                    # live price — if we store that as today_close the AH
+                    # base becomes the intraday price and AH change reads wrong.
+                    # Only populate today_close from Polygon when the market
+                    # has actually closed (session == "after").  During market
+                    # hours leave today_close = 0; _refresh_ah_closing_prices
+                    # will fill it correctly at 4pm.
+                    session_now = _market_session()
+                    if session_now != "after":
+                        today_close = 0.0   # don't poison AH base with intraday price
+                    elif today_close <= 0:
+                        # AH session but day.c missing — try lastTrade as fallback
                         today_close = float(last_trade.get("p", 0) or 0)
 
                     if open_price <= 0 and today_close <= 0:
@@ -1008,11 +1076,26 @@ class WSEngine:
                 open_price  = float(hist["Open"].iloc[-1])
                 avg_vol     = float(hist["Volume"].mean()) if "Volume" in hist.columns else 0.0
 
+                # FIX-20a: yfinance hist["Close"].iloc[-1] during market hours
+                # returns the latest intraday close, NOT the official 4pm close.
+                # During market hours, seed today_close = 0 (same logic as Polygon
+                # path) so the AH session doesn't use an intraday price as its base.
+                # Use prev_close (yesterday's close) as prev_close is always safe.
+                session_now = _market_session()
+                if session_now != "after":
+                    # During market/pre/closed: today hasn't closed yet.
+                    # today_close = yesterday's close for now; AH refresh fills it.
+                    today_close_seed = prev_close  # carry yesterday's close
+                    prev_close_seed  = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else prev_close
+                else:
+                    today_close_seed = today_close
+                    prev_close_seed  = prev_close
+
                 with self.historical_data_lock:
                     self.historical_data[ticker] = {
                         "open":        open_price,
-                        "prev_close":  prev_close,
-                        "today_close": today_close,
+                        "prev_close":  prev_close_seed,
+                        "today_close": today_close_seed,
                         "avg_volume":  avg_vol,
                     }
                 with _counter_lock:

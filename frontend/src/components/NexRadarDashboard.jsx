@@ -1,5 +1,58 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback, Component } from "react";
 import { API_BASE } from "../config.js";
+
+// ─── Global Error Boundary ───────────────────────────────────────────────────
+// Wraps the entire app shell. Catches runtime errors from any child component
+// (TradingView iframes crashing, malformed API data, third-party failures)
+// so a single component failure cannot unmount the whole dashboard.
+// Must be a class component — React has no hook equivalent for componentDidCatch.
+class NexRadarErrorBoundary extends Component {
+  state = { hasError: false, error: null, info: null };
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, info) {
+    console.error("[NexRadar] Uncaught error:", error, info);
+    this.setState({ info });
+  }
+  render() {
+    if (this.state.hasError) {
+      const T = getThemeTokens(true);
+      return (
+        <div style={{
+          display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center",
+          height:"100vh", background:T.bg0, fontFamily:T.font, gap:16, padding:40
+        }}>
+          <div style={{ fontSize:48, opacity:0.4 }}>⚠</div>
+          <div style={{ color:T.red, fontSize:16, fontWeight:700, letterSpacing:0.5 }}>
+            SIGNAL LOST — UNEXPECTED ERROR
+          </div>
+          <div style={{ color:T.text2, fontSize:12, maxWidth:480, textAlign:"center", lineHeight:1.7 }}>
+            {this.state.error?.message || "An unknown error occurred."}
+          </div>
+          <button
+            onClick={() => this.setState({ hasError:false, error:null, info:null })}
+            style={{
+              background:T.cyanDim, border:`1px solid ${T.cyanMid}`, color:T.cyan,
+              borderRadius:6, padding:"8px 20px", cursor:"pointer",
+              fontFamily:T.font, fontSize:12, fontWeight:700, letterSpacing:0.5, marginTop:8
+            }}>
+            ↺ RELOAD DASHBOARD
+          </button>
+          {this.state.info && (
+            <details style={{ color:T.text3, fontSize:10, fontFamily:T.fontMono || "monospace", maxWidth:600, textAlign:"left" }}>
+              <summary style={{ cursor:"pointer", color:T.text2 }}>Component stack</summary>
+              <pre style={{ marginTop:8, whiteSpace:"pre-wrap", wordBreak:"break-all" }}>
+                {this.state.info.componentStack}
+              </pre>
+            </details>
+          )}
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // ─── Market Session Detection (ET, client-side) ─────────────────────────────
 function getMarketSession() {
@@ -402,45 +455,72 @@ function EmptyChart({ height=180, label="Awaiting live data feed", T }) {
   );
 }
 
-// ─── TradingView Embed — exchange-aware, auto-retries NYSE/AMEX ──────────────
-// TradingView resolves most US symbols without an exchange prefix.
-// ─── TradingView Embed ─ iframe, extended hours ──────────────────────────────
-function TVChart({ symbol, height = 220, T, interval = "5", style = "1" }) {
-  const bg1 = T?.bg1 || "#060d18";
+// ─── TradingView Embedded Widget — iframe approach ───────────────────────────
+// Uses widgetembed URL instead of the tv.js widget constructor.
+// Benefits vs constructor approach:
+//   • Each chart is a fully isolated iframe — no shared JS globals
+//   • No tv-js-ready event listeners piling up across mounts (memory-leak fix)
+//   • No race conditions when multiple charts mount simultaneously
+//   • Candles fill the full iframe height — much more readable in matrix view
+//   • Zero script injection required
+//
+// Interval mapping: NexRadar TF keys → TradingView interval strings
+const TV_INTERVAL_MAP = {
+  "1":"1", "5":"5", "15":"15", "60":"60", "240":"240",
+  "D":"D", "W":"W",
+  // PageChart TF_MAP aliases
+  "1m":"1", "5m":"5", "15m":"15", "1H":"60", "4H":"240", "1D":"D", "1W":"W",
+};
+
+function TVChart({ symbol, height = 220, T, interval = "5", livePrice = null }) {
+  const bg    = T?.bg1   || "#060d18";
+  const text2 = T?.text2 || "#4a6278";
+  const cyan  = T?.cyan  || "#00bcd4";
 
   if (!symbol) return (
-    <div style={{
-      width: "100%", height, background: bg1,
-      display: "flex", alignItems: "center", justifyContent: "center",
-      color: T?.text2 || "#4a6278", fontSize: 13,
-    }}>
+    <div style={{ width:"100%", height, background:bg, display:"flex",
+      alignItems:"center", justifyContent:"center", color:text2, fontSize:13 }}>
       Select a symbol to view chart
     </div>
   );
 
+  const tvInterval = TV_INTERVAL_MAP[interval] || interval || "5";
   const params = new URLSearchParams({
-    symbol:              symbol,
-    interval:            interval,
-    timezone:            "America/New_York",
-    theme:               "dark",
-    style:               style,
-    locale:              "en",
-    extended_hours:      "1",
-    hide_top_toolbar:    "0",
-    hide_side_toolbar:   "1",
-    hide_legend:         "1",
-    allow_symbol_change: "1",
-    save_image:          "0",
+    symbol,
+    interval:         tvInterval,
+    timezone:         "America/New_York",
+    theme:            "dark",
+    style:            "1",   // candlestick
+    locale:           "en",
+    extended_hours:   "1",
+    hide_top_toolbar: "0",
+    hide_side_toolbar:"1",
+    hide_legend:      "1",
+    allow_symbol_change: "0",
+    save_image:       "0",
+    studies:          "Volume@tv-basicstudies",
   });
 
   return (
-    <iframe
-      key={`${symbol}-${interval}-${style}`}
-      src={`https://s.tradingview.com/widgetembed/?${params.toString()}`}
-      style={{ width: "100%", height, border: "none", display: "block", background: bg1 }}
-      allowFullScreen
-      title={`TradingView Chart — ${symbol}`}
-    />
+    <div style={{ position:"relative", width:"100%", height, background:bg }}>
+      {/* Live price badge */}
+      {livePrice != null && (
+        <div style={{ position:"absolute", top:6, right:8, zIndex:10,
+          background:"rgba(6,13,24,0.85)", border:`1px solid ${cyan}44`,
+          borderRadius:4, padding:"2px 8px",
+          fontFamily:"monospace", fontSize:11, color:T?.text0||"#e8f4fd",
+          pointerEvents:"none", backdropFilter:"blur(4px)" }}>
+          ${livePrice.toFixed(2)} <span style={{ color:cyan, fontSize:8 }}>●LIVE</span>
+        </div>
+      )}
+      <iframe
+        key={`${symbol}-${tvInterval}`}
+        src={`https://s.tradingview.com/widgetembed/?${params.toString()}`}
+        style={{ width:"100%", height, border:"none", display:"block" }}
+        allowFullScreen
+        title={`TradingView — ${symbol}`}
+      />
+    </div>
   );
 }
 
@@ -762,7 +842,7 @@ function EarningsSubPanel({ T }) {
 
 // ─── PAGE: Dashboard ──────────────────────────────────────────────────────────
 // Market Breadth now includes EARNINGS tile with real-time sector performance
-function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerformance = {}, tickers, T }) {
+function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerformance = {}, tickers, techData = [], techLoading = false, T }) {
   const sectorTiles = SECTORS.filter(s => s.id !== "ALL");
   
   // Fetch earnings data for Earnings Today widget
@@ -775,7 +855,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
   // Market Breadth timeframe state
   const [breadthTimeframe, setBreadthTimeframe] = useState("1D");
   
-  // Scalp Signals filter state
+  // Scalp Signals filter state — ALL | LONG | SHORT | INST
   const [scalpFilter, setScalpFilter] = useState("ALL");
   
   useEffect(() => {
@@ -818,7 +898,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
   return (
     <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:18 }}>
       {/* Market Breadth (includes Earnings) + Scalp Signals */}
-      <div style={{ display:"flex", gap:18, flexWrap:"wrap" }}>
+      <div style={{ display:"flex", gap:18, flexWrap:"wrap", alignItems:"stretch" }}>
         <div className="card card-glow" style={{ flex:2, minWidth:340 }}>
           <SectionHeader title="Market Breadth" T={T}>
             <button 
@@ -992,101 +1072,185 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
           </div>
         </div>
 
-        {/* Scalp Signals */}
-        <div className="card" style={{ flex:1, minWidth:200, alignSelf:"flex-start" }}>
+        {/* Scalp Signals — Tech Analysis Alert Feed */}
+        <div className="card" style={{ flex:1, minWidth:200, display:"flex", flexDirection:"column" }}>
           <SectionHeader title="Scalp Signals" T={T}>
-            <button 
-              className="btn-ghost" 
-              style={{ 
-                fontSize:9, 
-                background: scalpFilter === "ALL" ? T.cyan+"20" : "transparent",
-                color: scalpFilter === "ALL" ? T.cyan : T.text2,
-                padding:"4px 8px",
-                borderRadius:4
-              }}
-              onClick={() => setScalpFilter("ALL")}
-            >
-              ALL
-            </button>
-            <button 
-              className="btn-ghost" 
-              style={{ 
-                fontSize:9,
-                background: scalpFilter === "LONG" ? T.green+"20" : "transparent",
-                color: scalpFilter === "LONG" ? T.green : T.text2,
-                padding:"4px 8px",
-                borderRadius:4
-              }}
-              onClick={() => setScalpFilter("LONG")}
-            >
-              LONG
-            </button>
-            <button 
-              className="btn-ghost" 
-              style={{ 
-                fontSize:9,
-                background: scalpFilter === "SHORT" ? T.red+"20" : "transparent",
-                color: scalpFilter === "SHORT" ? T.red : T.text2,
-                padding:"4px 8px",
-                borderRadius:4
-              }}
-              onClick={() => setScalpFilter("SHORT")}
-            >
-              SHORT
-            </button>
+            {[
+              { key:"ALL",  label:"ALL",  color: T.cyan  },
+              { key:"LONG", label:"LONG", color: T.green },
+              { key:"SHORT",label:"SHORT",color: T.red   },
+              { key:"INST", label:"🐋 INST", color: T.purple },
+            ].map(f => (
+              <button key={f.key} className="btn-ghost"
+                style={{
+                  fontSize:9, padding:"4px 8px", borderRadius:4,
+                  background: scalpFilter === f.key ? f.color+"20" : "transparent",
+                  color:      scalpFilter === f.key ? f.color : T.text2,
+                  border:     `1px solid ${scalpFilter === f.key ? f.color+"40" : T.border}`,
+                }}
+                onClick={() => setScalpFilter(f.key)}>{f.label}</button>
+            ))}
           </SectionHeader>
-          <div style={{ padding:"8px 14px" }}>
+
+          <div style={{ padding:"8px 0", flex:1, overflowY:"auto", maxHeight:320 }}>
             {(() => {
-              const tickerArray = Array.from(tickers.values());
-              let topSignals = tickerArray
-                .filter(t => Math.abs(t.percent_change || 0) > 1)
-                .sort((a, b) => Math.abs(b.percent_change || 0) - Math.abs(a.percent_change || 0));
-              
+              // ── Build alert rows from techData ──────────────────────────
+              // Priority order: Institutional → RVOL spike → Score extreme → BB alert
+              const alerts = [];
+
+              techData.forEach(row => {
+                const isInst = row.inst_footprint?.includes("Accumulation") ||
+                               row.inst_footprint?.includes("Distribution");
+                const isAccum = row.inst_footprint?.includes("Accumulation");
+                const isDist  = row.inst_footprint?.includes("Distribution");
+                const highRvol = (row.rvol ?? 0) >= 2.0;
+                const highScore = Math.abs(row.score ?? 0) >= 3;
+                const bbAlert = row.bb_status?.includes("Overextended");
+                const hasAlert = isInst || highRvol || highScore || bbAlert;
+                if (!hasAlert) return;
+
+                // Determine direction
+                const isBullish = row.score > 0 || isAccum ||
+                                  row.trend === "Bullish" || row.rsi_signal === "Oversold";
+                const isBearish = row.score < 0 || isDist  ||
+                                  row.trend === "Bearish" || row.rsi_signal === "Overbought";
+                const direction = isBullish && !isBearish ? "LONG"
+                                : isBearish && !isBullish ? "SHORT"
+                                : row.score >= 0          ? "LONG" : "SHORT";
+
+                // Build alert badges
+                const tags = [];
+                if (isInst) tags.push({
+                  label: isAccum ? "🐋 ACCUM" : "🔻 DIST",
+                  color: isAccum ? T.purple : T.orange,
+                  priority: 1
+                });
+                if (highRvol) tags.push({
+                  label: `⚡ ${row.rvol?.toFixed(1)}x VOL`,
+                  color: T.gold,
+                  priority: 2
+                });
+                if (highScore) tags.push({
+                  label: `◈ ${row.score > 0 ? "+" : ""}${row.score} SCORE`,
+                  color: row.score >= 3 ? T.green : T.red,
+                  priority: 3
+                });
+                if (bbAlert) tags.push({
+                  label: "⚠ BB EXT",
+                  color: T.orange,
+                  priority: 4
+                });
+
+                alerts.push({
+                  ticker: row.ticker,
+                  price:  row.price,
+                  direction,
+                  isInst,
+                  tags,
+                  score: row.score ?? 0,
+                  rvol:  row.rvol  ?? 0,
+                  priority: Math.min(...tags.map(t => t.priority)),
+                });
+              });
+
+              // Sort: inst first, then rvol desc, then score abs desc
+              alerts.sort((a, b) => {
+                if (a.priority !== b.priority) return a.priority - b.priority;
+                if (b.rvol !== a.rvol) return b.rvol - a.rvol;
+                return Math.abs(b.score) - Math.abs(a.score);
+              });
+
               // Apply filter
-              if (scalpFilter === "LONG") {
-                topSignals = topSignals.filter(t => (t.percent_change || 0) > 0);
-              } else if (scalpFilter === "SHORT") {
-                topSignals = topSignals.filter(t => (t.percent_change || 0) < 0);
+              let filtered = alerts;
+              if (scalpFilter === "LONG")  filtered = alerts.filter(a => a.direction === "LONG");
+              if (scalpFilter === "SHORT") filtered = alerts.filter(a => a.direction === "SHORT");
+              if (scalpFilter === "INST")  filtered = alerts.filter(a => a.isInst);
+
+              const visible = filtered.slice(0, 8);
+
+              // Loading state
+              if (techLoading && alerts.length === 0) {
+                return Array(4).fill(0).map((_,i) => (
+                  <div key={i} style={{ padding:"10px 14px", display:"flex", justifyContent:"space-between", alignItems:"center", borderBottom:`1px solid ${T.border}` }}>
+                    <Shimmer w={50} h={11}/><Shimmer w={80} h={11} opacity={0.5}/>
+                  </div>
+                ));
               }
-              
-              topSignals = topSignals.slice(0, 5);
-              
-              if (topSignals.length === 0) {
-                return <EmptyState icon="◉" label="NO SIGNALS" sub="Market is closed or no significant movements" h={160} T={T} />;
-              }
-              
-              return topSignals.map((ticker, i) => {
-                const isLong = (ticker.percent_change || 0) > 0;
+
+              if (visible.length === 0) {
                 return (
-                  <div key={i} style={{ 
+                  <EmptyState icon="◉" label="NO ACTIVE ALERTS"
+                    sub={techData.length === 0
+                      ? "Tech analysis loading…"
+                      : scalpFilter === "INST"
+                        ? "No institutional activity detected"
+                        : "No RVOL spikes or score extremes"}
+                    h={140} T={T}/>
+                );
+              }
+
+              return visible.map((a, i) => {
+                const isLong = a.direction === "LONG";
+                const dirColor = isLong ? T.green : T.red;
+                const topTag = a.tags[0];
+                return (
+                  <div key={a.ticker} style={{
                     display:"grid",
                     gridTemplateColumns:"1fr auto auto",
                     alignItems:"center",
-                    padding:"10px 0", 
-                    borderBottom:i<4?`1px solid ${T.border}`:"none",
-                    gap:8
-                  }}>
-                    <span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:400 }}>{ticker.ticker}</span>
-                    <span style={{ 
-                      color: isLong ? T.green : T.red, 
-                      fontSize:9, 
-                      fontFamily:T.font, 
-                      fontWeight:700,
-                      padding:"2px 6px",
-                      borderRadius:4,
-                      background: isLong ? T.green+"15" : T.red+"15",
-                      textAlign:"center"
+                    padding:"9px 14px",
+                    borderBottom: i < visible.length-1 ? `1px solid ${T.border}` : "none",
+                    gap:8,
+                    transition:"background 0.15s",
+                  }}
+                  onMouseEnter={e => e.currentTarget.style.background = T.bg2}
+                  onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                    {/* Ticker + top alert tag */}
+                    <div style={{ display:"flex", flexDirection:"column", gap:3 }}>
+                      <span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>
+                        {a.ticker}
+                      </span>
+                      <span style={{
+                        color: topTag.color, fontSize:9, fontFamily:T.font, fontWeight:600,
+                        background: topTag.color+"18", padding:"1px 6px", borderRadius:3,
+                        width:"fit-content", letterSpacing:0.3
+                      }}>
+                        {topTag.label}
+                      </span>
+                    </div>
+                    {/* Direction */}
+                    <span style={{
+                      color: dirColor, fontSize:9, fontFamily:T.font, fontWeight:700,
+                      padding:"2px 6px", borderRadius:4,
+                      background: dirColor+"18", textAlign:"center", letterSpacing:0.3
                     }}>
-                      {isLong ? "LONG" : "SHORT"}
+                      {isLong ? "▲ LONG" : "▼ SHORT"}
                     </span>
-                    <span style={{ color: isLong ? T.green : T.red, fontSize:12, fontFamily:T.font, fontWeight:700, textAlign:"right" }}>
-                      {pct(ticker.percent_change)}
+                    {/* Price */}
+                    <span style={{ color:T.text0, fontSize:11, fontFamily:T.fontMono||T.font, fontWeight:600, textAlign:"right", minWidth:52 }}>
+                      {a.price ? `$${Number(a.price).toFixed(2)}` : "—"}
                     </span>
                   </div>
                 );
               });
             })()}
+
           </div>
+
+          {/* Footer: data freshness — outside scroll area, always visible */}
+          {techData.length > 0 && (
+            <div style={{ padding:"6px 14px", borderTop:`1px solid ${T.border}`, display:"flex", justifyContent:"space-between", alignItems:"center", flexShrink:0 }}>
+              <span style={{ color:T.text3, fontSize:8.5, fontFamily:T.font }}>
+                {techData.filter(r =>
+                  r.inst_footprint?.includes("Accumulation") || r.inst_footprint?.includes("Distribution") ||
+                  (r.rvol ?? 0) >= 2.0 || Math.abs(r.score ?? 0) >= 3
+                ).length} active alerts · {techData.length} tickers
+              </span>
+              <span style={{ color: T.text3, fontSize:8.5, fontFamily:T.font }}>
+                TA · 5m TTL
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -1313,7 +1477,7 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
 // • AH cols: SYMBOL+name | PREV CLOSE | TODAY CLOSE | LIVE PRICE | CHANGE | %CHG
 // • Source: ALL / WATCHLIST / (Yahoo Finance | TradingView) replaces PORTFOLIO
 // • Matrix view: top 50 clean TradingView charts
-function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", wsWatchlistRef = null, quickFilter = null, onClearQuickFilter = null, T }) {
+function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", wsWatchlistRef = null, quickFilter = null, onClearQuickFilter = null, wsStatus = 'connected', onLiveCount = null, watchlistProp = null, toggleWatchlistProp = null, T }) {
   const [viewMode,   setViewMode]   = useState("TABLE");
   const autoSubMode = SESSION_META[marketSession]?.subMode ?? "MH";
   const [subModeOverride, setSubModeOverride] = useState(null);
@@ -1328,9 +1492,25 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
   const [currentPage, setCurrentPage] = useState(1);
   const [selectedSymbol, setSelectedSymbol] = useState(null); // For chart panel
   const [chartOpenCount, setChartOpenCount] = useState(5); // How many charts to open
-  const [watchlist, setWatchlist] = useState(new Set()); // ★ Persisted signal watchlist
+  // Watchlist is now owned by root NexRadarDashboard and passed as props so
+  // Portfolio tab shares the same state. Fall back to local state if somehow
+  // rendered standalone (e.g. tests / storybook).
+  const [_localWatchlist, _setLocalWatchlist] = useState(new Set());
+  const watchlist       = watchlistProp      ?? _localWatchlist;
+  const setWatchlist    = watchlistProp      ? () => {} : _setLocalWatchlist;
   const tableScrollRef = useRef(null); // Ref for scroll-to-top on page change
   const ITEMS_PER_PAGE = 50;
+  // ── Column sort state ─────────────────────────────────────────────────────
+  const [sortKey, setSortKey] = useState("change");   // default: sort by $ change
+  const [sortDir, setSortDir] = useState("desc");      // "asc" | "desc"
+  const handleColSort = (key) => {
+    setSortKey(prev => {
+      if (prev === key) { setSortDir(d => d === "desc" ? "asc" : "desc"); return key; }
+      setSortDir("desc");
+      return key;
+    });
+    setCurrentPage(1);
+  };
 
   // ── Scalp signal map — BUY/SELL/HOLD badges in SIGNAL column ─────────────
   const [scalpSignals, setScalpSignals] = useState({}); // { TICKER: { signal, direction, strength, confidence } }
@@ -1350,58 +1530,70 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
     return () => clearInterval(id);
   }, []);
   
-  // Fetch earnings for EARNINGS sector filter
+  // Fetch earnings for EARNINGS sector filter — auto-refreshes daily at midnight ET
   const [earningsTickers, setEarningsTickers] = useState(new Set());
-  
+
   useEffect(() => {
-    const now = new Date();
-    const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
-    fetch(`${API_BASE}/api/earnings?start=${today}&end=${today}`)
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .then(data => {
-        const arr = Array.isArray(data) ? data :
-                    Array.isArray(data?.data) ? data.data :
-                    Array.isArray(data?.earnings) ? data.earnings :
-                    Array.isArray(data?.results) ? data.results : [];
-        setEarningsTickers(new Set(arr.map(e => e.ticker || e.symbol).filter(Boolean)));
-      })
-      .catch(err => { console.warn('[NexRadar Live Table] Earnings fetch failed:', err); setEarningsTickers(new Set()); });
+    const fetchTodayEarnings = () => {
+      const now = new Date();
+      const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+      fetch(`${API_BASE}/api/earnings?start=${today}&end=${today}`)
+        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+        .then(data => {
+          const arr = Array.isArray(data) ? data :
+                      Array.isArray(data?.data) ? data.data :
+                      Array.isArray(data?.earnings) ? data.earnings :
+                      Array.isArray(data?.results) ? data.results : [];
+          setEarningsTickers(new Set(arr.map(e => e.ticker || e.symbol).filter(Boolean)));
+        })
+        .catch(err => { console.warn('[NexRadar Live Table] Earnings fetch failed:', err); setEarningsTickers(new Set()); });
+    };
+
+    // Fetch immediately on mount
+    fetchTodayEarnings();
+
+    // Schedule re-fetch at next midnight ET (daily reset)
+    const scheduleMidnightRefresh = () => {
+      const etNow    = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+      const midnight = new Date(etNow);
+      midnight.setHours(24, 0, 5, 0); // 00:00:05 next day ET
+      const msUntil  = midnight.getTime() - etNow.getTime();
+      return setTimeout(() => {
+        fetchTodayEarnings();
+        // Re-arm for the following midnight
+        scheduleMidnightRefresh();
+      }, msUntil);
+    };
+    const midnightTimer = scheduleMidnightRefresh();
+    return () => clearTimeout(midnightTimer);
   }, []);
 
-  // ── Load watchlist from backend on mount ─────────────────────────────────
+  // ── Watchlist: delegate to root props when available ─────────────────────
+  // Root NexRadarDashboard owns the watchlist state and passes it down so
+  // Portfolio shares the same Set. When props are present (normal runtime),
+  // skip the local fetch and use the prop toggle directly.
   useEffect(() => {
+    if (watchlistProp !== null) return; // root already fetched it
     fetch(`${API_BASE}/api/watchlist`)
       .then(r => r.ok ? r.json() : Promise.reject(r.status))
-      .then(data => setWatchlist(new Set(data.watchlist ?? [])))
+      .then(data => _setLocalWatchlist(new Set(data.watchlist ?? [])))
       .catch(err => console.warn('[NexRadar] Failed to load watchlist:', err));
-  }, []);
+  }, [watchlistProp]);
 
-  // ── Register setter into root ref so WS watchlist_update events reach here ─
-  // The root onmessage handler calls wsWatchlistRef.current(newSet) when
-  // another tab stars/unstars a ticker, keeping all tabs in sync.
-  useEffect(() => {
-    if (wsWatchlistRef) {
-      wsWatchlistRef.current = setWatchlist;
-    }
-    return () => {
-      if (wsWatchlistRef) wsWatchlistRef.current = null;
-    };
-  }, [wsWatchlistRef]);
+  // wsWatchlistRef is now wired to root's setWatchlist — no local registration needed.
+  // (Kept as no-op for safety if rendered standalone.)
 
-  // ── Toggle watchlist — calls backend, optimistic UI update ───────────────
-  const toggleWatchlist = async (symbol) => {
-    const isWatched = watchlist.has(symbol);
+  // ── Toggle watchlist — delegate to root prop or local fallback ────────────
+  const toggleWatchlist = toggleWatchlistProp ?? (async (symbol) => {
+    const isWatched = _localWatchlist.has(symbol);
     const endpoint  = isWatched
       ? `${API_BASE}/api/watchlist/remove`
       : `${API_BASE}/api/watchlist/add`;
-
-    // Optimistic update — instant ★ feedback, no waiting for round-trip
-    setWatchlist(prev => {
+    _setLocalWatchlist(prev => {
       const next = new Set(prev);
       isWatched ? next.delete(symbol) : next.add(symbol);
       return next;
     });
-
     try {
       const res = await fetch(endpoint, {
         method:  'POST',
@@ -1410,15 +1602,14 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
     } catch (err) {
-      // Rollback on failure — revert the optimistic update
       console.error('[NexRadar] Watchlist toggle failed, rolling back:', err);
-      setWatchlist(prev => {
+      _setLocalWatchlist(prev => {
         const next = new Set(prev);
         isWatched ? next.add(symbol) : next.delete(symbol);
         return next;
       });
     }
-  };
+  });
 
   // Convert tickers Map to array and filter by sector
   const tickerArray = useMemo(() => {
@@ -1452,8 +1643,26 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
     if (quickFilter === "AH_MOMT")     arr = arr.filter(t => t.ah_momentum);
     if (quickFilter === "EARN_GAPS")   arr = arr.filter(t => t.is_earnings_gap_play);
     if (quickFilter === "DIAMOND")     arr = arr.filter(t => Math.abs(t.percent_change || 0) >= 5);
-    return arr.sort((a, b) => (b.change_value || 0) - (a.change_value || 0));
-  }, [tickerArray, minDelta, quickFilter]);
+    // Dynamic column sort
+    const dir = sortDir === "desc" ? -1 : 1;
+    arr = arr.slice().sort((a, b) => {
+      let va, vb;
+      switch (sortKey) {
+        case "symbol":    va = a.ticker || ""; vb = b.ticker || ""; return dir * va.localeCompare(vb);
+        case "open":      va = a.open       || 0; vb = b.open       || 0; break;
+        case "price":     va = a.live_price || a.close || 0; vb = b.live_price || b.close || 0; break;
+        case "change":    va = a.change_value   || 0; vb = b.change_value   || 0; break;
+        case "pct":       va = a.percent_change || 0; vb = b.percent_change || 0; break;
+        case "volume":    va = a.volume      || 0; vb = b.volume      || 0; break;
+        case "prev_close":va = a.prev_close  || 0; vb = b.prev_close  || 0; break;
+        case "today_close":va= a.today_close || 0; vb = b.today_close || 0; break;
+        case "live_price":va = a.live_price  || 0; vb = b.live_price  || 0; break;
+        default:          va = a.change_value|| 0; vb = b.change_value|| 0;
+      }
+      return dir * (va - vb);
+    });
+    return arr;
+  }, [tickerArray, minDelta, quickFilter, sortKey, sortDir]);
 
   // Reset to page 1 when filters change
   useEffect(() => {
@@ -1477,7 +1686,14 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
   };
 
   const activeLabel = selectedSectors.includes("ALL") ? "ALL" : selectedSectors.join(" + ");
-  const tickerCount = tickerArray.length; // Use tickerArray (after sector filter) not filteredTickers (after minDelta filter)
+  const tickerCount = tickerArray.length;
+
+  // Report real live count to App-level so the top-bar chip is always accurate.
+  // Required because EARNINGS is a pseudo-sector with count:null — computeSectorTotal()
+  // returns 0 for it, making the chip show "EARNINGS · 0" instead of the real number.
+  useEffect(() => {
+    if (onLiveCount) onLiveCount(tickerArray.length);
+  }, [tickerArray.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const matrixSymbols = useMemo(() => {
     if (filteredTickers && filteredTickers.length > 0) {
@@ -1492,10 +1708,13 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
 
   const openExternalCharts = () => {
     const topSymbols = filteredTickers.slice(0, chartOpenCount).map(t => t.ticker);
+    if (topSymbols.length === 0) return;
+    // Open all tabs synchronously — popup permission must be granted once in Chrome
+    // (lock icon → Site settings → Pop-ups → Allow)
     topSymbols.forEach(sym => {
       const url = extLink === "TradingView"
         ? `https://www.tradingview.com/chart/?symbol=${sym}`
-        : `https://finance.yahoo.com/quote/${sym}/chart`;
+        : `https://finance.yahoo.com/quote/${sym}`;
       window.open(url, "_blank");
     });
   };
@@ -1612,37 +1831,68 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
       {viewMode === "TABLE" && (
         <div style={{ display:"flex", gap:16, height:"100%" }}>
           {/* Main Table */}
-          <div className="card" style={{ flex: selectedSymbol ? "1 1 60%" : "1 1 100%", transition:"flex 0.3s ease" }}>
+          <div className="card" style={{ flex: "1 1 100%", transition:"flex 0.3s ease" }}>
           <SectionHeader title={`Live Stock Data · ${subMode === "MH" ? "Market Hours" : "After Hours"}${!selectedSectors.includes("ALL") ? ` · ${activeLabel}` : ""}`} T={T}>
             <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-              <span style={{ color:T.text2, fontSize:12, fontFamily:T.font, fontWeight:500 }}>{tickerCount.toLocaleString()} tickers</span>
+              <span style={{ color:T.text2, fontSize:12, fontFamily:T.font, fontWeight:500 }}>{filteredTickers.length.toLocaleString()} tickers</span>
               {tickers.size > 0 ? (
                 <>
                   <span className="live-dot"/>
                   <span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:600 }}>LIVE</span>
                 </>
+              ) : wsStatus === 'connecting' ? (
+                <span style={{ color:T.gold, fontSize:12, fontFamily:T.font, fontWeight:500 }}>🔄 RECONNECTING…</span>
+              ) : wsStatus === 'disconnected' ? (
+                <span style={{ color:T.red, fontSize:12, fontFamily:T.font, fontWeight:500 }}>❌ DISCONNECTED</span>
               ) : (
-                <span style={{ color:T.text2, fontSize:12, fontFamily:T.font, fontWeight:500 }}>CONNECTING…</span>
+                <span style={{ color:T.cyan, fontSize:12, fontFamily:T.font, fontWeight:500 }}>⏳ AWAITING SNAPSHOT…</span>
               )}
             </div>
           </SectionHeader>
 
           {/* Column headers */}
           <div style={{ display:"grid", gridTemplateColumns:gridCols, background:T.bg0, borderBottom:`1px solid ${T.border}` }}>
-            {cols.map(c => (
-              <div key={c.key} style={{ padding:"12px 14px", color:T.text0, fontSize:11, letterSpacing:1, fontFamily:T.font, fontWeight:800, textTransform:"uppercase" }}>
-                {c.label} <span style={{ opacity:0.3, fontSize:10 }}>⇅</span>
-              </div>
-            ))}
+            {cols.map(c => {
+              const isActive = sortKey === c.key;
+              const arrow = isActive ? (sortDir === "desc" ? " ↓" : " ↑") : "";
+              return (
+                <div key={c.key} onClick={() => handleColSort(c.key)}
+                  style={{ padding:"12px 14px", color: isActive ? T.cyan : T.text0,
+                    fontSize:11, letterSpacing:1, fontFamily:T.font, fontWeight:800,
+                    textTransform:"uppercase", cursor:"pointer", userSelect:"none",
+                    background: isActive ? T.cyanDim : "transparent",
+                    transition:"color 0.15s, background 0.15s" }}>
+                  {c.label}{arrow}
+                  {!isActive && <span style={{ opacity:0.25, fontSize:10 }}> ⇅</span>}
+                </div>
+              );
+            })}
           </div>
 
           {/* Scrollable Rows Container */}
           <div ref={tableScrollRef} style={{ maxHeight:"calc(100vh - 420px)", minHeight:"300px", overflowY:"auto", overflowX:"hidden", position:"relative" }}>
-            {paginatedTickers.length === 0 ? (
-              <div style={{ padding:40, textAlign:"center", color:T.text2, fontSize:13, fontFamily:T.font }}>
-                {tickers.size === 0 ? 'Waiting for live data from WebSocket...' : 'No tickers match the current filter'}
+            {/* wsStatus-aware empty states — shown when cache is empty (Bug 3 UX) */}
+            {tickers.size === 0 && wsStatus === 'connecting' && (
+              <div style={{ padding:40, textAlign:"center", color:T.gold, fontSize:13, fontFamily:T.font }}>
+                🔄 Reconnecting to live feed… fresh data arriving shortly
               </div>
-            ) : (
+            )}
+            {tickers.size === 0 && wsStatus === 'connected' && (
+              <div style={{ padding:40, textAlign:"center", color:T.cyan, fontSize:13, fontFamily:T.font }}>
+                ⏳ Connected — waiting for snapshot from backend…
+              </div>
+            )}
+            {tickers.size === 0 && wsStatus === 'disconnected' && (
+              <div style={{ padding:40, textAlign:"center", color:T.red, fontSize:13, fontFamily:T.font }}>
+                ❌ WebSocket disconnected — reconnecting automatically
+              </div>
+            )}
+            {paginatedTickers.length === 0 && tickers.size > 0 && (
+              <div style={{ padding:40, textAlign:"center", color:T.text2, fontSize:13, fontFamily:T.font }}>
+                No tickers match the current filter
+              </div>
+            )}
+            {paginatedTickers.length > 0 && (
               <>
                 {paginatedTickers.map((ticker, i) => {
                 const isPositive = (ticker.change_value || 0) >= 0;
@@ -1678,8 +1928,8 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
                           
                           {/* Symbol + Company stacked */}
                           <div 
-                            style={{ flex:1, cursor:"pointer", minWidth:0 }}
-                            onClick={() => setSelectedSymbol(ticker.ticker)}
+                            style={{ flex:1, minWidth:0 }}
+                            
                           >
                             <div style={{ 
                               color:T.cyan, 
@@ -1775,8 +2025,8 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
                           
                           {/* Symbol + Company stacked */}
                           <div 
-                            style={{ flex:1, cursor:"pointer", minWidth:0 }}
-                            onClick={() => setSelectedSymbol(ticker.ticker)}
+                            style={{ flex:1, minWidth:0 }}
+                            
                           >
                             <div style={{ 
                               color:T.cyan, 
@@ -1805,9 +2055,9 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
                           </div>
                         </div>
                         {/* Prev Close */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.prev_close || 0)}</div>
-                        {/* Today Close */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.today_close || 0)}</div>
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{ticker.prev_close > 0 ? `$${fmt2(ticker.prev_close)}` : "—"}</div>
+                        {/* Today Close — only populated after 4pm ET by AH refresh; show — during market hours */}
+                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{ticker.today_close > 0 ? `$${fmt2(ticker.today_close)}` : "—"}</div>
                         {/* Live Price */}
                         <div style={{ padding:"10px 14px", color:T.cyan, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price || 0)}</div>
                         {/* Change */}
@@ -1882,78 +2132,32 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
           </div>
         </div>
           
-          {/* Chart Panel - Appears on right when symbol selected */}
-          {selectedSymbol && (
-            <div className="card" style={{ flex:"1 1 38%", display:"flex", flexDirection:"column", minWidth:400, maxWidth:500 }}>
-              <SectionHeader title={selectedSymbol} T={T}>
-                <button 
-                  className="btn-ghost" 
-                  style={{ fontSize:11, padding:"4px 10px" }}
-                  onClick={() => setSelectedSymbol(null)}
-                >
-                  ✕ CLOSE
-                </button>
-              </SectionHeader>
-              
-              {/* TradingView Chart */}
-              <div style={{ flex:1, minHeight:400 }}>
-                <TVChart symbol={selectedSymbol} height={400} T={T} />
-              </div>
-              
-              {/* Quick Stats */}
-              <div style={{ padding:"14px 16px", borderTop:`1px solid ${T.border}`, background:T.bg0 }}>
-                {(() => {
-                  const tickerData = tickers.get(selectedSymbol);
-                  if (!tickerData) return <div style={{ color:T.text2, fontSize:12, fontFamily:T.font }}>Loading data...</div>;
-                  
-                  const isPositive = (tickerData.change_value || 0) >= 0;
-                  const changeColor = isPositive ? T.green : T.red;
-                  
-                  return (
-                    <div style={{ display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:12 }}>
-                      <div>
-                        <div style={{ color:T.text2, fontSize:11, fontFamily:T.font, marginBottom:4, fontWeight:600 }}>PRICE</div>
-                        <div style={{ color:T.text0, fontSize:18, fontFamily:T.font, fontWeight:700 }}>${fmt2(tickerData.live_price || 0)}</div>
-                      </div>
-                      <div>
-                        <div style={{ color:T.text2, fontSize:11, fontFamily:T.font, marginBottom:4, fontWeight:600 }}>CHANGE</div>
-                        <div style={{ color:changeColor, fontSize:16, fontFamily:T.font, fontWeight:700 }}>
-                          {isPositive ? '+' : ''}{fmt2(tickerData.change_value || 0)} ({pct(tickerData.percent_change || 0)})
-                        </div>
-                      </div>
-                      <div>
-                        <div style={{ color:T.text2, fontSize:11, fontFamily:T.font, marginBottom:4, fontWeight:600 }}>OPEN</div>
-                        <div style={{ color:T.text1, fontSize:14, fontFamily:T.font, fontWeight:600 }}>${fmt2(tickerData.open || 0)}</div>
-                      </div>
-                      <div>
-                        <div style={{ color:T.text2, fontSize:11, fontFamily:T.font, marginBottom:4, fontWeight:600 }}>VOLUME</div>
-                        <div style={{ color:T.text1, fontSize:14, fontFamily:T.font, fontWeight:600 }}>{fmtK(tickerData.volume || 0)}</div>
-                      </div>
-                    </div>
-                  );
-                })()}
-              </div>
-            </div>
-          )}
         </div>
       )}
 
-      {/* ── MATRIX VIEW: Top 50 clean TradingView charts ── */}
+      {/* ── MATRIX VIEW: TradingView charts (real-time if logged in to TV) ── */}
       {viewMode === "MATRIX" && (
         <div>
           <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
-            <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+            <div style={{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" }}>
               <span style={{ color:T.text1, fontSize:10, fontFamily:T.font, letterSpacing:1.5 }}>TOP</span>
-              {[20,50].map(n=>(
+              {[5,10,20,50].map(n=>(
                 <button key={n} className={`btn-ghost${matrixCount===n?" active":""}`}
                   onClick={()=>setMatrixCount(n)} style={{ fontSize:9, padding:"3px 9px" }}>
                   {n}
                 </button>
               ))}
-              <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>clean chart · no indicators</span>
+              <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>
+                TradingView · real-time (log in to TV for extended access)
+              </span>
             </div>
+            <button onClick={() => setViewMode("TABLE")}
+              style={{ background:"none", border:`1px solid ${T.border}`, color:T.text2,
+                borderRadius:4, padding:"3px 10px", cursor:"pointer", fontFamily:T.font, fontSize:9 }}>
+              ✕ CLOSE
+            </button>
           </div>
-          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))", gap:10 }}>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(380px,1fr))", gap:10 }}>
             {matrixSymbols.map(sym => (
               <div key={sym} className="card" style={{ overflow:"hidden" }}>
                 <div style={{ padding:"7px 12px", borderBottom:`1px solid ${T.border}`, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
@@ -1961,7 +2165,8 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
                   <a href={`https://www.tradingview.com/chart/?symbol=${sym}`} target="_blank" rel="noreferrer"
                     style={{ color:T.text2, fontSize:8.5, textDecoration:"none", fontFamily:T.font }}>↗ TV</a>
                 </div>
-                <TVChart symbol={sym} height={180} />
+                <TVChart symbol={sym} height={300} T={T}
+                  livePrice={tickers.get(sym)?.live_price ?? null} />
               </div>
             ))}
           </div>
@@ -2037,12 +2242,20 @@ function _timeAgo(d) {
   return `${Math.floor(m/1440)}d ago`;
 }
 
-function PageChart({ T }) {
-  const [inputVal,   setInputVal]   = useState("");
-  const [sym,        setSym]        = useState("");
+function PageChart({ T, tickers = new Map(), initialSymbol = "" }) {
+  const [inputVal,   setInputVal]   = useState(initialSymbol);
+  const [sym,        setSym]        = useState(initialSymbol);
   const [tf,         setTf]         = useState("1D");
   const [chartStyle, setChartStyle] = useState("1");
   const TF_MAP = {"1m":"1","5m":"5","15m":"15","1H":"60","4H":"240","1D":"D","1W":"W"};
+
+  // When a new initialSymbol is pushed from the global search, load it immediately
+  useEffect(() => {
+    if (initialSymbol) {
+      setInputVal(initialSymbol);
+      setSym(initialSymbol);
+    }
+  }, [initialSymbol]);
   const { stats, loading: sLoad } = useKeyStats(sym);
   const { news,  loading: nLoad } = useNewsFeed(sym);
   const handleLoad = () => { const s = inputVal.trim().toUpperCase(); if (s) setSym(s); };
@@ -2087,7 +2300,8 @@ function PageChart({ T }) {
         <div className="card" style={{ flex:3, minWidth:300, overflow:"hidden" }}>
           <SectionHeader title={sym||"— SELECT SYMBOL"}><Chip color={T.cyan}>{tf}</Chip></SectionHeader>
           {sym
-            ? <TVChart symbol={sym} height={460} T={T} interval={TF_MAP[tf]} style={chartStyle}/>
+            ? <TVChart symbol={sym} height={460} T={T} interval={TF_MAP[tf]}
+                livePrice={tickers.get(sym)?.live_price ?? null}/>
             : <EmptyChart height={460} label="Enter a symbol above and press LOAD or Enter"/>}
         </div>
         <div style={{ flex:1, minWidth:230, display:"flex", flexDirection:"column", gap:14 }}>
@@ -2142,7 +2356,7 @@ function PageChart({ T }) {
 
 
 // ─── PAGE: Signals - Scalp Signals + Pro Scalp Analysis + Tech Analysis ───────
-function PageSignals({ tickers = new Map(), selectedSectors = ["ALL"], T }) {
+function PageSignals({ tickers = new Map(), selectedSectors = ["ALL"], techData = [], techLoading = false, techError = null, techLastFetch = null, techCached = false, techDataAge = 0, onForceFetch = () => {}, T }) {
   const [signalView, setSignalView] = useState("SIGNALS"); // "SIGNALS" | "TECH" | "EARNINGS"
 
   // ── PRO SCALP (Signals tab) state ──────────────────────────────────────────
@@ -2174,33 +2388,13 @@ function PageSignals({ tickers = new Map(), selectedSectors = ["ALL"], T }) {
     return () => clearInterval(proIntervalRef.current);
   }, [signalView]);
 
-  // ── TECH ANALYSIS state (unchanged) ───────────────────────────────────────
-  const [techData,      setTechData]      = useState([]);
-  const [techLoading,   setTechLoading]   = useState(false);
-  const [techError,     setTechError]     = useState(null);
-  const [techLastFetch, setTechLastFetch] = useState(null);
-  const [techCached,    setTechCached]    = useState(false);
+  // ── TECH ANALYSIS state — received from app shell as props ───────────────
+  // (fetched at shell level so Dashboard can also read alerts from techData)
   const [techSortKey,   setTechSortKey]   = useState("score");
   const [techSortAsc,   setTechSortAsc]   = useState(false);
   const [techFilter,    setTechFilter]    = useState("ALL");
 
-  const fetchTechData = (forceRefresh = false) => {
-    setTechLoading(true); setTechError(null);
-    fetch(`${API_BASE}/api/market-monitor${forceRefresh ? "?refresh=1" : ""}`)
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .then(json => {
-        if (json.error) { setTechError(json.error); return; }
-        setTechData(json.data || []);
-        setTechCached(json.cached || false);
-        setTechLastFetch(new Date());
-      })
-      .catch(err => setTechError(err.message))
-      .finally(() => setTechLoading(false));
-  };
-
-  useEffect(() => {
-    if (signalView === "TECH" && techData.length === 0 && !techLoading) fetchTechData();
-  }, [signalView]);
+  const fetchTechData = (forceRefresh = false) => onForceFetch(forceRefresh);
 
   // ── PRO SCALP processed rows ───────────────────────────────────────────────
   const proRows = useMemo(() => {
@@ -2423,11 +2617,19 @@ function PageSignals({ tickers = new Map(), selectedSectors = ["ALL"], T }) {
                 </button>
               ))}
               <div style={{ marginLeft:"auto", display:"flex", gap:6, alignItems:"center" }}>
-                {techLastFetch && (
-                  <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>
-                    {techCached?"📦":"✅"} {techLastFetch.toLocaleTimeString()}
-                  </span>
-                )}
+                {techLastFetch && (() => {
+                  const ageMin = Math.round((Date.now() - techLastFetch.getTime()) / 60000);
+                  const isStale = ageMin >= 5;
+                  const dataAgeMin = Math.round(techDataAge / 60);
+                  return (
+                    <span style={{ color: isStale ? T.gold : T.text2, fontSize:9, fontFamily:T.font, fontWeight: isStale ? 700 : 400 }}>
+                      {isStale ? "⚠️ " : (techCached ? "📦 " : "✅ ")}
+                      fetched {techLastFetch.toLocaleTimeString()}
+                      {techCached && dataAgeMin > 0 ? ` · data ${dataAgeMin}m old` : ""}
+                      {isStale ? " · AUTO-REFRESHING" : ""}
+                    </span>
+                  );
+                })()}
                 <button onClick={() => fetchTechData(false)} disabled={techLoading}
                   style={{ background:T.bg2, border:`1px solid ${T.border}`, color:T.text1,
                     borderRadius:5, padding:"4px 10px", cursor:techLoading?"wait":"pointer",
@@ -2463,6 +2665,47 @@ function PageSignals({ tickers = new Map(), selectedSectors = ["ALL"], T }) {
           {!proLoading && !proError && proData.length === 0 && (
             <EmptyState icon="📊" label="NO WATCHLIST TICKERS"
               sub="Star (★) some tickers in the Live Table. Signals run real-time indicator analysis on your ★ watchlist." h={240} T={T}/>
+          )}
+
+          {/* ── Warming-up state ─────────────────────────────────────────────
+               Shown when tickers ARE starred but the engine hasn't yet
+               accumulated the minimum 27 bars needed to emit a signal.
+               Without this block: proData.length > 0 hides the empty-state,
+               but proRows.length === 0 (all warming_up) skips the table too
+               → completely blank screen with no user feedback.
+          ──────────────────────────────────────────────────────────────────── */}
+          {!proLoading && !proError && proData.length > 0 && proRows.length === 0 && proWarmingUp.length > 0 && (
+            <div className="card" style={{ padding:"32px 24px", textAlign:"center" }}>
+              <div style={{ fontSize:32, marginBottom:12 }}>⏳</div>
+              <div style={{ color:T.text0, fontFamily:T.font, fontSize:14, fontWeight:700, marginBottom:8, letterSpacing:0.5 }}>
+                ENGINE WARMING UP
+              </div>
+              <div style={{ color:T.text2, fontFamily:T.font, fontSize:12, marginBottom:20, maxWidth:440, margin:"0 auto 20px" }}>
+                {proWarmingUp.length} ticker{proWarmingUp.length !== 1 ? "s" : ""} accumulating bars.
+                Signals activate after <span style={{ color:T.cyan, fontWeight:700 }}>27 bars</span> (~2 min on the 5m chart).
+                Auto-refreshes every 30 s.
+              </div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:8, justifyContent:"center", marginBottom:20 }}>
+                {proWarmingUp.map(r => {
+                  const bars   = r.bars_count ?? 0;
+                  const pct    = Math.min(100, Math.round((bars / 27) * 100));
+                  const clr    = pct >= 75 ? T.green : pct >= 40 ? T.gold : T.text2;
+                  return (
+                    <div key={r.ticker} style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:6,
+                      padding:"8px 12px", display:"flex", flexDirection:"column", alignItems:"center", gap:5, minWidth:90 }}>
+                      <span style={{ color:T.cyan, fontFamily:T.font, fontSize:12, fontWeight:700 }}>{r.ticker}</span>
+                      <div style={{ width:70, height:4, background:T.bg3, borderRadius:2, overflow:"hidden" }}>
+                        <div style={{ width:`${pct}%`, height:"100%", background:clr, borderRadius:2, transition:"width 1s ease" }}/>
+                      </div>
+                      <span style={{ color:T.text2, fontFamily:T.font, fontSize:9 }}>{bars}/27 bars · {pct}%</span>
+                    </div>
+                  );
+                })}
+              </div>
+              <span style={{ color:T.text2, fontFamily:T.font, fontSize:10 }}>
+                ⭐ Watchlist · Signal Engine · Auto-refresh 30s
+              </span>
+            </div>
           )}
 
           {/* Loading shimmer */}
@@ -2936,7 +3179,7 @@ function PageEarnings({ T }) {
 // Allocation section: SVG donut with sector breakdown by portfolio weight.
 // Sectors drawn proportionally once real data arrives from /api/portfolio.
 // Until then, shows empty donut with usage guide.
-function PagePortfolio({ tickers = new Map(), marketSession = "market", T }) {
+function PagePortfolio({ tickers = new Map(), marketSession = "market", watchlist = new Set(), toggleWatchlist = () => {}, T }) {
   const [portfolioData, setPortfolioData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [currentPage, setCurrentPage] = useState(1);
@@ -3191,12 +3434,22 @@ function PagePortfolio({ tickers = new Map(), marketSession = "market", T }) {
           ) : (
             <>
               <div style={{ maxHeight:"calc(100vh - 520px)", minHeight:"300px", overflowY:"auto" }}>
-                {enrichedPortfolio.slice((currentPage - 1) * ITEMS_PER_PAGE, currentPage * ITEMS_PER_PAGE).map((pos, i) => {
+                {enrichedPortfolio.slice((currentPage - 1) * ITEMS_PER_PAGE, currentPage * ITEMS_PER_PAGE).map((pos) => {
                   if (marketSession === "market") {
                     return (
                     /* ── MH ROW: SYMBOL | SHARES | AVG COST | OPEN | LIVE PRICE | CHANGE | % CHG | VALUE | DAY P&L | TOTAL P&L | ACTION */
-                    <div key={i} style={{ display:"grid", gridTemplateColumns:"1.4fr 0.7fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.6fr", borderBottom:`1px solid ${T.border}`, fontSize:12, fontFamily:T.font }}>
-                      <div style={{ padding:"10px", color:T.cyan, fontWeight:700, fontSize:13 }}>{pos.ticker}<div style={{ color:T.text2, fontSize:9, fontWeight:400 }}>{pos.company_name || ""}</div></div>
+                    <div key={pos.ticker} style={{ display:"grid", gridTemplateColumns:"1.4fr 0.7fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.6fr", borderBottom:`1px solid ${T.border}`, fontSize:12, fontFamily:T.font }}>
+                      <div style={{ padding:"10px", display:"flex", alignItems:"flex-start", gap:8 }}>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); toggleWatchlist(pos.ticker); }}
+                          style={{ background:"none", border:"none", cursor:"pointer", padding:"1px 2px", fontSize:14, color: watchlist.has(pos.ticker) ? T.gold || "#f5a623" : T.text2, opacity: watchlist.has(pos.ticker) ? 1 : 0.4, transition:"all 0.15s", flexShrink:0, lineHeight:1 }}
+                          title={watchlist.has(pos.ticker) ? "Remove from watchlist" : "Add to watchlist"}
+                        >{watchlist.has(pos.ticker) ? "★" : "☆"}</button>
+                        <div>
+                          <div style={{ color:T.cyan, fontWeight:700, fontSize:13 }}>{pos.ticker}</div>
+                          <div style={{ color:T.text2, fontSize:9, fontWeight:400 }}>{pos.company_name || ""}</div>
+                        </div>
+                      </div>
                       <div style={{ padding:"10px", color:T.text1 }}>{pos.shares?.toLocaleString() || 0}</div>
                       <div style={{ padding:"10px", color:T.text1 }}>${fmt2(pos.avg_cost)}</div>
                       <div style={{ padding:"10px", color:T.text1 }}>{pos.openPrice > 0 ? `$${fmt2(pos.openPrice)}` : "—"}</div>
@@ -3212,8 +3465,18 @@ function PagePortfolio({ tickers = new Map(), marketSession = "market", T }) {
                   } else {
                     /* ── AH ROW: SYMBOL | SHARES | AVG COST | PREV CLOSE | TODAY CLOSE | LIVE PRICE | $ CHG | % CHG | VALUE | TOTAL P&L | ACTION */
                     return (
-                    <div key={i} style={{ display:"grid", gridTemplateColumns:"1.4fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.9fr 0.9fr 0.9fr 0.6fr", borderBottom:`1px solid ${T.border}`, fontSize:12, fontFamily:T.font }}>
-                      <div style={{ padding:"10px", color:T.cyan, fontWeight:700, fontSize:13 }}>{pos.ticker}<div style={{ color:T.text2, fontSize:9, fontWeight:400 }}>{pos.company_name || ""}</div></div>
+                    <div key={`${pos.ticker}_ah`} style={{ display:"grid", gridTemplateColumns:"1.4fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.9fr 0.9fr 0.9fr 0.6fr", borderBottom:`1px solid ${T.border}`, fontSize:12, fontFamily:T.font }}>
+                      <div style={{ padding:"10px", display:"flex", alignItems:"flex-start", gap:8 }}>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); toggleWatchlist(pos.ticker); }}
+                          style={{ background:"none", border:"none", cursor:"pointer", padding:"1px 2px", fontSize:14, color: watchlist.has(pos.ticker) ? T.gold || "#f5a623" : T.text2, opacity: watchlist.has(pos.ticker) ? 1 : 0.4, transition:"all 0.15s", flexShrink:0, lineHeight:1 }}
+                          title={watchlist.has(pos.ticker) ? "Remove from watchlist" : "Add to watchlist"}
+                        >{watchlist.has(pos.ticker) ? "★" : "☆"}</button>
+                        <div>
+                          <div style={{ color:T.cyan, fontWeight:700, fontSize:13 }}>{pos.ticker}</div>
+                          <div style={{ color:T.text2, fontSize:9, fontWeight:400 }}>{pos.company_name || ""}</div>
+                        </div>
+                      </div>
                       <div style={{ padding:"10px", color:T.text1 }}>{pos.shares?.toLocaleString() || 0}</div>
                       <div style={{ padding:"10px", color:T.text1 }}>${fmt2(pos.avg_cost)}</div>
                       <div style={{ padding:"10px", color:T.text1 }}>{pos.prevClose > 0 ? `$${fmt2(pos.prevClose)}` : "—"}</div>
@@ -3360,10 +3623,13 @@ function PagePortfolio({ tickers = new Map(), marketSession = "market", T }) {
 }
 
 // ─── App Shell ────────────────────────────────────────────────────────────────
-export default function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp = 'all', sector: sectorProp = 'ALL', onSourceChange, onSectorChange, onThemeChange, currentTheme = 'auto', onSignOut, user }) {
+function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp = 'all', sector: sectorProp = 'ALL', onSourceChange, onSectorChange, onThemeChange, currentTheme = 'auto', onSignOut, user }) {
   // Active page state - persisted in localStorage
   const [quickFilter, setQuickFilter] = useState(null);
   const [showAppearance, setShowAppearance] = useState(false);
+  // Global search: navigates to Chart page with the searched symbol pre-loaded
+  const [chartInitSymbol, setChartInitSymbol] = useState("");
+  const [searchVal, setSearchVal] = useState("");
   const [page, setPage] = useState(() => {
     try {
       const saved = localStorage.getItem('nexradar_active_page');
@@ -3421,28 +3687,191 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
 
   // WebSocket state for live ticker data
   const [tickers, setTickers] = useState(new Map());
+  const [wsStatus, setWsStatus] = useState('connecting'); // 'connecting' | 'connected' | 'disconnected'
   const wsRef = useRef(null);
+  // Dirty flag: only flush tickerCacheRef → React state when cache has actually changed.
+  // Prevents wasteful re-renders when returning from Signals/Chart tabs (Bug 2).
+  const tickerCacheDirtyRef = useRef(false);
+  // RAF Safety Valve: prevents >1 React state update per animation frame when
+  // the backend sends ticks faster than the browser can paint (high-volume sessions).
+  const isRenderingRef = useRef(false);
 
   // ── Signal Engine stats (sidebar) ─────────────────────────────────────────
-  const [sideWatchlist, setSideWatchlist] = useState(0);
+  const [sideWatchlist,    setSideWatchlist]    = useState(0);
+  const [sideScalpSignals, setSideScalpSignals] = useState({}); // { TICKER: { signal, ... } }
+
   useEffect(() => {
     fetch(`${API_BASE}/api/watchlist`)
       .then(r => r.ok ? r.json() : {})
       .then(d => setSideWatchlist((d.watchlist ?? []).length))
       .catch(() => {});
   }, []);
+
+  // Poll scalp-analysis every 30s so sidebar SIGNALS count stays current
+  useEffect(() => {
+    const fetchScalp = () =>
+      fetch(`${API_BASE}/api/scalp-analysis`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+          if (!d?.data) return;
+          const m = {};
+          d.data.forEach(r => { if (r.status === "ok") m[r.ticker] = r; });
+          setSideScalpSignals(m);
+        })
+        .catch(() => {});
+    fetchScalp();
+    const id = setInterval(fetchScalp, 30_000);
+    return () => clearInterval(id);
+  }, []);
   const sideSignalCount = useMemo(() => {
-    let count = 0;
-    for (const t of tickers.values()) {
-      if (t.signal === "BUY" || t.signal === "SELL") count++;
-    }
-    return count;
-  }, [tickers]);
+    // scalpSignals is the map built from /api/scalp-analysis in PageLiveTable.
+    // tickers (WebSocket data) has no .signal field — counting it always gives 0.
+    // We read the count directly from the sidebar's own scalp-analysis fetch instead.
+    return sideScalpSignals ? Object.values(sideScalpSignals).filter(r => r.signal === "BUY" || r.signal === "SELL").length : 0;
+  }, [sideScalpSignals]);
   const sideBarsCount = tickers.size;
+
+  // ── Tech Analysis data — lifted to app shell so Dashboard can use it ──────
+  // Fetched here (not in PageSignals) so the same data feeds both the
+  // Dashboard Scalp Signals alert card and the TECH tab in Signals.
+  const [techData,       setTechData]       = useState([]);
+  const [techLoading,    setTechLoading]    = useState(false);
+  const [techError,      setTechError]      = useState(null);
+  const [techLastFetch,  setTechLastFetch]  = useState(null);
+  const [techCached,     setTechCached]     = useState(false);
+  const [techDataAge,    setTechDataAge]    = useState(0);
+  const techLoadingRef   = useRef(false);
+  const techLastFetchRef = useRef(null);
+
+  const fetchTechData = useCallback((forceRefresh = false) => {
+    if (techLoadingRef.current) return;
+    techLoadingRef.current = true;
+    setTechLoading(true);
+    setTechError(null);
+    fetch(`${API_BASE}/api/market-monitor${forceRefresh ? "?refresh=1" : ""}`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then(json => {
+        if (json.error) { setTechError(json.error); return; }
+        const now = new Date();
+        setTechData(json.data || []);
+        setTechCached(json.cached || false);
+        setTechDataAge(json.data_age_sec || 0);
+        setTechLastFetch(now);
+        techLastFetchRef.current = now;
+      })
+      .catch(err => setTechError(err.message))
+      .finally(() => { techLoadingRef.current = false; setTechLoading(false); });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const STALE_MS       = 5  * 60 * 1000;
+    const FORCE_STALE_MS = 10 * 60 * 1000;
+    const lf = techLastFetchRef.current;
+    const isStale      = !lf || (Date.now() - lf.getTime()) > STALE_MS;
+    const isForceStale = !lf || (Date.now() - lf.getTime()) > FORCE_STALE_MS;
+    if (isStale) fetchTechData(isForceStale);
+    const id = setInterval(() => {
+      const l = techLastFetchRef.current;
+      fetchTechData(!l || (Date.now() - l.getTime()) > FORCE_STALE_MS);
+    }, STALE_MS);
+    return () => clearInterval(id);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Market Open Heartbeat ─────────────────────────────────────────────────
+  // At exactly 9:30 AM ET (market open bell) we:
+  //   1. Force-close the WebSocket so it reconnects and gets a fresh snapshot
+  //   2. Clear local ticker state so the table shows "awaiting snapshot" instead
+  //      of frozen pre-market data while reconnect is in flight
+  //   3. Re-schedule for the next trading day
+  // This resolves the AH→MH stale data window where a client open before 9:30
+  // could receive a snapshot that still contains AH values from the backend cache.
+  useEffect(() => {
+    const scheduleMarketOpenReset = () => {
+      const now   = new Date();
+      const etNow = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+
+      // Target: today at 9:30:05 AM ET (5s buffer past open so backend is ready)
+      const target = new Date(etNow);
+      target.setHours(9, 30, 5, 0);
+
+      // If already past 9:30 ET today, target tomorrow
+      if (etNow >= target) target.setDate(target.getDate() + 1);
+
+      const msUntil = target.getTime() - etNow.getTime();
+      console.log(`[NexRadar] Market open reset scheduled in ${(msUntil / 3_600_000).toFixed(2)}h`);
+
+      return setTimeout(() => {
+        console.log("[NexRadar] 🔔 Market Open — flushing stale session data");
+        // Force WS reconnect → fresh snapshot from backend
+        if (wsRef.current) {
+          wsRef.current.onclose = null; // suppress the auto-reconnect handler briefly
+          wsRef.current.close();
+        }
+        // Clear cached tickers so table shows "awaiting snapshot" cleanly
+        setTickers(new Map());
+        // wsRef.current being closed triggers the normal reconnect path
+        // (setTimeout(connectWS, 3000) inside the ws.onclose handler in the WS effect)
+        // but we nulled onclose above — manually re-connect after 3s
+        setTimeout(() => {
+          if (wsRef.current && wsRef.current.readyState !== WebSocket.OPEN) {
+            wsRef.current = null; // let WS effect reconnect on next render
+          }
+        }, 3000);
+        // Re-schedule for next trading day
+        scheduleMarketOpenReset();
+      }, msUntil);
+    };
+
+    const timerId = scheduleMarketOpenReset();
+    return () => clearTimeout(timerId);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   // Ref that carries the PageLiveTable watchlist setter into the WS closure.
   // The WS handler is created once on mount; without a ref it would capture a
   // stale setWatchlistFromWS that does nothing.
   const wsWatchlistRef = useRef(null);
+
+  // ── Global watchlist state — shared by PageLiveTable + PagePortfolio ─────
+  // Lifted from PageLiveTable so Portfolio tab can read/toggle the same Set
+  // without a separate fetch. WS sync writes here via wsWatchlistRef.
+  const [watchlist, setWatchlist] = useState(new Set());
+  useEffect(() => {
+    fetch(`${API_BASE}/api/watchlist`)
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(data => setWatchlist(new Set(data.watchlist ?? [])))
+      .catch(err => console.warn('[NexRadar] Failed to load watchlist:', err));
+  }, []);
+  // Register root setter into ref so WS watchlist_update events keep all tabs in sync
+  useEffect(() => {
+    wsWatchlistRef.current = setWatchlist;
+    return () => { wsWatchlistRef.current = null; };
+  }, []);
+  const toggleWatchlistGlobal = async (symbol) => {
+    const isWatched = watchlist.has(symbol);
+    const endpoint  = isWatched
+      ? `${API_BASE}/api/watchlist/remove`
+      : `${API_BASE}/api/watchlist/add`;
+    // Optimistic update
+    setWatchlist(prev => {
+      const next = new Set(prev);
+      isWatched ? next.delete(symbol) : next.add(symbol);
+      return next;
+    });
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticker: symbol }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      console.error('[NexRadar] Watchlist toggle failed, rolling back:', err);
+      setWatchlist(prev => {
+        const next = new Set(prev);
+        isWatched ? next.add(symbol) : next.delete(symbol);
+        return next;
+      });
+    }
+  };
 
   // Market session — rechecked every 30s; drives auto-subMode + sidebar chip
   const [marketSession, setMarketSession] = useState(getMarketSession);
@@ -3465,6 +3894,31 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
   // the ref into React state at most once every 250 ms, keeping the UI
   // responsive without copying 1 500+ entries on every price update.
   const tickerCacheRef = useRef(new Map());
+  // Track last session so we can detect AH → MH boundary and purge stale fields (Bug 1)
+  const lastSessionRef = useRef(marketSession);
+
+  // ── Bug 1 Fix: Session boundary → purge stale AH fields ─────────────────────
+  // When the market transitions from AH/Pre → Market Hours (9:30 ET / 7:30 MST),
+  // tickerCacheRef still holds last night's AH fields (prev_close, today_close,
+  // ah_dollar, ah_pct, ah_momentum). Until the backend sends a fresh snapshot,
+  // the table shows stale session data. On transition we strip those fields
+  // immediately and mark dirty so the flush interval propagates clean rows now.
+  useEffect(() => {
+    const prev = lastSessionRef.current;
+    lastSessionRef.current = marketSession;
+    if (prev === marketSession) return;
+    const isTransitionToMH = marketSession === 'market';
+    if (!isTransitionToMH) return; // only strip on → Market Hours
+    console.log(`[NexRadar] Session ${prev} → ${marketSession}: purging stale AH cache fields`);
+    const AH_FIELDS = ['ah_dollar', 'ah_pct', 'today_close', 'prev_close', 'ah_momentum'];
+    const cache = tickerCacheRef.current;
+    for (const [key, row] of cache) {
+      const cleaned = { ...row };
+      AH_FIELDS.forEach(f => delete cleaned[f]);
+      cache.set(key, cleaned);
+    }
+    tickerCacheDirtyRef.current = true;
+  }, [marketSession]);
 
   // ── Live Notifications ────────────────────────────────────────────────────
   // Accumulates real alerts fired by WS ticks. Capped at 50 entries (ring buffer).
@@ -3514,6 +3968,13 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
 
       ws.onopen = () => {
         console.log('[NexRadar] WebSocket connected');
+        setWsStatus('connected');
+        // Bug 3 Fix — STALE-ON-RECONNECT: Clear tickerCacheRef on every (re)connect.
+        // This covers: backend restart (manual deploy), session switch, tab wake.
+        // The table shows a loading state while waiting for the fresh snapshot
+        // instead of silently displaying last session's frozen data.
+        tickerCacheRef.current = new Map();
+        tickerCacheDirtyRef.current = true;
         // Client-side heartbeat: send a ping every 30 s so the proxy sees
         // traffic in the client→server direction even between market ticks.
         heartbeatTimer = setInterval(() => {
@@ -3555,12 +4016,14 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
           }
 
           if (msg.type === "snapshot") {
-            // Snapshot: replace entire cache and push straight to state
+            // Snapshot: replace entire cache and push straight to state.
+            // Always the authoritative data reset — trust it fully.
             const m = new Map();
             for (const row of msg.data ?? []) {
               m.set(row.ticker, row);
             }
             tickerCacheRef.current = m;
+            tickerCacheDirtyRef.current = false; // setTickers called directly below
             setTickers(new Map(m));   // one full copy for snapshot is fine
 
           } else if (msg.type === "tick") {
@@ -3570,6 +4033,7 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
             const prev  = cache.get(msg.ticker) ?? {};
             const next  = { ...prev, ...msg.data };
             cache.set(msg.ticker, next);
+            tickerCacheDirtyRef.current = true; // Bug 2 fix: mark dirty so flush fires
 
             // ── Live alert detection ──────────────────────────────────────
             const d      = msg.data;
@@ -3622,11 +4086,13 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
 
       ws.onerror = () => {
         console.error('[NexRadar] WebSocket error');
+        setWsStatus('disconnected');
       };
 
       ws.onclose = () => {
         clearInterval(heartbeatTimer);
         heartbeatTimer = null;
+        setWsStatus('connecting');
         if (cancelled) return;   // FIX #4: don't reconnect after unmount
         console.log('[NexRadar] WebSocket closed, reconnecting...');
         setTimeout(connectWS, 3000);
@@ -3635,17 +4101,29 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
 
     connectWS();
 
-    // FIX #6: flush tick buffer to React state at 250 ms intervals.
-    // This bounds re-renders to ≤4/s regardless of tick rate.
-    const flushInterval = setInterval(() => {
-      if (!cancelled) {
+    // Tick-to-Render Safety Valve (RAF-based flush):
+    // Uses requestAnimationFrame instead of setInterval(250ms) to batch tick
+    // updates. If the backend sends ticks faster than the browser paints
+    // (e.g. market open burst), the Map in state can become a bottleneck.
+    // RAF ensures we call setTickers at most once per browser paint frame (~16ms),
+    // keeping the UI responsive during high-volume tick storms.
+    // isRenderingRef prevents re-entrant RAF callbacks from stacking.
+    let rafId = null;
+    const scheduleFlush = () => {
+      if (cancelled) return;
+      if (tickerCacheDirtyRef.current && !isRenderingRef.current) {
+        isRenderingRef.current = true;
+        tickerCacheDirtyRef.current = false;
         setTickers(new Map(tickerCacheRef.current));
+        isRenderingRef.current = false;
       }
-    }, 250);
+      rafId = requestAnimationFrame(scheduleFlush);
+    };
+    rafId = requestAnimationFrame(scheduleFlush);
 
     return () => {
       cancelled = true;   // FIX #4: block any pending reconnect timers
-      clearInterval(flushInterval);
+      if (rafId) cancelAnimationFrame(rafId);
       clearInterval(heartbeatTimer);
       if (wsRef.current) {
         wsRef.current.onclose = null;   // prevent the handler from firing during intentional close
@@ -3696,6 +4174,11 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
 
   const handleSectorChange = (sectorIds) => {
     setSelectedSectors(sectorIds);
+    // Clear any active quick-filter when the sector changes.
+    // Otherwise "VOL SPIKES + TECHNOLOGY" silently persists when switching to BIO,
+    // and the table shows a "no tickers match" empty state because the quick-filter
+    // still applies to the new (different) sector's ticker set.
+    setQuickFilter(null);
     // Notify parent if callback provided
     if (onSectorChange) {
       onSectorChange(sectorIds[0] || 'ALL');
@@ -3704,18 +4187,26 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
 
   const renderPage = () => {
     switch (page) {
-      case "dashboard": return <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange} onNavigate={setPage} sectorPerformance={sectorPerformance} tickers={tickers} T={T} />;
-      case "live":      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={() => setQuickFilter(null)} T={T} />;
-      case "chart":     return <PageChart T={T} />;
-      case "signals":   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} T={T} />;
+      case "dashboard": return <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange} onNavigate={setPage} sectorPerformance={sectorPerformance} tickers={tickers} techData={techData} techLoading={techLoading} T={T} />;
+      case "live":      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={() => setQuickFilter(null)} wsStatus={wsStatus} onLiveCount={handleLiveCount} watchlistProp={watchlist} toggleWatchlistProp={toggleWatchlistGlobal} T={T} />;
+      case "chart":     return <PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />;
+      case "signals":   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} T={T} />;
       case "earnings":  return <PageEarnings T={T} />;
-      case "portfolio": return <PagePortfolio tickers={tickers} marketSession={marketSession} T={T} />;
+      case "portfolio": return <PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlistGlobal} T={T} />;
       default:          return null;
     }
   };
 
   const activeLabel = selectedSectors.includes("ALL") ? null : selectedSectors.join(" + ");
   const tickerTotal = computeSectorTotal(selectedSectors);
+
+  // Real live count reported back from PageLiveTable — used in the top-bar chip
+  // instead of the static computeSectorTotal() when on the live page.
+  // Fixes EARNINGS pseudo-sector (count:null → computeSectorTotal returns 0).
+  const [liveTickerCount, setLiveTickerCount] = useState(null);
+  const handleLiveCount = useCallback((n) => setLiveTickerCount(n), []);
+  useEffect(() => { if (page !== "live") setLiveTickerCount(null); }, [page]);
+  const displayCount = (page === "live" && liveTickerCount !== null) ? liveTickerCount : tickerTotal;
 
   return (
     <div style={{ display:"flex", height:"100vh", background:T.bg0, color:T.text0, fontFamily:T.font, overflow:"hidden" }}>
@@ -3797,14 +4288,26 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
           {activeLabel && (
             <div style={{ display:"flex", alignItems:"center", gap:6, background:T.cyan+"10", border:`1px solid ${T.cyan}30`, borderRadius:6, padding:"4px 12px" }}>
               <span style={{ color:T.cyan, fontSize:11, letterSpacing:0.5, fontFamily:T.font, fontWeight:600 }}>{activeLabel}</span>
-              <span style={{ color:T.cyan, fontSize:10, fontFamily:T.font }}>· {tickerTotal.toLocaleString()}</span>
+              <span style={{ color:T.cyan, fontSize:10, fontFamily:T.font }}>· {displayCount.toLocaleString()}</span>
               <button onClick={()=>setSelectedSectors(["ALL"])} style={{ background:"none", border:"none", color:T.cyan, cursor:"pointer", fontSize:13, padding:0, lineHeight:1, opacity:0.7 }} onMouseEnter={e=>e.target.style.opacity=1} onMouseLeave={e=>e.target.style.opacity=0.7}>✕</button>
             </div>
           )}
           <div style={{ flex:1 }}/>
           
-          {/* Search Input */}
+          {/* Search Input — navigates to Chart tab with symbol pre-loaded */}
           <input placeholder="Search symbol…"
+            value={searchVal}
+            onChange={e => setSearchVal(e.target.value.toUpperCase())}
+            onKeyDown={e => {
+              if (e.key === "Enter") {
+                const s = searchVal.trim().toUpperCase();
+                if (s) {
+                  setChartInitSymbol(s);
+                  setPage("chart");
+                  setSearchVal("");
+                }
+              }
+            }}
             style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:6, padding:"8px 14px", color:T.text0, fontFamily:T.font, fontSize:13, outline:"none", width:180 }}
             onFocus={e=>e.target.style.borderColor=T.cyanMid}
             onBlur={e=>e.target.style.borderColor=T.border}/>
@@ -4116,5 +4619,16 @@ export default function NexRadarDashboard({ darkMode: darkModeProp = true, sourc
         </div>
       </div>
     </div>
+  );
+}
+
+// ─── Root export wrapped in Global Error Boundary ────────────────────────────
+// NexRadarDashboard is the inner component; this default export wraps it so
+// any uncaught runtime error shows the FallbackUI instead of a blank screen.
+export default function NexRadarDashboardRoot(props) {
+  return (
+    <NexRadarErrorBoundary>
+      <NexRadarDashboard {...props} />
+    </NexRadarErrorBoundary>
   );
 }
