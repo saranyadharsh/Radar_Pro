@@ -93,6 +93,27 @@ class SupabaseDB:
     def __init__(self):
         self.client: Client = _get_client()
         logger.info("✅ SupabaseDB connected")
+        self._live_ticker_cols: set = self._discover_live_ticker_cols()
+
+    def _discover_live_ticker_cols(self) -> set:
+        """
+        Fetch one row from live_tickers to discover the actual column names.
+        Permanent fix for PGRST204 — never guess the schema, read it at startup.
+        Falls back to a minimal safe set if the table is empty or unreachable.
+        """
+        SAFE_FALLBACK = {"ticker", "sector", "price", "live_price",
+                         "open_price", "prev_close", "ts"}
+        try:
+            resp = self.client.table("live_tickers").select("*").limit(1).execute()
+            if resp.data:
+                cols = set(resp.data[0].keys())
+                logger.info(f"live_tickers schema: {sorted(cols)}")
+                return cols
+            logger.warning("live_tickers empty — using fallback column set")
+            return SAFE_FALLBACK
+        except Exception as e:
+            logger.error(f"_discover_live_ticker_cols failed: {e}")
+            return SAFE_FALLBACK
 
     # ── Stock list ────────────────────────────────────────────────────────────
 
@@ -164,18 +185,27 @@ class SupabaseDB:
 
     def upsert_tickers(self, rows: List[Dict]) -> bool:
         """
-        FIX #2 — maps cache key 'open' → DB column 'open_price' so the REST
-                  path never returns open_price=0.
-        FIX #3 — always writes 'sector' so sector filtering works on REST path.
+        Upserts rows into live_tickers.
+        Uses self._live_ticker_cols (discovered at startup by reading one row)
+        to filter the payload — permanently immune to PGRST204 schema errors
+        regardless of what fields ws_engine adds to the cache in future.
         """
         if not rows:
             return True
-        INT_FIELDS  = ("volume", "last_update", "update_count")
-        BOOL_FIELDS = ("volume_spike", "is_gap_play", "ah_momentum",
-                       "went_positive", "is_positive")
+
+        allowed     = self._live_ticker_cols
+        INT_FIELDS  = {"volume", "avg_volume", "last_update", "update_count"}
+        BOOL_FIELDS = {"volume_spike", "is_gap_play", "is_positive",
+                       "went_positive", "ah_momentum"}
+
         cleaned = []
         for row in rows:
-            r = dict(row)
+            r = {k: v for k, v in row.items() if k in allowed}
+
+            # Map cache alias 'open' → 'open_price' if needed
+            if "open_price" in allowed and "open_price" not in r and "open" in row:
+                r["open_price"] = row["open"]
+
             for f in INT_FIELDS:
                 if f in r and r[f] is not None:
                     try:    r[f] = int(float(r[f]))
@@ -183,19 +213,36 @@ class SupabaseDB:
             for f in BOOL_FIELDS:
                 if f in r and r[f] is not None:
                     r[f] = int(bool(r[f]))
-            # FIX #2: normalise cache key 'open' → DB column 'open_price'
-            if "open" in r and "open_price" not in r:
-                r["open_price"] = r.pop("open")
-            # FIX #3: ensure sector is always persisted
-            if "sector" not in r or not r["sector"]:
+
+            if not r.get("sector"):
                 r["sector"] = "Unknown"
-            cleaned.append(r)
-        try:
-            self.client.table("live_tickers").upsert(cleaned).execute()
-            return True
-        except Exception as e:
-            logger.error(f"upsert_tickers: {e}")
-            return False
+
+            # last_update has NOT NULL constraint — seed with current epoch if missing
+            if "last_update" in allowed and not r.get("last_update"):
+                r["last_update"] = int(time.time())
+
+            if r.get("ticker"):
+                cleaned.append(r)
+
+        for attempt in range(2):
+            try:
+                self.client.table("live_tickers").upsert(cleaned).execute()
+                return True
+            except Exception as e:
+                err_str = str(e)
+                # Transient network/SSL errors — reconnect client and retry once
+                TRANSIENT = ("SSL", "WinError", "ConnectionError", "RemoteProtocolError",
+                             "forcibly closed", "Connection reset", "BrokenPipe", "httpx")
+                if attempt == 0 and any(x in err_str for x in TRANSIENT):
+                    logger.warning(f"upsert_tickers transient error (retrying): {e}")
+                    try:
+                        self.client = _get_client()
+                    except Exception:
+                        pass
+                    continue
+                logger.error(f"upsert_tickers: {e}")
+                return False
+        return False
 
     def get_live_tickers(
         self,

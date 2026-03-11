@@ -24,6 +24,7 @@ import time
 import logging
 import threading
 from typing import Dict, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import yfinance as yf
 import pandas as pd
@@ -104,113 +105,149 @@ def _calculate_atr(df, period=14):
     return round(tr.rolling(window=period).mean().iloc[-1], 2)
 
 
+# ── Per-ticker analysis (called in parallel) ─────────────────────────────────
+
+def _analyze_ticker(ticker: str) -> Dict:
+    """
+    Thread-Pool Fix: extracted from the old serial for-loop so each ticker
+    is fetched concurrently via ThreadPoolExecutor in run_market_monitor.
+    Previously 50 tickers × ~0.5 s each = 25 s sequential, holding a FastAPI
+    thread-pool worker the entire time.  With MAX_WORKERS=20 threads the wall
+    time drops to ~2–3 s for 50 tickers and no FastAPI worker is starved.
+    """
+    try:
+        stock = yf.Ticker(ticker)
+
+        # Fundamentals — static
+        info      = stock.info
+        mkt_cap   = info.get("marketCap", 0)
+        fcf       = info.get("freeCashflow", 0)
+        de_raw    = info.get("debtToEquity", None)
+        de        = round(de_raw / 100, 2) if de_raw is not None else None
+        fcf_yield = round((fcf / mkt_cap) * 100, 2) if mkt_cap and fcf and mkt_cap > 0 else None
+
+        # Daily bars — SMA50 / Trend only
+        daily = stock.history(period="3mo", interval="1d")
+        sma50, trend, trend_detail = None, "N/A", "Insufficient data"
+        if not daily.empty and len(daily) >= 50:
+            sma50 = round(daily["Close"].rolling(window=50).mean().iloc[-1], 2)
+
+        # 5-minute intraday bars — all live indicators
+        intra = stock.history(period="5d", interval="5m")
+
+        if not intra.empty and len(intra) >= 20:
+            price         = round(intra["Close"].iloc[-1], 2)
+            candle        = _analyze_candlestick(intra)
+            rsi, rsi_sig  = _calculate_rsi(intra)
+            rvol, inst    = _detect_institutional(intra)
+            atr           = _calculate_atr(intra)
+            bb_upper, bb_lower = _calculate_bb(intra)
+
+            if sma50 is not None:
+                trend        = "Bullish" if price > sma50 else "Bearish"
+                trend_detail = f"{'>'  if price > sma50 else '<'} 50 SMA ({sma50})"
+
+            bb_status = "N/A"
+            if bb_upper is not None and bb_lower is not None:
+                bb_status = ("Overextended (High)"    if price >= bb_upper else
+                             "Potential Bounce (Low)" if price <= bb_lower else
+                             "Neutral")
+
+            score = 0
+            if rsi_sig == "Oversold":         score += 2
+            elif rsi_sig == "Overbought":     score -= 2
+            if trend == "Bullish":            score += 1
+            elif trend == "Bearish":          score -= 1
+            if bb_status == "Potential Bounce (Low)":  score += 1.5
+            elif bb_status == "Overextended (High)":   score -= 1.5
+            if isinstance(rvol, (int, float)) and rvol > 2.0:
+                score += 1
+                if "Accumulation" in str(inst): score += 1.5
+                elif "Distribution" in str(inst): score -= 1.5
+            if candle == "Bullish Engulfing":  score += 1.5
+            elif candle == "Bearish Engulfing": score -= 1.5
+
+            alerts = []
+            if "Accumulation" in str(inst):
+                alerts.append({"type": "whale", "text": f"Whale Accumulation (RVOL: {rvol}x)"})
+            if rsi_sig == "Oversold" and bb_status == "Potential Bounce (Low)" and candle == "Bullish Engulfing":
+                alerts.append({"type": "triple_bounce", "text": "Triple-Confluence Bounce"})
+            elif rsi_sig == "Oversold" and candle == "Bullish Engulfing":
+                alerts.append({"type": "prime_setup", "text": "Prime Setup (Oversold + Engulfing)"})
+
+            return {
+                "ticker": ticker, "price": price, "sma_50": sma50,
+                "atr": atr, "bb_status": bb_status,
+                "bb_upper": bb_upper, "bb_lower": bb_lower,
+                "trend": trend, "trend_detail": trend_detail,
+                "candlestick": candle, "rsi": rsi, "rsi_signal": rsi_sig,
+                "rvol": rvol if isinstance(rvol, (int, float)) else 0,
+                "inst_footprint": inst,
+                "fcf_yield": fcf_yield, "de_ratio": de,
+                "score": round(score, 2), "alerts": alerts, "status": "ok",
+            }
+        else:
+            # Intraday unavailable (weekend/holiday) — degrade gracefully
+            fallback_price = round(daily["Close"].iloc[-1], 2) if not daily.empty else (info.get("currentPrice", 0) or 0)
+            return {
+                "ticker": ticker, "price": fallback_price,
+                "sma_50": sma50, "atr": None, "bb_status": "N/A",
+                "bb_upper": None, "bb_lower": None,
+                "trend": trend, "trend_detail": trend_detail,
+                "candlestick": "N/A", "rsi": None, "rsi_signal": "N/A",
+                "rvol": 0, "inst_footprint": "N/A",
+                "fcf_yield": fcf_yield, "de_ratio": de,
+                "score": 0, "alerts": [], "status": "insufficient_data",
+            }
+
+    except Exception as e:
+        logger.warning(f"market_monitor error {ticker}: {e}")
+        return {
+            "ticker": ticker, "price": 0, "sma_50": None, "atr": None,
+            "bb_status": "Error", "bb_upper": None, "bb_lower": None,
+            "trend": "Error", "trend_detail": str(e)[:80],
+            "candlestick": "Error", "rsi": None, "rsi_signal": "Error",
+            "rvol": 0, "inst_footprint": "Error",
+            "fcf_yield": None, "de_ratio": None,
+            "score": 0, "alerts": [], "status": "error",
+        }
+
+
 # ── Main analysis loop ────────────────────────────────────────────────────────
+# Thread-Pool-Fix: MAX_WORKERS=20 keeps yfinance concurrency high enough to
+# fetch 50 tickers in ~2-3s while staying within yfinance's rate-limit safety
+# margin. Raising this above 30 risks HTTP 429s from Yahoo Finance.
+_MONITOR_MAX_WORKERS = 20
 
 def run_market_monitor(ticker_list: List[str]) -> List[Dict]:
+    """
+    Thread-Pool Fix: replaced serial for-loop with ThreadPoolExecutor.
+    Each ticker's yfinance fetch now runs concurrently. Wall time drops from
+    ~25s (50 tickers × 0.5s sequential) to ~2-3s, freeing FastAPI thread-pool
+    workers quickly and preventing thread exhaustion under concurrent requests.
+    """
     results = []
-    for ticker in ticker_list:
-        try:
-            stock = yf.Ticker(ticker)
-
-            # Fundamentals — static
-            info      = stock.info
-            mkt_cap   = info.get("marketCap", 0)
-            fcf       = info.get("freeCashflow", 0)
-            de_raw    = info.get("debtToEquity", None)
-            de        = round(de_raw / 100, 2) if de_raw is not None else None
-            fcf_yield = round((fcf / mkt_cap) * 100, 2) if mkt_cap and fcf and mkt_cap > 0 else None
-
-            # Daily bars — SMA50 / Trend only
-            daily = stock.history(period="3mo", interval="1d")
-            sma50, trend, trend_detail = None, "N/A", "Insufficient data"
-            if not daily.empty and len(daily) >= 50:
-                sma50 = round(daily["Close"].rolling(window=50).mean().iloc[-1], 2)
-
-            # 5-minute intraday bars — all live indicators
-            intra = stock.history(period="5d", interval="5m")
-
-            if not intra.empty and len(intra) >= 20:
-                price         = round(intra["Close"].iloc[-1], 2)
-                candle        = _analyze_candlestick(intra)
-                rsi, rsi_sig  = _calculate_rsi(intra)
-                rvol, inst    = _detect_institutional(intra)
-                atr           = _calculate_atr(intra)
-                bb_upper, bb_lower = _calculate_bb(intra)
-
-                if sma50 is not None:
-                    trend        = "Bullish" if price > sma50 else "Bearish"
-                    trend_detail = f"{'>' if price > sma50 else '<'} 50 SMA ({sma50})"
-
-                bb_status = "N/A"
-                if bb_upper is not None and bb_lower is not None:
-                    bb_status = ("Overextended (High)"    if price >= bb_upper else
-                                 "Potential Bounce (Low)" if price <= bb_lower else
-                                 "Neutral")
-
-                score = 0
-                if rsi_sig == "Oversold":         score += 2
-                elif rsi_sig == "Overbought":     score -= 2
-                if trend == "Bullish":            score += 1
-                elif trend == "Bearish":          score -= 1
-                if bb_status == "Potential Bounce (Low)":  score += 1.5
-                elif bb_status == "Overextended (High)":   score -= 1.5
-                if isinstance(rvol, (int, float)) and rvol > 2.0:
-                    score += 1
-                    if "Accumulation" in str(inst): score += 1.5
-                    elif "Distribution" in str(inst): score -= 1.5
-                if candle == "Bullish Engulfing":  score += 1.5
-                elif candle == "Bearish Engulfing": score -= 1.5
-
-                alerts = []
-                if "Accumulation" in str(inst):
-                    alerts.append({"type": "whale", "text": f"Whale Accumulation (RVOL: {rvol}x)"})
-                if rsi_sig == "Oversold" and bb_status == "Potential Bounce (Low)" and candle == "Bullish Engulfing":
-                    alerts.append({"type": "triple_bounce", "text": "Triple-Confluence Bounce"})
-                elif rsi_sig == "Oversold" and candle == "Bullish Engulfing":
-                    alerts.append({"type": "prime_setup", "text": "Prime Setup (Oversold + Engulfing)"})
-
+    with ThreadPoolExecutor(max_workers=_MONITOR_MAX_WORKERS) as executor:
+        future_to_ticker = {executor.submit(_analyze_ticker, t): t for t in ticker_list}
+        for future in as_completed(future_to_ticker):
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                ticker = future_to_ticker[future]
+                logger.warning(f"run_market_monitor future error {ticker}: {e}")
                 results.append({
-                    "ticker": ticker, "price": price, "sma_50": sma50,
-                    "atr": atr, "bb_status": bb_status,
-                    "bb_upper": bb_upper, "bb_lower": bb_lower,
-                    "trend": trend, "trend_detail": trend_detail,
-                    "candlestick": candle, "rsi": rsi, "rsi_signal": rsi_sig,
-                    "rvol": rvol if isinstance(rvol, (int, float)) else 0,
-                    "inst_footprint": inst,
-                    "fcf_yield": fcf_yield, "de_ratio": de,
-                    "score": round(score, 2), "alerts": alerts, "status": "ok",
+                    "ticker": ticker, "price": 0, "sma_50": None, "atr": None,
+                    "bb_status": "Error", "bb_upper": None, "bb_lower": None,
+                    "trend": "Error", "trend_detail": str(e)[:80],
+                    "candlestick": "Error", "rsi": None, "rsi_signal": "Error",
+                    "rvol": 0, "inst_footprint": "Error",
+                    "fcf_yield": None, "de_ratio": None,
+                    "score": 0, "alerts": [], "status": "error",
                 })
-            else:
-                # Intraday unavailable (weekend/holiday) — degrade gracefully
-                fallback_price = round(daily["Close"].iloc[-1], 2) if not daily.empty else (info.get("currentPrice", 0) or 0)
-                results.append({
-                    "ticker": ticker, "price": fallback_price,
-                    "sma_50": sma50, "atr": None, "bb_status": "N/A",
-                    "bb_upper": None, "bb_lower": None,
-                    "trend": trend, "trend_detail": trend_detail,
-                    "candlestick": "N/A", "rsi": None, "rsi_signal": "N/A",
-                    "rvol": 0, "inst_footprint": "N/A",
-                    "fcf_yield": fcf_yield, "de_ratio": de,
-                    "score": 0, "alerts": [], "status": "insufficient_data",
-                })
-
-            time.sleep(0.05)
-
-        except Exception as e:
-            logger.warning(f"market_monitor error {ticker}: {e}")
-            results.append({
-                "ticker": ticker, "price": 0, "sma_50": None, "atr": None,
-                "bb_status": "Error", "bb_upper": None, "bb_lower": None,
-                "trend": "Error", "trend_detail": str(e)[:80],
-                "candlestick": "Error", "rsi": None, "rsi_signal": "Error",
-                "rvol": 0, "inst_footprint": "Error",
-                "fcf_yield": None, "de_ratio": None,
-                "score": 0, "alerts": [], "status": "error",
-            })
 
     results.sort(key=lambda r: r.get("score", 0), reverse=True)
     return results
-
 
 def get_cached_monitor(watchlist_tickers: List[str], force_refresh: bool = False) -> Dict:
     now = time.time()

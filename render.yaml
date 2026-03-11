@@ -32,8 +32,8 @@ services:
     envVars:
       - key: VITE_API_BASE
         value: https://nexradar-backend.onrender.com
-      - key: VITE_WS_URL
-        value: wss://nexradar-backend.onrender.com/ws/live
+      #- key: VITE_WS_URL
+       # value: wss://nexradar-backend.onrender.com/ws/live
     routes:
       - type: rewrite
         source: /*

@@ -84,13 +84,6 @@ class SSEBroadcaster:
     Backpressure:
       Queue maxsize=500.  Slow clients that fall behind are silently evicted;
       their EventSource auto-reconnects and immediately receives the snapshot.
-
-    Memory:
-      _snapshot holds the latest snapshot dict only — replaced on every snapshot
-      broadcast, so it never grows.  The snapshot data list itself is bounded by
-      LIVE_DISPLAY_CAP in supabase_db (6200 rows × ~500 bytes ≈ 3 MB max).
-      Dead queues are removed atomically inside publish() so _queues never
-      accumulates stale entries from disconnected clients.
     """
     def __init__(self):
         self._queues:   Set[asyncio.Queue] = set()
@@ -98,7 +91,7 @@ class SSEBroadcaster:
 
     async def publish(self, payload: dict) -> None:
         if payload.get("type") == "snapshot":
-            self._snapshot = payload          # replace — never accumulates
+            self._snapshot = payload          # always keep latest in memory
         msg = "data: " + json.dumps(payload) + "\n\n"
         dead = set()
         for q in list(self._queues):
@@ -106,18 +99,7 @@ class SSEBroadcaster:
                 q.put_nowait(msg)
             except asyncio.QueueFull:
                 dead.add(q)
-        # Evicted queues: send poison pill so the generator breaks out immediately
-        # instead of waiting for the 15s keepalive timeout to notice data stopped.
-        # The frontend's EventSource will auto-reconnect and get a fresh snapshot.
-        if dead:
-            for q in dead:
-                try:
-                    while not q.empty():   # drain first so put_nowait has room
-                        q.get_nowait()
-                    q.put_nowait("DISCONNECT")
-                except Exception:
-                    pass
-            self._queues -= dead
+        self._queues -= dead
 
     def subscribe(self) -> asyncio.Queue:
         q = asyncio.Queue(maxsize=500)
@@ -231,13 +213,6 @@ async def get_snapshot(
     payload = broadcaster.get_snapshot() if broadcaster else {}
     data    = payload.get("data", [])
 
-    # Ensure every row has the "open" alias the frontend MH table reads
-    for row in data:
-        if "open" not in row or not row["open"]:
-            row["open"] = row.get("open_price", 0)
-        if "company_name" not in row or not row["company_name"]:
-            row["company_name"] = row.get("company", "")
-
     if only_positive:
         data = [r for r in data if r.get("is_positive")]
     if sector and sector.upper() not in ("", "ALL"):
@@ -257,20 +232,13 @@ async def get_snapshot(
 @app.get("/api/stream")
 async def sse_stream(request: Request):
     """
-    SSE endpoint — zero Redis.
-
-    subscribe() is called INSIDE the generator, not before it.
-    This prevents a queue leak in the rare case where StreamingResponse
-    raises before the generator coroutine ever runs (e.g. CORS pre-flight
-    reuse, early client disconnect during response construction).
-
-    On disconnect: unsubscribe() runs in the generator's finally block.
-    On slow client: queue fills to maxsize=500 → put_nowait raises QueueFull
-    → broadcaster evicts that queue → client's EventSource auto-reconnects
-    and immediately receives the latest snapshot (no data loss for UI).
+    SSE endpoint.  Replaces the entire Redis XREADGROUP / NOGROUP / cursor logic.
+    On connect: sends the current snapshot immediately (no blank-screen cold start).
+    On disconnect: unsubscribes the queue — no Redis consumer cleanup needed.
     """
+    q = broadcaster.subscribe()
+
     async def _generate() -> AsyncGenerator[str, None]:
-        q = broadcaster.subscribe()
         try:
             snap = broadcaster.get_snapshot()
             if snap:
@@ -280,13 +248,9 @@ async def sse_stream(request: Request):
                     break
                 try:
                     msg = await asyncio.wait_for(q.get(), timeout=15.0)
-                    if msg == "DISCONNECT":
-                        # Poison pill from broadcaster — queue was evicted (too slow).
-                        # Break so EventSource reconnects and gets a fresh snapshot.
-                        break
                     yield msg
                 except asyncio.TimeoutError:
-                    yield 'data: {"type":"keepalive"}\n\n'
+                    yield ": keepalive\n\n"
         except asyncio.CancelledError:
             pass
         except Exception as e:

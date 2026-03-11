@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, time, date
 from enum import Enum
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 import time as std_time
 import pytz
 
@@ -364,12 +365,17 @@ class ScalpingSignalEngine:
     ATR_SL_MULT           = 1.5
     ATR_TP_MULT           = 2.5
 
-    def __init__(self):
+    def __init__(self, db=None, broadcast_cb=None):
+        self._db = db
+        self._broadcast_cb = broadcast_cb
         self._calcs:      Dict[str, IndicatorCalculator] = {}
         self._last_sig:   Dict[str, float] = {}   # FIX-10: purged every 10 min
         self._last_purge: float = std_time.time()
         self._callbacks:  List  = []
         self._lock        = threading.Lock()
+        
+        # New: Tracked symbols for filtering on_tick
+        self._watched: set = set()
 
         # Ring buffer of last 200 signals (for dashboard /api/signals)
         self.signal_history: deque = deque(maxlen=200)
@@ -377,8 +383,55 @@ class ScalpingSignalEngine:
         # FIX-5: date-guard prevents missed/double VWAP reset
         self._vwap_reset_date: Optional[date] = None
 
+        # If a broadcast_cb was passed, register it
+        if broadcast_cb:
+            self.on_signal(broadcast_cb)
+
         self._start_vwap_scheduler()
 
+    @property
+    def watched(self):
+        """Used by ws_engine metrics."""
+        return list(self._watched)
+
+    def set_watchlist(self, symbols: List[str]):
+        """Updates the active watchlist symbols."""
+        with self._lock:
+            self._watched = set([s.upper().strip() for s in symbols])
+            # Optional: Clear calculators for symbols no longer watched
+            to_remove = [s for s in self._calcs if s not in self._watched]
+            for s in to_remove:
+                del self._calcs[s]
+        logger.info(f"Signal Watchlist updated: {len(self._watched)} symbols")
+
+    def start(self):
+        """Hook for future async/thread initialization if needed."""
+        logger.info("Scalping Signal Engine started")
+
+    def stop(self):
+        """Hook for cleanup."""
+        logger.info("Scalping Signal Engine stopped")
+
+    def on_tick(self, ticker: str, price: float, ts_ms: Optional[int] = None):
+        """
+        Entry point from ws_engine.py. 
+        Note: This engine prefers 1-min aggregate bars. 
+        For raw ticks, we treat them as minute-snapshots.
+        """
+        if ticker not in self._watched:
+            return
+
+        et_tz = pytz.timezone("America/New_York")
+        ts = datetime.fromtimestamp(ts_ms/1000.0, tz=et_tz) if ts_ms else datetime.now(et_tz)
+
+        # Create a 'pseudo-bar' from the live tick. 
+        # (WSEngine provides 1m aggregates 'A' or live trades 'T' through this)
+        bar = OHLCVBar(
+            timestamp=ts,
+            open=price, high=price, low=price, close=price, volume=0
+        )
+        
+        self.process_aggregate_bar(ticker, bar)
     # ── public API ───────────────────────────────────────────────────────────
 
     def on_signal(self, cb):
@@ -471,7 +524,10 @@ class ScalpingSignalEngine:
             else:
                 candle = "—"
 
-            # ── Quick score (mirrors _evaluate logic, session-neutral) ───────
+            # ── Quick score (mirrors _evaluate logic, WITH session multiplier) ─
+            # FIX: old code was session-neutral — score was always inflated vs
+            # _evaluate which applies a session quality multiplier. Pre-market
+            # and midday tickers were showing STRONG when they should be WEAK/HOLD.
             bull = bear = 0.0
             confluence = 0
             if close > vwap:     bull += 0.15; confluence += 1
@@ -487,8 +543,23 @@ class ScalpingSignalEngine:
             if vol >= 1.5:
                 if bull > bear: bull += 0.12; confluence += 1
                 else:           bear += 0.12
-            mult = 1.3 if adx >= 40 else (1.1 if adx >= 25 else 0.85)
-            bull *= mult; bear *= mult
+            adx_mult = 1.3 if adx >= 40 else (1.1 if adx >= 25 else 0.85)
+            bull *= adx_mult; bear *= adx_mult
+
+            # Apply same session quality multiplier as _evaluate so snapshot
+            # scores match what the full evaluation engine produces
+            now_ts = datetime.now(ZoneInfo("America/New_York"))
+            cur_session = _get_session(now_ts)
+            s_mult = {
+                MarketSession.OPEN:        0.80,
+                MarketSession.MID_MORNING: 1.00,
+                MarketSession.AFTERNOON:   0.90,
+                MarketSession.POWER_HOUR:  0.95,
+                MarketSession.AFTER_HOURS: 0.70,
+                MarketSession.PRE_MARKET:  0.60,
+            }.get(cur_session, 0.70)
+            bull *= s_mult; bear *= s_mult
+
             net = bull - bear
 
             # Map to direction / signal label
@@ -673,7 +744,7 @@ class ScalpingSignalEngine:
             bear += 0.15
             reasons.append({"text": "Bearish EMA stack", "type": "bear"})
 
-        vwap_pct = (close - vwap) / vwap * 100
+        vwap_pct = (close - vwap) / vwap * 100 if vwap else 0  # BUG-FIX: guard vwap=0
         if close > vwap:
             bull += 0.15
             reasons.append({"text": f"Above VWAP +{vwap_pct:.2f}%", "type": "bull"})

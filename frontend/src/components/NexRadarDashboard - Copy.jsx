@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, useCallback, Component } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback, Component, memo } from "react";
 import { API_BASE } from "../config.js";
 
 // ─── Global Error Boundary ───────────────────────────────────────────────────
@@ -238,6 +238,7 @@ const getCSS = (T) => `
   @keyframes fadeUp   { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
   @keyframes shimmer  { 0%{background-position:-400px 0} 100%{background-position:400px 0} }
   @keyframes dotblink { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.25;transform:scale(0.5)} }
+  @keyframes slideInRight { from{opacity:0;transform:translateX(24px)} to{opacity:1;transform:translateX(0)} }
 
   .page-enter { animation: fadeUp 0.3s ease forwards; }
 
@@ -472,7 +473,7 @@ const TV_INTERVAL_MAP = {
   "1m":"1", "5m":"5", "15m":"15", "1H":"60", "4H":"240", "1D":"D", "1W":"W",
 };
 
-function TVChart({ symbol, height = 220, T, interval = "5", livePrice = null }) {
+function TVChart({ symbol, height = 220, T, interval = "5", livePrice = null, chartStyle = "1" }) {
   const bg    = T?.bg1   || "#060d18";
   const text2 = T?.text2 || "#4a6278";
   const cyan  = T?.cyan  || "#00bcd4";
@@ -490,7 +491,7 @@ function TVChart({ symbol, height = 220, T, interval = "5", livePrice = null }) 
     interval:         tvInterval,
     timezone:         "America/New_York",
     theme:            "dark",
-    style:            "1",   // candlestick
+    style:            chartStyle,   // FIX: use dynamic chartStyle (1=candle,2=line,3=bar)
     locale:           "en",
     extended_hours:   "1",
     hide_top_toolbar: "0",
@@ -514,7 +515,7 @@ function TVChart({ symbol, height = 220, T, interval = "5", livePrice = null }) 
         </div>
       )}
       <iframe
-        key={`${symbol}-${tvInterval}`}
+        key={`${symbol}-${tvInterval}-${chartStyle}`}
         src={`https://s.tradingview.com/widgetembed/?${params.toString()}`}
         style={{ width:"100%", height, border:"none", display:"block" }}
         allowFullScreen
@@ -1477,7 +1478,161 @@ function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerf
 // • AH cols: SYMBOL+name | PREV CLOSE | TODAY CLOSE | LIVE PRICE | CHANGE | %CHG
 // • Source: ALL / WATCHLIST / (Yahoo Finance | TradingView) replaces PORTFOLIO
 // • Matrix view: top 50 clean TradingView charts
-function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", wsWatchlistRef = null, quickFilter = null, onClearQuickFilter = null, wsStatus = 'connected', onLiveCount = null, T }) {
+// ─── Memoized table row — only re-renders when price, volume, watchlist, or mode changes ──
+const LiveTableRow = memo(function LiveTableRow({
+  ticker, isWatched, toggleWatchlist, subMode, gridCols, scalpSignals, setSelectedSymbol, T
+}) {
+  const isPositive  = (ticker.change_value || 0) >= 0;
+  const changeColor = isPositive ? T.green : T.red;
+
+  return (
+    <div className="tr-hover" style={{ display:"grid", gridTemplateColumns:gridCols, borderBottom:`1px solid ${T.border}` }}>
+      {subMode === "MH" ? (
+        <>
+          {/* Symbol + Company */}
+          <div style={{ padding:"10px 14px", display:"flex", alignItems:"flex-start", gap:10 }}>
+            <button
+              onClick={(e) => { e.stopPropagation(); toggleWatchlist(ticker.ticker); }}
+              style={{
+                background:"none", border:"none", cursor:"pointer", fontSize:14, padding:0,
+                marginTop:2, color: isWatched ? T.gold : T.text2,
+                opacity: isWatched ? 1 : 0.3, transition:"all 0.2s", flexShrink:0
+              }}
+              onMouseEnter={e => e.currentTarget.style.opacity = 1}
+              onMouseLeave={e => e.currentTarget.style.opacity = isWatched ? 1 : 0.3}
+              title={isWatched ? "Remove from watchlist" : "Add to watchlist"}
+            >
+              {isWatched ? "⭐" : "☆"}
+            </button>
+            <div style={{ flex:1, minWidth:0 }}>
+              <div
+                onClick={() => setSelectedSymbol(s => s === ticker.ticker ? null : ticker.ticker)}
+                title="Click to view chart"
+                style={{
+                  color:T.cyan, fontSize:13, fontFamily:T.font, fontWeight:700,
+                  textDecoration:"underline", textDecorationColor:T.cyan+"40",
+                  marginBottom:3, lineHeight:1.2, cursor:"pointer",
+                }}>{ticker.ticker}</div>
+              <div style={{
+                color:T.text2, fontSize:10, fontFamily:T.font,
+                whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                maxWidth:"100%", lineHeight:1.3
+              }}>
+                {ticker.company_name && ticker.company_name !== ticker.ticker
+                  ? ticker.company_name
+                  : <span style={{ opacity:0.4 }}>—</span>}
+              </div>
+            </div>
+          </div>
+          {/* Open */}
+          <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.open || 0)}</div>
+          {/* Price */}
+          <div style={{ padding:"10px 14px", color:T.text0, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price || 0)}</div>
+          {/* $ CHG */}
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+            {isPositive ? "+" : ""}{fmt2(ticker.change_value || 0)}
+          </div>
+          {/* % CHG */}
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+            {pct(ticker.percent_change || 0)}
+          </div>
+          {/* Volume */}
+          <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+            {fmtVol(ticker.volume || 0)}
+          </div>
+          {/* Signal */}
+          <div style={{ padding:"10px 14px", display:"flex", alignItems:"center", gap:5 }}>
+            {(() => {
+              const sig = scalpSignals[ticker.ticker];
+              if (!sig) {
+                return ticker.volume_spike
+                  ? <span style={{ color:T.orange, fontSize:10, fontFamily:T.font, background:T.orangeDim, padding:"3px 8px", borderRadius:4, fontWeight:600 }}>VOL⚡</span>
+                  : <span style={{ color:T.text2, fontSize:11 }}>—</span>;
+              }
+              const clr = sig.signal === "BUY" ? T.green : sig.signal === "SELL" ? T.red : T.text2;
+              const bg  = sig.signal === "BUY" ? T.greenDim : sig.signal === "SELL" ? T.redDim : T.bg2;
+              return (
+                <div style={{ display:"flex", flexDirection:"column", gap:3 }}>
+                  <span style={{ color:clr, fontSize:11, fontFamily:T.font, fontWeight:800, background:bg, padding:"3px 8px", borderRadius:4, letterSpacing:0.5 }}>
+                    {sig.signal === "BUY" ? "▲ BUY" : sig.signal === "SELL" ? "▼ SELL" : "◈ HOLD"}
+                  </span>
+                  <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>
+                    {sig.strength} · {sig.prediction}%
+                  </span>
+                </div>
+              );
+            })()}
+          </div>
+        </>
+      ) : (
+        <>
+          {/* Symbol + Company */}
+          <div style={{ padding:"10px 14px", display:"flex", alignItems:"flex-start", gap:10 }}>
+            <button
+              onClick={(e) => { e.stopPropagation(); toggleWatchlist(ticker.ticker); }}
+              style={{
+                background:"none", border:"none", cursor:"pointer", fontSize:14, padding:0,
+                marginTop:2, color: isWatched ? T.gold : T.text2,
+                opacity: isWatched ? 1 : 0.3, transition:"all 0.2s", flexShrink:0
+              }}
+              onMouseEnter={e => e.currentTarget.style.opacity = 1}
+              onMouseLeave={e => e.currentTarget.style.opacity = isWatched ? 1 : 0.3}
+              title={isWatched ? "Remove from watchlist" : "Add to watchlist"}
+            >
+              {isWatched ? "⭐" : "☆"}
+            </button>
+            <div style={{ flex:1, minWidth:0 }}>
+              <div
+                onClick={() => setSelectedSymbol(s => s === ticker.ticker ? null : ticker.ticker)}
+                title="Click to view chart"
+                style={{
+                  color:T.cyan, fontSize:13, fontFamily:T.font, fontWeight:700,
+                  textDecoration:"underline", textDecorationColor:T.cyan+"40",
+                  marginBottom:3, lineHeight:1.2, cursor:"pointer",
+                }}>{ticker.ticker}</div>
+              <div style={{
+                color:T.text2, fontSize:10, fontFamily:T.font,
+                whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                maxWidth:"100%", lineHeight:1.3
+              }}>
+                {ticker.company_name && ticker.company_name !== ticker.ticker
+                  ? ticker.company_name
+                  : <span style={{ opacity:0.4 }}>—</span>}
+              </div>
+            </div>
+          </div>
+          {/* Prev Close */}
+          <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{ticker.prev_close > 0 ? `$${fmt2(ticker.prev_close)}` : "—"}</div>
+          {/* Today Close */}
+          <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{ticker.today_close > 0 ? `$${fmt2(ticker.today_close)}` : "—"}</div>
+          {/* Live Price */}
+          <div style={{ padding:"10px 14px", color:T.cyan, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price || 0)}</div>
+          {/* $ CHG */}
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+            {isPositive ? "+" : ""}{fmt2(ticker.change_value || 0)}
+          </div>
+          {/* % CHG */}
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
+            {pct(ticker.percent_change || 0)}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}, (prev, next) => {
+  return (
+    prev.ticker.live_price   === next.ticker.live_price   &&
+    prev.ticker.change_value === next.ticker.change_value &&
+    prev.ticker.volume       === next.ticker.volume       &&
+    prev.ticker.volume_spike === next.ticker.volume_spike &&
+    prev.isWatched           === next.isWatched           &&
+    prev.subMode             === next.subMode             &&
+    prev.gridCols            === next.gridCols            &&
+    prev.scalpSignals        === next.scalpSignals
+  );
+});
+
+function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", wsWatchlistRef = null, quickFilter = null, onClearQuickFilter = null, wsStatus = 'connected', onLiveCount = null, watchlistProp = null, toggleWatchlistProp = null, T }) {
   const [viewMode,   setViewMode]   = useState("TABLE");
   const autoSubMode = SESSION_META[marketSession]?.subMode ?? "MH";
   const [subModeOverride, setSubModeOverride] = useState(null);
@@ -1490,9 +1645,22 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
   const [extLink,    setExtLink]    = useState("Yahoo Finance"); // Yahoo Finance | TradingView
   const [matrixCount,setMatrixCount]= useState(50);
   const [currentPage, setCurrentPage] = useState(1);
-  const [selectedSymbol, setSelectedSymbol] = useState(null); // For chart panel
+  const [selectedSymbol, setSelectedSymbol] = useState(null);
+  const [chartPanelTF,   setChartPanelTF]   = useState("5");  // timeframe for inline chart panel
+
+  // Close chart panel on Escape
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") setSelectedSymbol(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   const [chartOpenCount, setChartOpenCount] = useState(5); // How many charts to open
-  const [watchlist, setWatchlist] = useState(new Set()); // ★ Persisted signal watchlist
+  // Watchlist is now owned by root NexRadarDashboard and passed as props so
+  // Portfolio tab shares the same state. Fall back to local state if somehow
+  // rendered standalone (e.g. tests / storybook).
+  const [_localWatchlist, _setLocalWatchlist] = useState(new Set());
+  const watchlist       = watchlistProp      ?? _localWatchlist;
+  const setWatchlist    = watchlistProp      ? () => {} : _setLocalWatchlist;
   const tableScrollRef = useRef(null); // Ref for scroll-to-top on page change
   const ITEMS_PER_PAGE = 50;
   // ── Column sort state ─────────────────────────────────────────────────────
@@ -1516,7 +1684,7 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
         .then(d => {
           if (!d?.data) return;
           const m = {};
-          d.data.forEach(r => { if (r.status === "ok") m[r.ticker] = r; });
+          d.data.forEach(r => { if (!r.status || r.status === "ok") m[r.ticker] = r; });
           setScalpSignals(m);
         })
         .catch(() => {});
@@ -1548,55 +1716,52 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
     fetchTodayEarnings();
 
     // Schedule re-fetch at next midnight ET (daily reset)
+    // Fix-10: Orphaned Recursive Timer.
+    // OLD: return setTimeout() gave the first ID to midnightTimer. On fire,
+    // recursive call created a NEW ID never stored anywhere. Cleanup only
+    // cleared the first timer -- every subsequent midnight leaked forever.
+    // FIX: mutable ref always holds the currently-live ID so cleanup is safe.
+    const midnightTimerRef = { current: null };
     const scheduleMidnightRefresh = () => {
       const etNow    = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
       const midnight = new Date(etNow);
       midnight.setHours(24, 0, 5, 0); // 00:00:05 next day ET
       const msUntil  = midnight.getTime() - etNow.getTime();
-      return setTimeout(() => {
+      midnightTimerRef.current = setTimeout(() => {
         fetchTodayEarnings();
-        // Re-arm for the following midnight
-        scheduleMidnightRefresh();
+        scheduleMidnightRefresh(); // overwrites ref with newest ID
       }, msUntil);
     };
-    const midnightTimer = scheduleMidnightRefresh();
-    return () => clearTimeout(midnightTimer);
+    scheduleMidnightRefresh();
+    return () => { if (midnightTimerRef.current) clearTimeout(midnightTimerRef.current); };
   }, []);
 
-  // ── Load watchlist from backend on mount ─────────────────────────────────
+  // ── Watchlist: delegate to root props when available ─────────────────────
+  // Root NexRadarDashboard owns the watchlist state and passes it down so
+  // Portfolio shares the same Set. When props are present (normal runtime),
+  // skip the local fetch and use the prop toggle directly.
   useEffect(() => {
+    if (watchlistProp !== null) return; // root already fetched it
     fetch(`${API_BASE}/api/watchlist`)
       .then(r => r.ok ? r.json() : Promise.reject(r.status))
-      .then(data => setWatchlist(new Set(data.watchlist ?? [])))
+      .then(data => _setLocalWatchlist(new Set(data.watchlist ?? [])))
       .catch(err => console.warn('[NexRadar] Failed to load watchlist:', err));
-  }, []);
+  }, [watchlistProp]);
 
-  // ── Register setter into root ref so WS watchlist_update events reach here ─
-  // The root onmessage handler calls wsWatchlistRef.current(newSet) when
-  // another tab stars/unstars a ticker, keeping all tabs in sync.
-  useEffect(() => {
-    if (wsWatchlistRef) {
-      wsWatchlistRef.current = setWatchlist;
-    }
-    return () => {
-      if (wsWatchlistRef) wsWatchlistRef.current = null;
-    };
-  }, [wsWatchlistRef]);
+  // wsWatchlistRef is now wired to root's setWatchlist — no local registration needed.
+  // (Kept as no-op for safety if rendered standalone.)
 
-  // ── Toggle watchlist — calls backend, optimistic UI update ───────────────
-  const toggleWatchlist = async (symbol) => {
-    const isWatched = watchlist.has(symbol);
+  // ── Toggle watchlist — delegate to root prop or local fallback ────────────
+  const toggleWatchlist = toggleWatchlistProp ?? (async (symbol) => {
+    const isWatched = _localWatchlist.has(symbol);
     const endpoint  = isWatched
       ? `${API_BASE}/api/watchlist/remove`
       : `${API_BASE}/api/watchlist/add`;
-
-    // Optimistic update — instant ★ feedback, no waiting for round-trip
-    setWatchlist(prev => {
+    _setLocalWatchlist(prev => {
       const next = new Set(prev);
       isWatched ? next.delete(symbol) : next.add(symbol);
       return next;
     });
-
     try {
       const res = await fetch(endpoint, {
         method:  'POST',
@@ -1605,17 +1770,35 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
     } catch (err) {
-      // Rollback on failure — revert the optimistic update
       console.error('[NexRadar] Watchlist toggle failed, rolling back:', err);
-      setWatchlist(prev => {
+      _setLocalWatchlist(prev => {
         const next = new Set(prev);
         isWatched ? next.add(symbol) : next.delete(symbol);
         return next;
       });
     }
-  };
+  });
 
   // Convert tickers Map to array and filter by sector
+  // Fix-9 — CPU Thrashing: Two-tier memoization to decouple fast price updates
+  // from the heavy sort operation.
+  //
+  // PROBLEM: filteredTickers depended on tickerArray which depended on `tickers`.
+  // `tickers` updates every 250ms (our WS flush interval). Every 250ms React was
+  // running: Array.from(6200 values) + multiple .filter() passes + .sort() of
+  // 6200 objects = heavy GC + JS main-thread block = frozen buttons/UI.
+  //
+  // FIX: Split into two tiers:
+  //   Tier 1 — tickerArray: depends on `tickers` (runs at 250ms). Only does
+  //     cheap source/sector/watchlist filtering — O(n) membership checks, no sort.
+  //   Tier 2 — filteredTickers: depends on `sortTrigger` (runs at 1000ms).
+  //     Reads from tickerArray ref (always fresh), runs all filter passes + sort.
+  //     The sort of 6200 objects now happens 1x/second instead of 4x/second.
+  //
+  // tickerArrayRef keeps Tier-2 always reading the latest Tier-1 data without
+  // adding tickerArray as a dependency (which would break the throttle).
+  const tickerArrayRef = useRef([]);
+
   const tickerArray = useMemo(() => {
     const arr = Array.from(tickers.values());
 
@@ -1637,17 +1820,49 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
       });
     }
 
+    tickerArrayRef.current = filtered; // keep ref in sync for Tier-2
     return filtered;
   }, [tickers, selectedSectors, source, watchlist, earningsTickers]);
 
+  // Tier-2 sort trigger: increments at most once per second so the heavy
+  // sort/filter only runs 1x/sec instead of 4x/sec (250ms WS flush rate).
+  const [sortTrigger, setSortTrigger] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setSortTrigger(t => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Fix-12 — UI Input Lag on Sector / Source Filters:
+  // filteredTickers reads tickerArrayRef.current (a ref, not state).
+  // When a user clicks "TECHNOLOGY", tickerArray (Tier-1) re-runs and
+  // updates the ref — but refs never trigger useMemo re-evaluation.
+  // sortTrigger only fires every 1 second, so the table appears frozen
+  // for up to 1s after every sector/source/watchlist button click.
+  //
+  // FIX: userFilterVersion is a plain integer state that increments
+  // immediately whenever any user-driven filter changes. Because it IS
+  // state (not a ref), adding it to filteredTickers' dep array forces an
+  // instant re-render on user action while price-tick throttling (the
+  // sortTrigger interval) is still respected for background WS updates.
+  const [userFilterVersion, setUserFilterVersion] = useState(0);
+  useEffect(() => {
+    setUserFilterVersion(v => v + 1);
+  }, [selectedSectors, source, watchlist, earningsTickers, quickFilter]);
+
+  // Fix-9 Tier-2: heavy sort runs at 1s cadence via sortTrigger, NOT at the
+  // 250ms WS flush rate. Reads tickerArrayRef.current so it always sees the
+  // latest filtered data without making tickerArray a dependency.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const filteredTickers = useMemo(() => {
-    let arr = tickerArray.filter(t => Math.abs(t.change_value || 0) >= minDelta);
+    // Read the always-fresh Tier-1 array via ref — never stale, never re-sorts
+    // on every price tick, only on the 1-second sortTrigger pulse.
+    let arr = tickerArrayRef.current.filter(t => Math.abs(t.change_value || 0) >= minDelta);
     if (quickFilter === "VOL_SPIKES")  arr = arr.filter(t => t.volume_spike);
     if (quickFilter === "GAP_PLAYS")   arr = arr.filter(t => t.is_gap_play);
     if (quickFilter === "AH_MOMT")     arr = arr.filter(t => t.ah_momentum);
     if (quickFilter === "EARN_GAPS")   arr = arr.filter(t => t.is_earnings_gap_play);
     if (quickFilter === "DIAMOND")     arr = arr.filter(t => Math.abs(t.percent_change || 0) >= 5);
-    // Dynamic column sort
+    // Dynamic column sort — expensive O(n log n); runs 1x/sec, not 4x/sec
     const dir = sortDir === "desc" ? -1 : 1;
     arr = arr.slice().sort((a, b) => {
       let va, vb;
@@ -1666,7 +1881,12 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
       return dir * (va - vb);
     });
     return arr;
-  }, [tickerArray, minDelta, quickFilter, sortKey, sortDir]);
+  // sortTrigger: throttles price-tick re-sorts to 1x/sec.
+  // userFilterVersion: fires instantly on any user-driven filter change
+  //   (sector pill, source toggle, watchlist star, quickFilter button)
+  //   so the table responds in <16ms, not up to 1 full second.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sortTrigger, userFilterVersion, minDelta, quickFilter, sortKey, sortDir]);
 
   // Reset to page 1 when filters change
   useEffect(() => {
@@ -1835,7 +2055,7 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
       {viewMode === "TABLE" && (
         <div style={{ display:"flex", gap:16, height:"100%" }}>
           {/* Main Table */}
-          <div className="card" style={{ flex: "1 1 100%", transition:"flex 0.3s ease" }}>
+          <div className="card" style={{ flex: selectedSymbol ? "1 1 58%" : "1 1 100%", minWidth:0, transition:"flex 0.3s ease", overflow:"hidden" }}>
           <SectionHeader title={`Live Stock Data · ${subMode === "MH" ? "Market Hours" : "After Hours"}${!selectedSectors.includes("ALL") ? ` · ${activeLabel}` : ""}`} T={T}>
             <div style={{ display:"flex", alignItems:"center", gap:8 }}>
               <span style={{ color:T.text2, fontSize:12, fontFamily:T.font, fontWeight:500 }}>{filteredTickers.length.toLocaleString()} tickers</span>
@@ -1898,186 +2118,19 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
             )}
             {paginatedTickers.length > 0 && (
               <>
-                {paginatedTickers.map((ticker, i) => {
-                const isPositive = (ticker.change_value || 0) >= 0;
-                const changeColor = isPositive ? T.green : T.red;
-                
-                return (
-                  <div key={ticker.ticker || i} className="tr-hover" style={{ display:"grid", gridTemplateColumns:gridCols, borderBottom:`1px solid ${T.border}` }}>
-                    {subMode === "MH" ? (
-                      <>
-                        {/* Symbol + Company (stacked with star) */}
-                        <div style={{ padding:"10px 14px", display:"flex", alignItems:"flex-start", gap:10 }}>
-                          {/* Star icon for watchlist */}
-                          <button
-                            onClick={(e) => { e.stopPropagation(); toggleWatchlist(ticker.ticker); }}
-                            style={{ 
-                              background:"none", 
-                              border:"none", 
-                              cursor:"pointer", 
-                              fontSize:14, 
-                              padding:0,
-                              marginTop:2,
-                              color: watchlist.has(ticker.ticker) ? T.gold : T.text2,
-                              opacity: watchlist.has(ticker.ticker) ? 1 : 0.3,
-                              transition:"all 0.2s",
-                              flexShrink:0
-                            }}
-                            onMouseEnter={e => e.currentTarget.style.opacity = 1}
-                            onMouseLeave={e => e.currentTarget.style.opacity = watchlist.has(ticker.ticker) ? 1 : 0.3}
-                            title={watchlist.has(ticker.ticker) ? "Remove from watchlist" : "Add to watchlist"}
-                          >
-                            {watchlist.has(ticker.ticker) ? "⭐" : "☆"}
-                          </button>
-                          
-                          {/* Symbol + Company stacked */}
-                          <div 
-                            style={{ flex:1, minWidth:0 }}
-                            
-                          >
-                            <div style={{ 
-                              color:T.cyan, 
-                              fontSize:13, 
-                              fontFamily:T.font, 
-                              fontWeight:700,
-                              textDecoration:"underline",
-                              textDecorationColor:T.cyan+"40",
-                              marginBottom:3,
-                              lineHeight:1.2
-                            }}>{ticker.ticker}</div>
-                            <div style={{ 
-                              color:T.text2, 
-                              fontSize:10, 
-                              fontFamily:T.font, 
-                              whiteSpace:"nowrap", 
-                              overflow:"hidden", 
-                              textOverflow:"ellipsis",
-                              maxWidth:"100%",
-                              lineHeight:1.3
-                            }}>
-                              {ticker.company_name && ticker.company_name !== ticker.ticker
-                                ? ticker.company_name
-                                : <span style={{ opacity:0.4 }}>—</span>}
-                            </div>
-                          </div>
-                        </div>
-                        {/* Open */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.open || 0)}</div>
-                        {/* Price */}
-                        <div style={{ padding:"10px 14px", color:T.text0, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price || 0)}</div>
-                        {/* Change */}
-                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
-                          {isPositive ? '+' : ''}{fmt2(ticker.change_value || 0)}
-                        </div>
-                        {/* %CHG */}
-                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
-                          {pct(ticker.percent_change || 0)}
-                        </div>
-                        {/* Volume */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
-                          {fmtVol(ticker.volume || 0)}
-                        </div>
-                        {/* SIGNAL — from scalp analysis engine */}
-                        <div style={{ padding:"10px 14px", display:"flex", alignItems:"center", gap:5 }}>
-                          {(() => {
-                            const sig = scalpSignals[ticker.ticker];
-                            if (!sig) {
-                              return ticker.volume_spike
-                                ? <span style={{ color:T.orange, fontSize:10, fontFamily:T.font, background:T.orangeDim, padding:"3px 8px", borderRadius:4, fontWeight:600 }}>VOL⚡</span>
-                                : <span style={{ color:T.text2, fontSize:11 }}>—</span>;
-                            }
-                            const clr = sig.signal === "BUY" ? T.green : sig.signal === "SELL" ? T.red : T.text2;
-                            const bg  = sig.signal === "BUY" ? T.greenDim : sig.signal === "SELL" ? T.redDim : T.bg2;
-                            return (
-                              <div style={{ display:"flex", flexDirection:"column", gap:3 }}>
-                                <span style={{ color:clr, fontSize:11, fontFamily:T.font, fontWeight:800, background:bg, padding:"3px 8px", borderRadius:4, letterSpacing:0.5 }}>
-                                  {sig.signal === "BUY" ? "▲ BUY" : sig.signal === "SELL" ? "▼ SELL" : "◈ HOLD"}
-                                </span>
-                                <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>
-                                  {sig.strength} · {sig.prediction}%
-                                </span>
-                              </div>
-                            );
-                          })()}
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        {/* Symbol + Company (stacked with star) */}
-                        <div style={{ padding:"10px 14px", display:"flex", alignItems:"flex-start", gap:10 }}>
-                          {/* Star icon for watchlist */}
-                          <button
-                            onClick={(e) => { e.stopPropagation(); toggleWatchlist(ticker.ticker); }}
-                            style={{ 
-                              background:"none", 
-                              border:"none", 
-                              cursor:"pointer", 
-                              fontSize:14, 
-                              padding:0,
-                              marginTop:2,
-                              color: watchlist.has(ticker.ticker) ? T.gold : T.text2,
-                              opacity: watchlist.has(ticker.ticker) ? 1 : 0.3,
-                              transition:"all 0.2s",
-                              flexShrink:0
-                            }}
-                            onMouseEnter={e => e.currentTarget.style.opacity = 1}
-                            onMouseLeave={e => e.currentTarget.style.opacity = watchlist.has(ticker.ticker) ? 1 : 0.3}
-                            title={watchlist.has(ticker.ticker) ? "Remove from watchlist" : "Add to watchlist"}
-                          >
-                            {watchlist.has(ticker.ticker) ? "⭐" : "☆"}
-                          </button>
-                          
-                          {/* Symbol + Company stacked */}
-                          <div 
-                            style={{ flex:1, minWidth:0 }}
-                            
-                          >
-                            <div style={{ 
-                              color:T.cyan, 
-                              fontSize:13, 
-                              fontFamily:T.font, 
-                              fontWeight:700,
-                              textDecoration:"underline",
-                              textDecorationColor:T.cyan+"40",
-                              marginBottom:3,
-                              lineHeight:1.2
-                            }}>{ticker.ticker}</div>
-                            <div style={{ 
-                              color:T.text2, 
-                              fontSize:10, 
-                              fontFamily:T.font, 
-                              whiteSpace:"nowrap", 
-                              overflow:"hidden", 
-                              textOverflow:"ellipsis",
-                              maxWidth:"100%",
-                              lineHeight:1.3
-                            }}>
-                              {ticker.company_name && ticker.company_name !== ticker.ticker
-                                ? ticker.company_name
-                                : <span style={{ opacity:0.4 }}>—</span>}
-                            </div>
-                          </div>
-                        </div>
-                        {/* Prev Close */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.prev_close || 0)}</div>
-                        {/* Today Close */}
-                        <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.today_close || 0)}</div>
-                        {/* Live Price */}
-                        <div style={{ padding:"10px 14px", color:T.cyan, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price || 0)}</div>
-                        {/* Change */}
-                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
-                          {isPositive ? '+' : ''}{fmt2(ticker.change_value || 0)}
-                        </div>
-                        {/* %CHG */}
-                        <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>
-                          {pct(ticker.percent_change || 0)}
-                        </div>
-                      </>
-                    )}
-                  </div>
-                );
-              })
-              }
+                {paginatedTickers.map((ticker, i) => (
+                  <LiveTableRow
+                    key={ticker.ticker || i}
+                    ticker={ticker}
+                    isWatched={watchlist.has(ticker.ticker)}
+                    toggleWatchlist={toggleWatchlist}
+                    subMode={subMode}
+                    gridCols={gridCols}
+                    scalpSignals={scalpSignals}
+                    setSelectedSymbol={setSelectedSymbol}
+                    T={T}
+                  />
+                ))}
               
               {/* Bottom fade gradient — purely decorative, shows more content below */}
               {paginatedTickers.length >= 10 && (
@@ -2135,7 +2188,83 @@ function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), m
             </div>
           </div>
         </div>
-          
+
+          {/* ── Inline chart panel (slides in on ticker click) ─────────────────
+               Opens to the right of the table without navigating away.
+               selectedSymbol toggles: click same ticker = close panel.
+          ─────────────────────────────────────────────────────────────────── */}
+          {selectedSymbol && (
+            <div className="card" style={{
+              flex: "0 0 40%",
+              minWidth: 320,
+              maxWidth: 560,
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              animation: "slideInRight 0.22s ease",
+              position: "relative",
+            }}>
+              {/* Panel header */}
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
+                padding:"10px 14px", borderBottom:`1px solid ${T.border}`, flexShrink:0 }}>
+                <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                  <span style={{ color:T.cyan, fontFamily:T.font, fontSize:15, fontWeight:800 }}>{selectedSymbol}</span>
+                  <span style={{ color:T.text2, fontFamily:T.font, fontSize:10 }}>CHART</span>
+                </div>
+                <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                  {/* TF selector */}
+                  {["1","5","15","60","D"].map(tf => (
+                    <button key={tf} onClick={() => setChartPanelTF(tf)}
+                      style={{ background: chartPanelTF===tf ? T.cyan+"22" : "transparent",
+                        border: `1px solid ${chartPanelTF===tf ? T.cyan : T.border}`,
+                        color: chartPanelTF===tf ? T.cyan : T.text2,
+                        fontFamily:T.font, fontSize:10, fontWeight:700,
+                        padding:"3px 8px", borderRadius:4, cursor:"pointer" }}>
+                      {tf === "D" ? "1D" : tf === "60" ? "1H" : tf+"m"}
+                    </button>
+                  ))}
+                  {/* Open in TV */}
+                  <a href={`https://www.tradingview.com/chart/?symbol=${selectedSymbol}`}
+                    target="_blank" rel="noreferrer"
+                    style={{ color:T.text2, fontSize:10, fontFamily:T.font, textDecoration:"none",
+                      padding:"3px 8px", border:`1px solid ${T.border}`, borderRadius:4 }}
+                    title="Open full chart in TradingView">⬡ TV</a>
+                  {/* Close */}
+                  <button onClick={() => setSelectedSymbol(null)}
+                    style={{ background:"transparent", border:`1px solid ${T.border}`,
+                      color:T.text2, fontFamily:T.font, fontSize:11, fontWeight:700,
+                      padding:"3px 9px", borderRadius:4, cursor:"pointer" }}
+                    title="Close chart panel (Esc)">✕</button>
+                </div>
+              </div>
+              {/* Live price bar */}
+              {(() => {
+                const live = tickers.get(selectedSymbol);
+                if (!live) return null;
+                const chg = live.percent_change || 0;
+                const isPos = chg >= 0;
+                return (
+                  <div style={{ display:"flex", gap:16, padding:"8px 14px",
+                    borderBottom:`1px solid ${T.border}`, background:T.bg2, flexShrink:0 }}>
+                    <span style={{ color:T.text0, fontFamily:T.font, fontSize:13, fontWeight:700 }}>${(live.live_price||0).toFixed(2)}</span>
+                    <span style={{ color: isPos?T.green:T.red, fontFamily:T.font, fontSize:12 }}>{isPos?"+":" "}{(live.change_value||0).toFixed(2)} ({isPos?"+":""}{chg.toFixed(2)}%)</span>
+                    <span style={{ color:T.text2, fontFamily:T.font, fontSize:11 }}>Vol {live.volume ? (live.volume/1e6).toFixed(1)+"M" : "—"}</span>
+                  </div>
+                );
+              })()}
+              {/* Chart */}
+              <div style={{ flex:1, minHeight:0 }}>
+                <TVChart
+                  symbol={selectedSymbol}
+                  height="100%"
+                  T={T}
+                  interval={chartPanelTF}
+                  livePrice={tickers.get(selectedSymbol)?.live_price ?? null}
+                />
+              </div>
+            </div>
+          )}
+
         </div>
       )}
 
@@ -2305,6 +2434,7 @@ function PageChart({ T, tickers = new Map(), initialSymbol = "" }) {
           <SectionHeader title={sym||"— SELECT SYMBOL"}><Chip color={T.cyan}>{tf}</Chip></SectionHeader>
           {sym
             ? <TVChart symbol={sym} height={460} T={T} interval={TF_MAP[tf]}
+                chartStyle={chartStyle}
                 livePrice={tickers.get(sym)?.live_price ?? null}/>
             : <EmptyChart height={460} label="Enter a symbol above and press LOAD or Enter"/>}
         </div>
@@ -2402,7 +2532,7 @@ function PageSignals({ tickers = new Map(), selectedSectors = ["ALL"], techData 
 
   // ── PRO SCALP processed rows ───────────────────────────────────────────────
   const proRows = useMemo(() => {
-    let rows = proData.filter(r => r.status === "ok");
+    let rows = proData.filter(r => !r.status || r.status === "ok");
     if (proFilter === "BUY")    rows = rows.filter(r => r.signal === "BUY");
     else if (proFilter === "SELL")   rows = rows.filter(r => r.signal === "SELL");
     else if (proFilter === "STRONG") rows = rows.filter(r => r.strength === "STRONG");
@@ -2419,7 +2549,7 @@ function PageSignals({ tickers = new Map(), selectedSectors = ["ALL"], techData 
     buy:    proData.filter(r => r.signal === "BUY").length,
     sell:   proData.filter(r => r.signal === "SELL").length,
     strong: proData.filter(r => r.strength === "STRONG").length,
-    total:  proData.filter(r => r.status === "ok").length,
+    total:  proData.filter(r => !r.status || r.status === "ok").length,
   }), [proData]);
 
   const handleProSort = key => {
@@ -3183,7 +3313,7 @@ function PageEarnings({ T }) {
 // Allocation section: SVG donut with sector breakdown by portfolio weight.
 // Sectors drawn proportionally once real data arrives from /api/portfolio.
 // Until then, shows empty donut with usage guide.
-function PagePortfolio({ tickers = new Map(), marketSession = "market", T }) {
+function PagePortfolio({ tickers = new Map(), marketSession = "market", watchlist = new Set(), toggleWatchlist = () => {}, T }) {
   const [portfolioData, setPortfolioData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [currentPage, setCurrentPage] = useState(1);
@@ -3443,7 +3573,17 @@ function PagePortfolio({ tickers = new Map(), marketSession = "market", T }) {
                     return (
                     /* ── MH ROW: SYMBOL | SHARES | AVG COST | OPEN | LIVE PRICE | CHANGE | % CHG | VALUE | DAY P&L | TOTAL P&L | ACTION */
                     <div key={pos.ticker} style={{ display:"grid", gridTemplateColumns:"1.4fr 0.7fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.9fr 0.6fr", borderBottom:`1px solid ${T.border}`, fontSize:12, fontFamily:T.font }}>
-                      <div style={{ padding:"10px", color:T.cyan, fontWeight:700, fontSize:13 }}>{pos.ticker}<div style={{ color:T.text2, fontSize:9, fontWeight:400 }}>{pos.company_name || ""}</div></div>
+                      <div style={{ padding:"10px", display:"flex", alignItems:"flex-start", gap:8 }}>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); toggleWatchlist(pos.ticker); }}
+                          style={{ background:"none", border:"none", cursor:"pointer", padding:"1px 2px", fontSize:14, color: watchlist.has(pos.ticker) ? T.gold || "#f5a623" : T.text2, opacity: watchlist.has(pos.ticker) ? 1 : 0.4, transition:"all 0.15s", flexShrink:0, lineHeight:1 }}
+                          title={watchlist.has(pos.ticker) ? "Remove from watchlist" : "Add to watchlist"}
+                        >{watchlist.has(pos.ticker) ? "★" : "☆"}</button>
+                        <div>
+                          <div style={{ color:T.cyan, fontWeight:700, fontSize:13 }}>{pos.ticker}</div>
+                          <div style={{ color:T.text2, fontSize:9, fontWeight:400 }}>{pos.company_name || ""}</div>
+                        </div>
+                      </div>
                       <div style={{ padding:"10px", color:T.text1 }}>{pos.shares?.toLocaleString() || 0}</div>
                       <div style={{ padding:"10px", color:T.text1 }}>${fmt2(pos.avg_cost)}</div>
                       <div style={{ padding:"10px", color:T.text1 }}>{pos.openPrice > 0 ? `$${fmt2(pos.openPrice)}` : "—"}</div>
@@ -3460,7 +3600,17 @@ function PagePortfolio({ tickers = new Map(), marketSession = "market", T }) {
                     /* ── AH ROW: SYMBOL | SHARES | AVG COST | PREV CLOSE | TODAY CLOSE | LIVE PRICE | $ CHG | % CHG | VALUE | TOTAL P&L | ACTION */
                     return (
                     <div key={`${pos.ticker}_ah`} style={{ display:"grid", gridTemplateColumns:"1.4fr 0.7fr 0.9fr 0.9fr 1fr 1fr 0.9fr 0.9fr 0.9fr 0.9fr 0.6fr", borderBottom:`1px solid ${T.border}`, fontSize:12, fontFamily:T.font }}>
-                      <div style={{ padding:"10px", color:T.cyan, fontWeight:700, fontSize:13 }}>{pos.ticker}<div style={{ color:T.text2, fontSize:9, fontWeight:400 }}>{pos.company_name || ""}</div></div>
+                      <div style={{ padding:"10px", display:"flex", alignItems:"flex-start", gap:8 }}>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); toggleWatchlist(pos.ticker); }}
+                          style={{ background:"none", border:"none", cursor:"pointer", padding:"1px 2px", fontSize:14, color: watchlist.has(pos.ticker) ? T.gold || "#f5a623" : T.text2, opacity: watchlist.has(pos.ticker) ? 1 : 0.4, transition:"all 0.15s", flexShrink:0, lineHeight:1 }}
+                          title={watchlist.has(pos.ticker) ? "Remove from watchlist" : "Add to watchlist"}
+                        >{watchlist.has(pos.ticker) ? "★" : "☆"}</button>
+                        <div>
+                          <div style={{ color:T.cyan, fontWeight:700, fontSize:13 }}>{pos.ticker}</div>
+                          <div style={{ color:T.text2, fontSize:9, fontWeight:400 }}>{pos.company_name || ""}</div>
+                        </div>
+                      </div>
                       <div style={{ padding:"10px", color:T.text1 }}>{pos.shares?.toLocaleString() || 0}</div>
                       <div style={{ padding:"10px", color:T.text1 }}>${fmt2(pos.avg_cost)}</div>
                       <div style={{ padding:"10px", color:T.text1 }}>{pos.prevClose > 0 ? `$${fmt2(pos.prevClose)}` : "—"}</div>
@@ -3614,6 +3764,7 @@ function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp =
   // Global search: navigates to Chart page with the searched symbol pre-loaded
   const [chartInitSymbol, setChartInitSymbol] = useState("");
   const [searchVal, setSearchVal] = useState("");
+  const searchInputRef = useRef("");  // avoids full re-render on every keystroke
   const [page, setPage] = useState(() => {
     try {
       const saved = localStorage.getItem('nexradar_active_page');
@@ -3672,7 +3823,16 @@ function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp =
   // WebSocket state for live ticker data
   const [tickers, setTickers] = useState(new Map());
   const [wsStatus, setWsStatus] = useState('connecting'); // 'connecting' | 'connected' | 'disconnected'
-  const wsRef = useRef(null);
+  const wsRef = useRef(null);  // kept for type-safety; see sseRef below
+  // BUG-3 FIX: sseRef holds the live EventSource so the market-open timer
+  // (separate useEffect below) can close and reopen it at 9:30 AM ET.
+  // wsRef was dead code left over from the WebSocket→SSE migration — it was
+  // always null when the timer fired, bricking the dashboard every morning.
+  const sseRef = useRef(null);
+  // Holds the active market-open reset timer ID so scheduleMarketOpenReset()
+  // and the SSE useEffect cleanup share the same ref object — fixes the
+  // ReferenceError crash (midnightTimerRef used at L4172/L4188 but never declared).
+  const midnightTimerRef = useRef(null);
   // Dirty flag: only flush tickerCacheRef → React state when cache has actually changed.
   // Prevents wasteful re-renders when returning from Signals/Chart tabs (Bug 2).
   const tickerCacheDirtyRef = useRef(false);
@@ -3699,7 +3859,7 @@ function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp =
         .then(d => {
           if (!d?.data) return;
           const m = {};
-          d.data.forEach(r => { if (r.status === "ok") m[r.ticker] = r; });
+          d.data.forEach(r => { if (!r.status || r.status === "ok") m[r.ticker] = r; });
           setSideScalpSignals(m);
         })
         .catch(() => {});
@@ -3763,12 +3923,16 @@ function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp =
 
   // ── Market Open Heartbeat ─────────────────────────────────────────────────
   // At exactly 9:30 AM ET (market open bell) we:
-  //   1. Force-close the WebSocket so it reconnects and gets a fresh snapshot
+  //   1. Force-close the EventSource so it reconnects and gets a fresh snapshot
   //   2. Clear local ticker state so the table shows "awaiting snapshot" instead
   //      of frozen pre-market data while reconnect is in flight
   //   3. Re-schedule for the next trading day
-  // This resolves the AH→MH stale data window where a client open before 9:30
-  // could receive a snapshot that still contains AH values from the backend cache.
+  //
+  // BUG-3 FIX: previously this called wsRef.current.close() which was always
+  // null (dead code from the WebSocket→SSE migration).  setTickers(new Map())
+  // ran fine but the EventSource was never closed, so the dashboard just went
+  // blank at 9:30 AM with no reconnect.  Now we use sseRef.current which is
+  // assigned inside connectSSE() on every (re)connect.
   useEffect(() => {
     const scheduleMarketOpenReset = () => {
       const now   = new Date();
@@ -3786,21 +3950,20 @@ function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp =
 
       return setTimeout(() => {
         console.log("[NexRadar] 🔔 Market Open — flushing stale session data");
-        // Force WS reconnect → fresh snapshot from backend
-        if (wsRef.current) {
-          wsRef.current.onclose = null; // suppress the auto-reconnect handler briefly
-          wsRef.current.close();
+
+        // BUG-3 FIX: close the live EventSource via sseRef
+        if (sseRef.current) {
+          // BUG-6 FIX: strip listeners before close to prevent handler leak
+          sseRef.current.onopen    = null;
+          sseRef.current.onmessage = null;
+          sseRef.current.onerror   = null;
+          sseRef.current.close();
+          sseRef.current = null;
         }
+
         // Clear cached tickers so table shows "awaiting snapshot" cleanly
         setTickers(new Map());
-        // wsRef.current being closed triggers the normal reconnect path
-        // (setTimeout(connectWS, 3000) inside the ws.onclose handler in the WS effect)
-        // but we nulled onclose above — manually re-connect after 3s
-        setTimeout(() => {
-          if (wsRef.current && wsRef.current.readyState !== WebSocket.OPEN) {
-            wsRef.current = null; // let WS effect reconnect on next render
-          }
-        }, 3000);
+
         // Re-schedule for next trading day
         scheduleMarketOpenReset();
       }, msUntil);
@@ -3813,6 +3976,49 @@ function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp =
   // The WS handler is created once on mount; without a ref it would capture a
   // stale setWatchlistFromWS that does nothing.
   const wsWatchlistRef = useRef(null);
+
+  // ── Global watchlist state — shared by PageLiveTable + PagePortfolio ─────
+  // Lifted from PageLiveTable so Portfolio tab can read/toggle the same Set
+  // without a separate fetch. WS sync writes here via wsWatchlistRef.
+  const [watchlist, setWatchlist] = useState(new Set());
+  useEffect(() => {
+    fetch(`${API_BASE}/api/watchlist`)
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(data => setWatchlist(new Set(data.watchlist ?? [])))
+      .catch(err => console.warn('[NexRadar] Failed to load watchlist:', err));
+  }, []);
+  // Register root setter into ref so WS watchlist_update events keep all tabs in sync
+  useEffect(() => {
+    wsWatchlistRef.current = setWatchlist;
+    return () => { wsWatchlistRef.current = null; };
+  }, []);
+  const toggleWatchlistGlobal = async (symbol) => {
+    const isWatched = watchlist.has(symbol);
+    const endpoint  = isWatched
+      ? `${API_BASE}/api/watchlist/remove`
+      : `${API_BASE}/api/watchlist/add`;
+    // Optimistic update
+    setWatchlist(prev => {
+      const next = new Set(prev);
+      isWatched ? next.delete(symbol) : next.add(symbol);
+      return next;
+    });
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticker: symbol }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      console.error('[NexRadar] Watchlist toggle failed, rolling back:', err);
+      setWatchlist(prev => {
+        const next = new Set(prev);
+        isWatched ? next.add(symbol) : next.delete(symbol);
+        return next;
+      });
+    }
+  };
 
   // Market session — rechecked every 30s; drives auto-subMode + sidebar chip
   const [marketSession, setMarketSession] = useState(getMarketSession);
@@ -3887,68 +4093,128 @@ function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp =
   // FIX #4: 'cancelled' flag prevents onclose from spawning new sockets
   // after the effect cleanup runs (React strict-mode double-mount / hot reload).
   //
-  // KEEPALIVE FIX:
-  //   Render (and most proxies) drop idle TCP connections after ~55 s.
-  //   The server sends {"type":"ping"} every 30 s.  We reply with
-  //   {"type":"pong"} so the server's receive loop knows we're alive.
-  //   We also send our own heartbeat every 30 s in case the server ping
-  //   is buffered or swallowed by an intermediate proxy.
+  // KEEPALIVE + STALE-CONNECTION FIX:
+  //   Cloud proxies (Render, Railway, Fly.io) silently drop idle TCP connections
+  //   after ~55 s without sending a proper TCP close frame.  The browser's
+  //   readyState stays OPEN indefinitely — the UI shows "LIVE" while prices
+  //   are permanently frozen (the "half-open socket" problem).
+  //
+  //   Fix: every 30 s we send {"type":"ping"}.  The backend now replies with
+  //   {"type":"pong"} within the same event loop turn.  We set an 8-second
+  //   kill timer when we send the ping.  If pong arrives in time, we clear it.
+  //   If the 8 s window expires with no pong, the socket is dead — we force-
+  //   close it and trigger the normal reconnect path.  This guarantees the UI
+  // SSE (Server-Sent Events) replaces WebSocket.
+  //
+  // WHY SSE:
+  //   Market data is one-way (server → client).  SSE is a plain HTTP response
+  //   so cloud load balancers (Render, Nginx) treat it identically to a normal
+  //   GET — no silent drops, no proxy upgrades, no ping/pong needed.
+  //   EventSource auto-reconnects natively: no heartbeat timers, no pong
+  //   watchdogs, no reconnect logic in this file at all.
+  //
+  // PROTOCOL:
+  //   On open  → GET /api/snapshot to seed tickerCacheRef (replaces WS snapshot)
+  //   Streaming → GET /api/stream  (EventSource)
+  //   Messages  → same JSON shapes: { type: "tick"|"snapshot"|"watchlist_update", ... }
+  //
+  // REMOVED (no longer needed):
+  //   wsRef, heartbeatTimer, pongTimeoutTimer, onclose reconnect, ws.send(ping)
   useEffect(() => {
-    const WS_URL = import.meta.env.VITE_WS_URL ||
-      (import.meta.env.PROD
-        ? `wss://${window.location.host}/ws/live`
-        : 'ws://localhost:8000/ws/live');
+    //const SSE_URL      = (import.meta.env.VITE_API_BASE || '') + '/api/stream';
+    ///const SNAPSHOT_URL = (import.meta.env.VITE_API_BASE || '') + '/api/snapshot';
+    // AFTER (consistent with all other API calls)
+    const SSE_URL      = API_BASE + '/api/stream';
+    const SNAPSHOT_URL = API_BASE + '/api/snapshot';
 
-    let cancelled = false;   // FIX #4: guards the reconnect timer
-    let heartbeatTimer = null;
+    let cancelled        = false;
+    let source           = null;
+    let flushIntervalId  = null;
+    let watchdogTimer    = null;  // detects half-open SSE connections
+    const WATCHDOG_MS    = 20_000; // force-reconnect if silent for 20s
 
-    const connectWS = () => {
-      if (cancelled) return;   // don't open a new socket after cleanup
-      const ws = new WebSocket(WS_URL);
-      wsRef.current = ws;
+    const resetWatchdog = () => {
+      if (watchdogTimer) clearTimeout(watchdogTimer);
+      watchdogTimer = setTimeout(() => {
+        if (cancelled) return;
+        console.warn('[NexRadar] SSE silent for 20s — reconnecting (half-open socket)');
+        if (source) {
+          source.onopen    = null;
+          source.onmessage = null;
+          source.onerror   = null;
+          source.close();
+        }
+        connectSSE();
+      }, WATCHDOG_MS);
+    };
 
-      ws.onopen = () => {
-        console.log('[NexRadar] WebSocket connected');
+    // ── Flush interval: propagate ref mutations to React state at 1000ms ─────
+    // Backend now sends tick_batch every 250ms, so data is always fresh in the ref.
+    // Flushing to React state once/sec cuts Map clone + reconcile work by 75%.
+    // Humans can't read price numbers changing 4x/sec anyway.
+    flushIntervalId = setInterval(() => {
+      if (cancelled) return;
+      if (tickerCacheDirtyRef.current) {
+        tickerCacheDirtyRef.current = false;
+        setTickers(new Map(tickerCacheRef.current));
+      }
+    }, 1000);
+
+    // ── Fetch initial snapshot ────────────────────────────────────────────────
+    const fetchSnapshot = async () => {
+      try {
+        const res  = await fetch(SNAPSHOT_URL);
+        if (!res.ok) throw new Error(`snapshot HTTP ${res.status}`);
+        const body = await res.json();
+        const rows = body.data ?? body ?? [];
+        if (Array.isArray(rows) && rows.length > 0) {
+          const m = new Map();
+          for (const row of rows) m.set(row.ticker, row);
+          tickerCacheRef.current      = m;
+          tickerCacheDirtyRef.current = false;
+          setTickers(new Map(m));
+          console.log(`[NexRadar] Snapshot loaded: ${m.size} tickers`);
+        }
+      } catch (err) {
+        console.warn('[NexRadar] Snapshot fetch failed:', err);
+      }
+    };
+
+    // ── Connect SSE ───────────────────────────────────────────────────────────
+    const connectSSE = () => {
+      if (cancelled) return;
+
+      // Fetch snapshot first so the table populates immediately on (re)connect
+      fetchSnapshot();
+
+      source = new EventSource(SSE_URL);
+      // BUG-3 FIX: store the live EventSource in sseRef so the market-open
+      // timer (separate useEffect) can close it at 9:30 AM ET
+      sseRef.current = source;
+      setWsStatus('connecting');
+
+      source.onopen = () => {
+        console.log('[NexRadar] SSE connected');
         setWsStatus('connected');
-        // Bug 3 Fix — STALE-ON-RECONNECT: Clear tickerCacheRef on every (re)connect.
-        // This covers: backend restart (manual deploy), session switch, tab wake.
-        // The table shows a loading state while waiting for the fresh snapshot
-        // instead of silently displaying last session's frozen data.
-        tickerCacheRef.current = new Map();
-        tickerCacheDirtyRef.current = true;
-        // Client-side heartbeat: send a ping every 30 s so the proxy sees
-        // traffic in the client→server direction even between market ticks.
-        heartbeatTimer = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'ping' }));
-          }
-        }, 30000);
+        resetWatchdog(); // start watchdog on connect
+        fetchSnapshot();
       };
 
-      ws.onmessage = async (event) => {
+      let lastWatchdogReset = 0; // throttle watchdog resets — clearTimeout/setTimeout on every tick thrashes main thread
+      source.onmessage = (event) => {
+        if (cancelled) return;
+        // Throttle watchdog resets: max once/sec instead of on every message.
+        // At 1000 ticks/sec, clearTimeout+setTimeout was consuming significant main-thread CPU.
+        const _now = Date.now();
+        if (_now - lastWatchdogReset > 1000) { resetWatchdog(); lastWatchdogReset = _now; }
         try {
-          let data = event.data;
-          if (data instanceof Blob) {
-            data = await data.text();
-          }
-          const msg = JSON.parse(data);
+          const msg = JSON.parse(event.data);
 
-          // Server keepalive ping — reply with pong immediately
-          if (msg.type === 'ping') {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'pong' }));
-            }
-            return;
-          }
+          // ── Keepalive ping from backend — just resets the watchdog, nothing else
+          if (msg.type === 'keepalive') return;
 
-          // Ignore our own pong echo if server reflects it back
-          if (msg.type === 'pong') return;
-
-          // ── Watchlist sync across tabs ─────────────────────────────────
-          // Backend broadcasts this when any tab adds/removes a ★ ticker.
-          // All open tabs update their star state without a page reload.
+          // ── Watchlist sync ────────────────────────────────────────────────
           if (msg.type === 'watchlist_update') {
-            // msg.watchlist is the full sorted list from the backend
             if (wsWatchlistRef.current) {
               wsWatchlistRef.current(new Set(msg.watchlist ?? []));
             }
@@ -3956,122 +4222,97 @@ function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp =
             return;
           }
 
-          if (msg.type === "snapshot") {
-            // Snapshot: replace entire cache and push straight to state.
-            // Always the authoritative data reset — trust it fully.
+          // ── Full snapshot ─────────────────────────────────────────────────
+          if (msg.type === 'snapshot') {
             const m = new Map();
-            for (const row of msg.data ?? []) {
-              m.set(row.ticker, row);
-            }
-            tickerCacheRef.current = m;
-            tickerCacheDirtyRef.current = false; // setTickers called directly below
-            setTickers(new Map(m));   // one full copy for snapshot is fine
-
-          } else if (msg.type === "tick") {
-            // FIX #6: mutate the ref in-place; NO Map copy here.
-            // The flush interval below will propagate it to React state.
-            const cache = tickerCacheRef.current;
-            const prev  = cache.get(msg.ticker) ?? {};
-            const next  = { ...prev, ...msg.data };
-            cache.set(msg.ticker, next);
-            tickerCacheDirtyRef.current = true; // Bug 2 fix: mark dirty so flush fires
-
-            // ── Live alert detection ──────────────────────────────────────
-            const d      = msg.data;
-            const ticker = msg.ticker;
-            const pct    = (d.percent_change ?? 0).toFixed(2);
-            const price  = d.live_price ? `$${(+d.live_price).toFixed(2)}` : "";
-
-            if (d.volume_spike && d.volume_spike_level === "high" && !prev.volume_spike) {
-              _pushNotif({ type:"vol", icon:"📡", color:"#00d4ff",
-                title:`${ticker} Volume Spike`,
-                sub:`${d.volume_ratio?.toFixed(1) ?? "?"}× avg vol · ${pct}% · ${price}`,
-                ticker });
-            }
-            if (d.is_gap_play && !prev.is_gap_play) {
-              const dir = d.gap_direction === "up" ? "↑" : "↓";
-              _pushNotif({ type:"gap", icon:"📊", color:"#f5a623",
-                title:`${ticker} Gap Play ${dir}`,
-                sub:`Gap ${d.gap_percent > 0 ? "+" : ""}${(d.gap_percent ?? 0).toFixed(2)}% · ${price}`,
-                ticker });
-            }
-            if (d.ah_momentum && !prev.ah_momentum) {
-              _pushNotif({ type:"ah", icon:"🌙", color:"#a78bfa",
-                title:`${ticker} AH Momentum`,
-                sub:`AH move exceeds regular session · ${price}`,
-                ticker });
-            }
-            if (d.went_positive === 1 && (prev.went_positive ?? 0) !== 1) {
-              _pushNotif({ type:"turn", icon:"🔄", color:"#22c55e",
-                title:`${ticker} Turned Positive`,
-                sub:`+${pct}% · ${price}`,
-                ticker });
-            }
-            if (d.is_earnings_gap_play && !prev.is_earnings_gap_play) {
-              _pushNotif({ type:"earn", icon:"📋", color:"#f97316",
-                title:`${ticker} Earnings Gap`,
-                sub:`Gap ${d.gap_percent > 0 ? "+" : ""}${(d.gap_percent ?? 0).toFixed(2)}% post-earnings · ${price}`,
-                ticker });
-            }
-            if (Math.abs(d.percent_change ?? 0) >= 5 && Math.abs(prev.percent_change ?? 0) < 5) {
-              _pushNotif({ type:"diamond", icon:"💎", color:"#00d4ff",
-                title:`${ticker} Diamond +5%`,
-                sub:`${pct}% · ${price}`,
-                ticker });
-            }
+            for (const row of msg.data ?? []) m.set(row.ticker, row);
+            tickerCacheRef.current      = m;
+            tickerCacheDirtyRef.current = false;
+            setTickers(new Map(m));
+            return;
           }
+
+          // ── Single tick (legacy — kept for backwards compat) ──────────────
+          if (msg.type === 'tick') {
+            tickerCacheRef.current.set(msg.ticker, msg.data);
+            tickerCacheDirtyRef.current = true;
+            return;
+          }
+
+          // ── Batched ticks (primary path — backend sends every 250ms) ──────
+          if (msg.type === 'tick_batch') {
+            const cache = tickerCacheRef.current;
+            const rows  = msg.data;
+            for (let i = 0; i < rows.length; i++) {
+              cache.set(rows[i].ticker, rows[i]);
+            }
+            tickerCacheDirtyRef.current = true;
+            return;
+          }
+
+          // ── Control messages (vwap_reset etc.) — ignore on frontend ───────
+          if (msg.type === 'control') return;
+
         } catch (err) {
-          console.error('[NexRadar] WebSocket parse error:', err);
+          console.debug('[NexRadar] SSE parse error:', err);
         }
       };
 
-      ws.onerror = () => {
-        console.error('[NexRadar] WebSocket error');
-        setWsStatus('disconnected');
-      };
-
-      ws.onclose = () => {
-        clearInterval(heartbeatTimer);
-        heartbeatTimer = null;
+      source.onerror = () => {
         setWsStatus('connecting');
-        if (cancelled) return;   // FIX #4: don't reconnect after unmount
-        console.log('[NexRadar] WebSocket closed, reconnecting...');
-        setTimeout(connectWS, 3000);
+        // BUG-3 FIX: if the market-open timer deliberately closed this source
+        // (readyState CLOSED), reconnect after 1.5s so the fresh snapshot is
+        // fetched.  EventSource auto-reconnects for transient network errors
+        // but NOT when closed programmatically via .close().
+        if (source.readyState === EventSource.CLOSED && !cancelled) {
+          console.log('[NexRadar] SSE deliberately closed — reconnecting …');
+          setTimeout(() => { if (!cancelled) connectSSE(); }, 1500);
+        } else {
+          console.warn('[NexRadar] SSE error — browser will auto-reconnect');
+        }
       };
     };
 
-    connectWS();
+    connectSSE();
 
-    // Tick-to-Render Safety Valve (RAF-based flush):
-    // Uses requestAnimationFrame instead of setInterval(250ms) to batch tick
-    // updates. If the backend sends ticks faster than the browser paints
-    // (e.g. market open burst), the Map in state can become a bottleneck.
-    // RAF ensures we call setTickers at most once per browser paint frame (~16ms),
-    // keeping the UI responsive during high-volume tick storms.
-    // isRenderingRef prevents re-entrant RAF callbacks from stacking.
-    let rafId = null;
-    const scheduleFlush = () => {
-      if (cancelled) return;
-      if (tickerCacheDirtyRef.current && !isRenderingRef.current) {
-        isRenderingRef.current = true;
-        tickerCacheDirtyRef.current = false;
-        setTickers(new Map(tickerCacheRef.current));
-        isRenderingRef.current = false;
-      }
-      rafId = requestAnimationFrame(scheduleFlush);
+    // ── Midnight market-open reset (unchanged logic) ──────────────────────────
+    const scheduleMarketOpenReset = () => {
+      const now  = new Date();
+      const next = new Date(now);
+      next.setHours(9, 30, 0, 0);
+      if (next <= now) next.setDate(next.getDate() + 1);
+      const msUntil = next - now;
+      midnightTimerRef.current = setTimeout(() => {
+        if (cancelled) return;
+        // Force a fresh snapshot at market open
+        tickerCacheRef.current      = new Map();
+        tickerCacheDirtyRef.current = true;
+        setTickers(new Map());
+        fetchSnapshot();
+        scheduleMarketOpenReset();
+      }, msUntil);
     };
-    rafId = requestAnimationFrame(scheduleFlush);
+    scheduleMarketOpenReset();
 
+    // ── Cleanup ───────────────────────────────────────────────────────────────
     return () => {
-      cancelled = true;   // FIX #4: block any pending reconnect timers
-      if (rafId) cancelAnimationFrame(rafId);
-      clearInterval(heartbeatTimer);
-      if (wsRef.current) {
-        wsRef.current.onclose = null;   // prevent the handler from firing during intentional close
-        wsRef.current.close();
+      cancelled = true;
+      if (flushIntervalId) clearInterval(flushIntervalId);
+      if (watchdogTimer)   clearTimeout(watchdogTimer);
+      if (midnightTimerRef.current) clearTimeout(midnightTimerRef.current);
+      if (source) {
+        // BUG-6 FIX: strip all listeners before closing to prevent duplicate
+        // handler accumulation when the component remounts across reconnects
+        source.onopen    = null;
+        source.onmessage = null;
+        source.onerror   = null;
+        source.close();
       }
+      // BUG-3 FIX: clear sseRef so the market-open timer doesn't hold a
+      // stale reference to a closed EventSource across remounts
+      sseRef.current = null;
     };
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Calculate sector performance from live ticker data
   const sectorPerformance = useMemo(() => {
@@ -4129,11 +4370,11 @@ function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp =
   const renderPage = () => {
     switch (page) {
       case "dashboard": return <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange} onNavigate={setPage} sectorPerformance={sectorPerformance} tickers={tickers} techData={techData} techLoading={techLoading} T={T} />;
-      case "live":      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={() => setQuickFilter(null)} wsStatus={wsStatus} onLiveCount={handleLiveCount} T={T} />;
+      case "live":      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={() => setQuickFilter(null)} wsStatus={wsStatus} onLiveCount={handleLiveCount} watchlistProp={watchlist} toggleWatchlistProp={toggleWatchlistGlobal} T={T} />;
       case "chart":     return <PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />;
       case "signals":   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} T={T} />;
       case "earnings":  return <PageEarnings T={T} />;
-      case "portfolio": return <PagePortfolio tickers={tickers} marketSession={marketSession} T={T} />;
+      case "portfolio": return <PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlistGlobal} T={T} />;
       default:          return null;
     }
   };
@@ -4237,15 +4478,16 @@ function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp =
           
           {/* Search Input — navigates to Chart tab with symbol pre-loaded */}
           <input placeholder="Search symbol…"
-            value={searchVal}
-            onChange={e => setSearchVal(e.target.value.toUpperCase())}
+            defaultValue=""
+            onChange={e => { searchInputRef.current = e.target.value.toUpperCase(); }}
             onKeyDown={e => {
               if (e.key === "Enter") {
-                const s = searchVal.trim().toUpperCase();
+                const s = (searchInputRef.current || "").trim().toUpperCase();
                 if (s) {
                   setChartInitSymbol(s);
                   setPage("chart");
-                  setSearchVal("");
+                  searchInputRef.current = "";
+                  e.target.value = "";
                 }
               }
             }}
@@ -4518,12 +4760,31 @@ function NexRadarDashboard({ darkMode: darkModeProp = true, source: sourceProp =
           <div style={{ background:T.bg1, borderBottom:`1px solid #080f1a`, padding:"7px 20px", display:"flex", gap:9, flexShrink:0, overflowX:"auto" }}>
             {(() => {
               const all = Array.from(tickers.values());
+              const isMH = marketSession === "market";
+
+              // FIX: filter by selectedSectors so tile counts match what the
+              // Live Table will show after the user clicks the tile.
+              // Without this, clicking "GAP PLAYS: 45" on Technology sector
+              // shows 45 but only 3 are tech stocks — confusing mismatch.
+              const sectorFiltered = selectedSectors.includes("ALL")
+                ? all
+                : all.filter(t => {
+                    const ns = normalizeSector(t.sector);
+                    return ns && selectedSectors.includes(ns);
+                  });
+
+              // VOL SPIKES: count tickers where rvol >= 1.5 (includes both live ticks and stable spikes)
+              // In AH show ah_momentum count alongside; in MH show gap plays (day-open gaps)
               const counts = [
-                ["📡","VOL SPIKES", T.cyan,   all.filter(t => t.volume_spike).length],
-                ["📊","GAP PLAYS",  T.gold,   all.filter(t => t.is_gap_play).length],
-                ["🌙","AH MOMT.",   T.purple, all.filter(t => t.ah_momentum).length],
-                ["📋","EARN. GAPS", T.orange, all.filter(t => t.is_earnings_gap_play).length],
-                ["💎","DIAMOND",    T.cyan,   all.filter(t => Math.abs(t.percent_change || 0) >= 5).length],
+                ["📡","VOL SPIKES", T.cyan,   sectorFiltered.filter(t => (t.rvol||1) >= 1.5).length],
+                isMH
+                  ? ["📊","GAP PLAYS",  T.gold,   sectorFiltered.filter(t => t.is_gap_play).length]
+                  : ["🌙","AH MOMT.",   T.purple, sectorFiltered.filter(t => t.ah_momentum).length],
+                isMH
+                  ? ["🌙","AH MOMT.",   T.purple, sectorFiltered.filter(t => t.ah_momentum).length]
+                  : ["📊","GAP PLAYS",  T.gold,   sectorFiltered.filter(t => t.is_gap_play).length],
+                ["📋","EARN. GAPS", T.orange, sectorFiltered.filter(t => t.is_earnings_gap_play).length],
+                ["💎","DIAMOND",    T.cyan,   sectorFiltered.filter(t => Math.abs(t.percent_change || 0) >= 5).length],
               ];
               return counts.map(([icon,label,color,count]) => (
                 <div key={label}
