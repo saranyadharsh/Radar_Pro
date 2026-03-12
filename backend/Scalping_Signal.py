@@ -17,8 +17,18 @@
     Momentum ~35%  — MACD (0.12) + RSI (0.12) + Stochastic (0.11)
     Volume   ~20%  — Vol spike (0.15) + OBV (0.05)
     Extras   ~10%  — BB extremes (0.05), ADX multiplier (0.85-1.30x)
+    Phase 3  ~25%  — Supertrend (0.10) + Order Block (0.15) — additive
     Note: ADX is applied as a multiplier, not an additive weight.
           Session multiplier applied last (0.60-1.00x).
+
+  PINE SCRIPT ALIGNMENT (v3):
+    ALIGN-1  EMA 9→8 to match Pine's EMA(8)
+    ALIGN-2  Stochastic K period 5→14 to match Pine's ta.stoch(close,high,low,14)
+    ALIGN-3  Bollinger Bands std: population→sample (ddof=1) to match Pine ta.stdev
+    ALIGN-4  Supertrend: simplified→stateful band tracking (matches Pine logic)
+    ALIGN-5  TP/SL: 5-min aggregated ATR with Pine-matching multipliers (1.5 SL, 3.0 TP)
+    ALIGN-6  Volume delta: added buy/sell split by wick ratio (matches Pine)
+    ALIGN-7  get_scalp_snapshot TP/SL now uses class constants + atr_5m (was hardcoded)
 
   SESSION FILTER (ET):
     ✅ 09:30-10:00  Open (80% weight)
@@ -151,6 +161,8 @@ class IndicatorCalculator:
         self._vwap_cum_vol = 0.0
         # FIX-4: store true streaming MACD line values for accurate signal EMA
         self._macd_history: deque = deque(maxlen=50)
+        # ALIGN-6: store volume delta values for EMA(10) momentum detection
+        self._delta_history: deque = deque(maxlen=50)
         # Cache most-recent computed indicators for live snapshot API
         self._latest_ind: Optional[dict] = None
 
@@ -163,6 +175,7 @@ class IndicatorCalculator:
         self._vwap_cum_vol = 0.0
         self._obv          = 0.0          # FIX-1
         self._macd_history.clear()        # fresh MACD signal baseline each day
+        self._delta_history.clear()       # ALIGN-6: fresh delta baseline each day
 
     def add_bar(self, bar: OHLCVBar) -> Optional[dict]:
         """Add bar -> return indicator dict or None if warming up."""
@@ -208,7 +221,8 @@ class IndicatorCalculator:
         rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
 
-    def _stoch(self, highs, lows, closes, kp=5, dp=3):
+    def _stoch(self, highs, lows, closes, kp=14, dp=3):
+        # ALIGN-2: K period 5→14 to match Pine's ta.stoch(close,high,low,14)
         # K line (Fast Stochastic)
         h  = np.max(highs[-kp:])
         lo = np.min(lows[-kp:])
@@ -279,8 +293,147 @@ class IndicatorCalculator:
 
         return float(adx_final)
 
+    def _supertrend(self, highs: np.ndarray, lows: np.ndarray,
+                    closes: np.ndarray, period: int = 10,
+                    multiplier: float = 3.0) -> tuple:
+        """
+        ALIGN-4: Stateful Supertrend matching Pine Script logic.
+        Returns (st_value: float, st_dir: str) where st_dir is 'UP', 'DOWN', or 'NEUTRAL'.
+
+        Pine logic:
+          lowerBand := close[1] > prevLowerBand ? max(lowerBandRaw, prevLowerBand) : lowerBandRaw
+          upperBand := close[1] < prevUpperBand ? min(upperBandRaw, prevUpperBand) : upperBandRaw
+          Direction flips only when close crosses the active band.
+        """
+        if len(closes) <= period + 1:
+            return 0.0, "NEUTRAL"
+
+        # Compute ATR for each bar using a simple rolling window
+        n = len(closes)
+        tr = np.empty(n - 1)
+        for i in range(1, n):
+            tr[i - 1] = max(highs[i] - lows[i],
+                            abs(highs[i] - closes[i - 1]),
+                            abs(lows[i] - closes[i - 1]))
+
+        # Walk forward with stateful band logic (matches Pine bar-by-bar)
+        direction = 1  # 1 = downtrend (price below upper), -1 = uptrend (price above lower)
+        upper_band = 0.0
+        lower_band = 0.0
+
+        for i in range(period, n):
+            # Rolling ATR for this bar
+            atr_val = float(np.mean(tr[max(0, i - period):i]))
+            if atr_val == 0:
+                continue
+
+            hl2 = (highs[i] + lows[i]) / 2.0
+            raw_upper = hl2 + multiplier * atr_val
+            raw_lower = hl2 - multiplier * atr_val
+
+            if i == period:
+                upper_band = raw_upper
+                lower_band = raw_lower
+            else:
+                # Pine: lowerBand := close[1] > prevLowerBand ? max(raw, prev) : raw
+                lower_band = max(raw_lower, lower_band) if closes[i - 1] > lower_band else raw_lower
+                # Pine: upperBand := close[1] < prevUpperBand ? min(raw, prev) : raw
+                upper_band = min(raw_upper, upper_band) if closes[i - 1] < upper_band else raw_upper
+
+            prev_dir = direction
+            if prev_dir == -1:
+                direction = 1 if closes[i] < lower_band else -1
+            else:
+                direction = -1 if closes[i] > upper_band else 1
+
+        # Pine convention: direction == -1 means uptrend (isUptrend)
+        if direction == -1:
+            return float(lower_band), "UP"
+        else:
+            return float(upper_band), "DOWN"
+
+    def _detect_order_block(self, opens: np.ndarray, highs: np.ndarray,
+                             lows: np.ndarray, closes: np.ndarray,
+                             volumes: np.ndarray, lookback: int = 5) -> tuple:
+        """
+        Detects high-volume impulsive engulfing moves that signal institutional
+        order-block activity. Returns (ob_active: bool, ob_dir: str).
+
+        Criteria (all three must be met):
+          1. Body size >= 1.5× ATR(14) — confirms an impulsive move
+          2. Candle volume >= 1.5× rolling-average volume (lookback) — confirms
+             institutional participation
+          3. Direction determined by close vs open of the triggering candle
+
+        Returns ('BULLISH_OB' | 'BEARISH_OB' | 'NONE')
+        """
+        if len(closes) < lookback + 2:
+            return False, "NONE"
+
+        atr = self._atr(highs, lows, closes, p=14)
+        if atr == 0:
+            return False, "NONE"
+
+        body_size = abs(closes[-1] - opens[-1])
+        if body_size < atr * 1.5:
+            return False, "NONE"
+
+        # Safe slice: ensure we don't underflow on short deque
+        vol_window = volumes[-(lookback + 1):-1] if len(volumes) > lookback else volumes[:-1]
+        if len(vol_window) == 0:
+            return False, "NONE"
+
+        avg_vol = float(np.mean(vol_window))
+        if avg_vol == 0 or volumes[-1] < avg_vol * 1.5:
+            return False, "NONE"
+
+        if closes[-1] > opens[-1]:
+            return True, "BULLISH_OB"
+        else:
+            return True, "BEARISH_OB"
+
+    @staticmethod
+    def _atr_5m(highs, lows, closes, n_agg=5, p=14) -> float:
+        """
+        ALIGN-5: Aggregate 1-min bars into 5-min, then compute ATR.
+        This produces ATR values comparable to Pine's ta.atr(14) on a 5-min chart.
+        Used exclusively for TP/SL calculation so dollar distances are meaningful.
+        """
+        n = len(highs)
+        if n < n_agg * (p + 1):
+            # Not enough bars — fall back to raw ATR scaled up
+            tr = [max(highs[i] - lows[i],
+                      abs(highs[i] - closes[i - 1]),
+                      abs(lows[i] - closes[i - 1]))
+                  for i in range(1, n)]
+            return float(np.mean(tr[-p:])) * 1.8 if tr else 0.0
+
+        agg_h, agg_l, agg_c = [], [], []
+        for i in range(0, n - n_agg + 1, n_agg):
+            agg_h.append(np.max(highs[i:i + n_agg]))
+            agg_l.append(np.min(lows[i:i + n_agg]))
+            agg_c.append(closes[i + n_agg - 1])
+
+        if len(agg_h) < p + 1:
+            tr = [max(highs[i] - lows[i],
+                      abs(highs[i] - closes[i - 1]),
+                      abs(lows[i] - closes[i - 1]))
+                  for i in range(1, n)]
+            return float(np.mean(tr[-p:])) * 1.8 if tr else 0.0
+
+        agg_h = np.array(agg_h)
+        agg_l = np.array(agg_l)
+        agg_c = np.array(agg_c)
+
+        tr = [max(agg_h[i] - agg_l[i],
+                  abs(agg_h[i] - agg_c[i - 1]),
+                  abs(agg_l[i] - agg_c[i - 1]))
+              for i in range(1, len(agg_h))]
+        return float(np.mean(tr[-p:])) if tr else 0.0
+
     def _compute(self, bar: OHLCVBar) -> dict:
         closes  = self._arr('close')
+        opens   = self._arr('open')          # needed for order block + volume delta
         highs   = self._arr('high')
         lows    = self._arr('low')
         volumes = self._arr('volume')
@@ -291,37 +444,37 @@ class IndicatorCalculator:
         self._vwap_cum_vol += bar.volume
         vwap = self._vwap_cum_pv / (self._vwap_cum_vol + 1e-10)
 
-        # EMAs
-        ema9  = self._ema(closes, 9)
+        # ALIGN-1: EMAs — EMA(8) to match Pine's ema8, keep ema21
+        ema8  = self._ema(closes, 8)
         ema21 = self._ema(closes, 21)
 
         # FIX-4: True streaming MACD signal line
-        # Original approximated by re-computing from truncated history slices.
-        # Now we store each bar's MACD line value and apply proper EMA(9) to it.
         macd_line = self._ema(closes, 12) - self._ema(closes, 26)
         self._macd_history.append(macd_line)
         if len(self._macd_history) >= 9:
             macd_signal = self._ema(np.array(self._macd_history), 9)
         else:
-            # Bootstrap period: simple mean until 9 values accumulated
             macd_signal = float(np.mean(self._macd_history))
         macd_hist = macd_line - macd_signal
 
-        # RSI (Wilder)
+        # RSI (Wilder) — matches Pine ta.rsi(close, 14)
         rsi = self._rsi(closes)
 
-        # Stochastic
+        # ALIGN-2: Stochastic — kp=14 to match Pine ta.stoch(close,high,low,14)
         stoch_k, stoch_d = self._stoch(highs, lows, closes)
 
-        # Bollinger Bands (20-period)
+        # ALIGN-3: Bollinger Bands (20-period) — ddof=1 to match Pine ta.stdev
         bb_mid   = float(np.mean(closes[-20:]))
-        bb_std   = float(np.std(closes[-20:]))
+        bb_std   = float(np.std(closes[-20:], ddof=1))
         bb_upper = bb_mid + 2 * bb_std
         bb_lower = bb_mid - 2 * bb_std
 
-        # ATR / ADX
+        # ATR (1-min) / ADX — used for indicators, NOT for TP/SL
         atr = self._atr(highs, lows, closes)
         adx = self._adx(highs, lows, closes)
+
+        # ALIGN-5: 5-min aggregated ATR for TP/SL calculation
+        atr_5m = self._atr_5m(highs, lows, closes)
 
         # OBV (FIX-1: _obv reset daily alongside VWAP in reset_vwap)
         if len(self.bars) >= 2:
@@ -336,15 +489,50 @@ class IndicatorCalculator:
         safe_avg_vol = max(raw_avg_vol, 500.0)
         vol_ratio    = bar.volume / safe_avg_vol
 
+        # ALIGN-6: Volume Delta — buy/sell split by wick ratio (matches Pine logic)
+        #   Pine: buyVolume  = candleRange > 0 ? volume * (close - low) / candleRange : volume * 0.5
+        #         sellVolume = candleRange > 0 ? volume * (high - close) / candleRange : volume * 0.5
+        candle_range = bar.high - bar.low
+        if candle_range > 0 and bar.volume > 0:
+            buy_vol  = bar.volume * (bar.close - bar.low) / candle_range
+            sell_vol = bar.volume * (bar.high - bar.close) / candle_range
+        else:
+            buy_vol  = bar.volume * 0.5
+            sell_vol = bar.volume * 0.5
+        vol_delta = buy_vol - sell_vol
+
+        # Volume Delta EMA(10) for momentum detection
+        self._delta_history.append(vol_delta)
+        if len(self._delta_history) >= 10:
+            delta_ema = self._ema(np.array(self._delta_history), 10)
+        else:
+            delta_ema = float(np.mean(self._delta_history)) if self._delta_history else 0.0
+        delta_momentum = vol_delta > delta_ema
+        delta_bullish  = vol_delta > 0
+        delta_bearish  = vol_delta < 0
+
+        # ALIGN-4: Supertrend — stateful band tracking (matches Pine)
+        st_val, st_dir = self._supertrend(highs, lows, closes)
+
+        # Order Block detection — GIL-safe
+        ob_active, ob_dir = self._detect_order_block(opens, highs, lows, closes, volumes)
+
         return dict(
-            ema9=ema9, ema21=ema21, vwap=vwap,
+            ema8=ema8, ema21=ema21, vwap=vwap,
             macd_line=macd_line, macd_signal=macd_signal, macd_hist=macd_hist,
             rsi=rsi, stoch_k=stoch_k, stoch_d=stoch_d,
             bb_upper=bb_upper, bb_mid=bb_mid, bb_lower=bb_lower,
-            atr=atr, adx=adx, obv=self._obv, vol_ratio=vol_ratio,
+            atr=atr, atr_5m=atr_5m, adx=adx,
+            obv=self._obv, vol_ratio=vol_ratio,
+            vol_delta=vol_delta, delta_ema=delta_ema,
+            delta_momentum=delta_momentum,
+            delta_bullish=delta_bullish, delta_bearish=delta_bearish,
             close=bar.close,
+            supertrend_val=st_val, supertrend_dir=st_dir,
+            ob_active=ob_active, ob_dir=ob_dir,
+            day_high=float(np.max(highs)),   # session high across rolling window
+            day_low=float(np.min(lows)),     # session low  across rolling window
         )
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIGNAL ENGINE
@@ -362,8 +550,8 @@ class ScalpingSignalEngine:
     STOCH_OB, STOCH_OS    = 80, 20
     ADX_TREND, ADX_STRONG = 25, 40
     VOL_SPIKE, VOL_HIGH   = 1.5, 2.0
-    ATR_SL_MULT           = 1.5
-    ATR_TP_MULT           = 2.5
+    ATR_SL_MULT           = 1.5       # ALIGN-5: matches Pine slMultiplier (uses atr_5m)
+    ATR_TP_MULT           = 3.0       # ALIGN-5: SL × R:R(2.0) = 1.5 × 2.0 = 3.0
 
     def __init__(self, db=None, broadcast_cb=None):
         self._db = db
@@ -473,12 +661,20 @@ class ScalpingSignalEngine:
             macd_l  = ind["macd_line"]
             macd_s  = ind["macd_signal"]
             adx     = ind["adx"]
-            ema9    = ind["ema9"]
+            ema8    = ind["ema8"]
             ema21   = ind["ema21"]
             vol     = ind["vol_ratio"]
             atr     = ind["atr"]
+            atr_5m  = ind.get("atr_5m", atr)   # ALIGN-5: prefer 5-min ATR for TP/SL
             bb_u    = ind["bb_upper"]
             bb_l    = ind["bb_lower"]
+            day_high = ind["day_high"]
+            day_low  = ind["day_low"]
+            # ALIGN-6: volume delta fields
+            vol_delta      = ind.get("vol_delta", 0)
+            delta_bullish  = ind.get("delta_bullish", False)
+            delta_bearish  = ind.get("delta_bearish", False)
+            delta_momentum = ind.get("delta_momentum", False)
 
             # ── Derived labels ───────────────────────────────────────────────
             vwap_pct    = (close - vwap) / vwap * 100 if vwap else 0
@@ -497,13 +693,18 @@ class ScalpingSignalEngine:
                          else "Bearish" if stoch_k < stoch_d and stoch_k > 20
                          else "Neutral")
 
-            trend_lbl = ("Bullish" if close > ema9 > ema21
-                         else "Bearish" if close < ema9 < ema21
+            trend_lbl = ("Bullish" if close > ema8 > ema21
+                         else "Bearish" if close < ema8 < ema21
                          else "Sideways")
 
             adx_lbl   = ("Strong"   if adx >= 40
                          else "Trending" if adx >= 25
                          else "Choppy")
+
+            # Phase 3: Supertrend + Order Block
+            st_dir    = ind.get("supertrend_dir", "NEUTRAL")
+            ob_active = ind.get("ob_active",      False)
+            ob_dir    = ind.get("ob_dir",         "NONE")
 
             # Candle (very last 2 bars)
             bars_list = list(calc.bars)
@@ -525,15 +726,12 @@ class ScalpingSignalEngine:
                 candle = "—"
 
             # ── Quick score (mirrors _evaluate logic, WITH session multiplier) ─
-            # FIX: old code was session-neutral — score was always inflated vs
-            # _evaluate which applies a session quality multiplier. Pre-market
-            # and midday tickers were showing STRONG when they should be WEAK/HOLD.
             bull = bear = 0.0
             confluence = 0
             if close > vwap:     bull += 0.15; confluence += 1
             else:                bear += 0.15
-            if close > ema9 > ema21: bull += 0.15; confluence += 1
-            elif close < ema9 < ema21: bear += 0.15
+            if close > ema8 > ema21: bull += 0.15; confluence += 1
+            elif close < ema8 < ema21: bear += 0.15
             if macd_h > 0 and macd_l > macd_s: bull += 0.12; confluence += 1
             elif macd_h < 0 and macd_l < macd_s: bear += 0.12
             if rsi > 55:  bull += 0.12; confluence += 1
@@ -543,6 +741,11 @@ class ScalpingSignalEngine:
             if vol >= 1.5:
                 if bull > bear: bull += 0.12; confluence += 1
                 else:           bear += 0.12
+            # ALIGN-6: Volume delta confluence
+            if delta_bullish and delta_momentum:
+                bull += 0.08; confluence += 1
+            elif delta_bearish and not delta_momentum:
+                bear += 0.08
             adx_mult = 1.3 if adx >= 40 else (1.1 if adx >= 25 else 0.85)
             bull *= adx_mult; bear *= adx_mult
 
@@ -575,16 +778,17 @@ class ScalpingSignalEngine:
 
             conf = min(abs(net) / 0.8, 1.0)
 
-            safe_atr = atr if atr > 0 else close * 0.002
+            # ALIGN-5/7: Use 5-min ATR for TP/SL (matches Pine ATR on 5m chart)
+            safe_atr = atr_5m if atr_5m > 0 else (atr if atr > 0 else close * 0.002)
             if direction == "LONG":
-                sl = round(close - safe_atr * 1.5, 2)
-                tp = round(close + safe_atr * 2.5, 2)
+                sl = round(close - safe_atr * ScalpingSignalEngine.ATR_SL_MULT, 2)
+                tp = round(close + safe_atr * ScalpingSignalEngine.ATR_TP_MULT, 2)
             elif direction == "SHORT":
-                sl = round(close + safe_atr * 1.5, 2)
-                tp = round(close - safe_atr * 2.5, 2)
+                sl = round(close + safe_atr * ScalpingSignalEngine.ATR_SL_MULT, 2)
+                tp = round(close - safe_atr * ScalpingSignalEngine.ATR_TP_MULT, 2)
             else:
-                sl = round(close - safe_atr * 1.5, 2)
-                tp = round(close + safe_atr * 2.5, 2)
+                sl = round(close - safe_atr * ScalpingSignalEngine.ATR_SL_MULT, 2)
+                tp = round(close + safe_atr * ScalpingSignalEngine.ATR_TP_MULT, 2)
             rr = round(abs(tp - close) / (abs(close - sl) + 1e-10), 2)
 
             rows.append({
@@ -601,8 +805,8 @@ class ScalpingSignalEngine:
                 "vwap":         round(vwap, 2),
                 "vwap_status":  vwap_status,
                 "vwap_pct":     round(vwap_pct, 2),
-                "support":      round(min(bb_l, ema21), 2),
-                "resistance":   round(max(bb_u, ema9), 2),
+                "support":      round(min(day_low,  bb_l), 2),
+                "resistance":   round(max(day_high, bb_u), 2),
                 "candle":       candle,
                 "macd_signal":  macd_sig_lbl,
                 "macd_hist":    round(macd_h, 6),
@@ -615,11 +819,15 @@ class ScalpingSignalEngine:
                 "trend":        trend_lbl,
                 "adx":          round(adx, 1),
                 "adx_label":    adx_lbl,
+                "supertrend":   st_dir,
+                "order_block":  ob_dir if ob_active else "NONE",
                 "confluence":   confluence,
                 "tp":           tp,
                 "sl":           sl,
                 "rr":           rr,
                 "atr":          round(atr, 2),
+                "atr_5m":       round(atr_5m, 2),
+                "vol_delta":    round(vol_delta, 2),
             })
 
         # Sort: BUY first, then SELL, then HOLD/warming; within group by confidence desc
@@ -721,7 +929,7 @@ class ScalpingSignalEngine:
         reasons = []
 
         close     = ind['close']
-        ema9      = ind['ema9']
+        ema8      = ind['ema8']
         ema21     = ind['ema21']
         vwap      = ind['vwap']
         macd_hist = ind['macd_hist']
@@ -735,16 +943,18 @@ class ScalpingSignalEngine:
         bb_upper  = ind['bb_upper']
         bb_lower  = ind['bb_lower']
         atr       = ind['atr']
+        atr_5m    = ind.get('atr_5m', atr)  # ALIGN-5: 5-min ATR for TP/SL
 
+        # ALIGN-1: EMA stack uses EMA(8) to match Pine
         # ── TREND (~30%) ─────────────────────────────────────────────────
-        if close > ema9 > ema21:
+        if close > ema8 > ema21:
             bull += 0.15
             reasons.append({"text": "Bullish EMA stack", "type": "bull"})
-        elif close < ema9 < ema21:
+        elif close < ema8 < ema21:
             bear += 0.15
             reasons.append({"text": "Bearish EMA stack", "type": "bear"})
 
-        vwap_pct = (close - vwap) / vwap * 100 if vwap else 0  # BUG-FIX: guard vwap=0
+        vwap_pct = (close - vwap) / vwap * 100 if vwap else 0
         if close > vwap:
             bull += 0.15
             reasons.append({"text": f"Above VWAP +{vwap_pct:.2f}%", "type": "bull"})
@@ -760,26 +970,23 @@ class ScalpingSignalEngine:
             bear += 0.12
             reasons.append({"text": f"MACD bearish hist:{macd_hist:.4f}", "type": "bear"})
 
-        # FIX-2: non-overlapping RSI zones — eliminates original LONG bias
-        # Original: `if 40 < rsi < 70` and `elif 30 < rsi < 60` overlapped at 40-60,
-        # meaning RSI=50 always hit the first branch and added bull += 0.05.
-        if rsi >= self.RSI_OB:                   # >= 70 overbought
+        # FIX-2: non-overlapping RSI zones
+        if rsi >= self.RSI_OB:
             bear += 0.08
             reasons.append({"text": f"RSI overbought {rsi:.0f}", "type": "warn"})
-        elif rsi <= self.RSI_OS:                  # <= 30 oversold
+        elif rsi <= self.RSI_OS:
             bull += 0.08
             reasons.append({"text": f"RSI oversold {rsi:.0f}", "type": "warn"})
-        elif rsi > self.RSI_BULL:                 # 55-70 bullish momentum
+        elif rsi > self.RSI_BULL:
             bull += 0.12
             reasons.append({"text": f"RSI bull zone {rsi:.0f}", "type": "bull"})
-        elif rsi < self.RSI_BEAR:                 # 30-45 bearish momentum
+        elif rsi < self.RSI_BEAR:
             bear += 0.12
             reasons.append({"text": f"RSI bear zone {rsi:.0f}", "type": "bear"})
-        elif rsi >= 50:                           # 50-55 mild bull lean
+        elif rsi >= 50:
             bull += 0.04
-        else:                                     # 45-50 mild bear lean
+        else:
             bear += 0.04
-        # RSI 45-55: only ±0.04 (near-neutral) — no systematic LONG bias
 
         if stk > std and stk < self.STOCH_OB:
             bull += 0.11
@@ -806,11 +1013,29 @@ class ScalpingSignalEngine:
         else:
             reasons.append({"text": f"Low vol {vol_ratio:.1f}x", "type": "warn"})
 
-        obv = ind['obv']   # FIX-1: now resets daily — intraday OBV is meaningful
+        obv = ind['obv']   # FIX-1: resets daily
         if obv > 0:
             bull += 0.05
         elif obv < 0:
             bear += 0.05
+
+        # ALIGN-6: Volume Delta (matches Pine's buy/sell volume split)
+        delta_bullish  = ind.get('delta_bullish', False)
+        delta_bearish  = ind.get('delta_bearish', False)
+        delta_momentum = ind.get('delta_momentum', False)
+        vol_delta      = ind.get('vol_delta', 0)
+        if delta_bullish and delta_momentum:
+            bull += 0.08
+            reasons.append({"text": "Delta Strong Buy ⚡", "type": "bull"})
+        elif delta_bullish:
+            bull += 0.04
+            reasons.append({"text": "Delta Buy ↑", "type": "bull"})
+        elif delta_bearish and not delta_momentum:
+            bear += 0.08
+            reasons.append({"text": "Delta Strong Sell ⚡", "type": "bear"})
+        elif delta_bearish:
+            bear += 0.04
+            reasons.append({"text": "Delta Sell ↓", "type": "bear"})
 
         # ── ADX / TREND STRENGTH (multiplier, not additive weight) ───────
         mult = 1.3 if adx >= self.ADX_STRONG else (1.1 if adx >= self.ADX_TREND else 0.85)
@@ -820,6 +1045,26 @@ class ScalpingSignalEngine:
             reasons.append({"text": f"ADX {adx:.0f} choppy — caution", "type": "warn"})
         bull *= mult
         bear *= mult
+
+        # ── SUPERTREND (~10% additive weight) ────────────────────────────
+        st_dir = ind.get('supertrend_dir', 'NEUTRAL')
+        if st_dir == 'UP':
+            bull += 0.10
+            reasons.append({"text": "Supertrend UP ▲", "type": "bull"})
+        elif st_dir == 'DOWN':
+            bear += 0.10
+            reasons.append({"text": "Supertrend DOWN ▼", "type": "bear"})
+
+        # ── ORDER BLOCK (~15% additive weight) ───────────────────────────
+        ob_active = ind.get('ob_active', False)
+        ob_dir    = ind.get('ob_dir',    'NONE')
+        if ob_active:
+            if ob_dir == 'BULLISH_OB':
+                bull += 0.15
+                reasons.append({"text": "Bullish Order Block 🐋", "type": "bull"})
+            elif ob_dir == 'BEARISH_OB':
+                bear += 0.15
+                reasons.append({"text": "Bearish Order Block 🔻", "type": "bear"})
 
         # BB extremes (bonus, not in core weights)
         if close > bb_upper:
@@ -862,7 +1107,8 @@ class ScalpingSignalEngine:
             sig      = Signal.WEAK_BUY    if direction > 0 else Signal.WEAK_SELL
             strength = "WEAK"
 
-        safe_atr = atr if atr > 0 else close * 0.002
+        # ALIGN-5: Use 5-min ATR for TP/SL (matches Pine ATR on 5m chart)
+        safe_atr = atr_5m if atr_5m > 0 else (atr if atr > 0 else close * 0.002)
         if direction > 0:
             sl = close - safe_atr * self.ATR_SL_MULT
             tp = close + safe_atr * self.ATR_TP_MULT

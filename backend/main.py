@@ -325,34 +325,37 @@ async def get_earnings(start: str = Query(default=None), end: str = Query(defaul
     today = date.today()
     s = start or today.isoformat()
     e = end   or (today + timedelta(days=7)).isoformat()
-    return db.get_earnings_for_range(s, e)
+    # asyncio.to_thread: Supabase client is synchronous (httpx/requests under the hood).
+    # Calling it directly in an async route blocks the event loop — all SSE clients
+    # stall until the query returns.  to_thread() offloads it to the thread pool.
+    return await asyncio.to_thread(db.get_earnings_for_range, s, e)
 
 
 # ── Signals ────────────────────────────────────────────────────────────────────
 @app.get("/api/signals")
 async def get_signals(limit: int = Query(200, le=500)):
-    return db.get_recent_signals(limit=limit)
+    return await asyncio.to_thread(db.get_recent_signals, limit)
 
 @app.post("/api/signals")
 async def post_signal(payload: dict):
-    return {"ok": db.insert_signal(payload)}
+    return {"ok": await asyncio.to_thread(db.insert_signal, payload)}
 
 
 # ── Portfolio / Monitor ────────────────────────────────────────────────────────
 @app.get("/api/portfolio")
 async def get_portfolio():
-    return db.get_portfolio()
+    return await asyncio.to_thread(db.get_portfolio)
 
 @app.get("/api/monitor")
 async def get_monitor():
-    return db.get_monitor()
+    return await asyncio.to_thread(db.get_monitor)
 
 
 # ── Stock List ─────────────────────────────────────────────────────────────────
 @app.get("/api/stock-list")
 async def get_stock_list():
     try:
-        tickers, company_map, sector_map = db.get_stock_meta()
+        tickers, company_map, sector_map = await asyncio.to_thread(db.get_stock_meta)
         return [{"ticker": t, "company_name": company_map.get(t) or "—",
                  "sector": sector_map.get(t) or "—"} for t in tickers]
     except Exception as e:
@@ -380,7 +383,7 @@ def _refresh_signal_watcher():
 
 @app.get("/api/watchlist")
 async def watchlist_get():
-    rows = db.get_signal_watchlist()
+    rows = await asyncio.to_thread(db.get_signal_watchlist)
     tickers = [r["ticker"] for r in rows if r.get("ticker")]
     return {"watchlist": tickers, "count": len(tickers)}
 
@@ -389,9 +392,9 @@ async def watchlist_get():
 async def watchlist_add(body: WatchlistBody):
     try:
         ticker = body.ticker.upper().strip()
-        db.add_signal_watchlist(ticker)
+        await asyncio.to_thread(db.add_signal_watchlist, ticker)
         _refresh_signal_watcher()
-        rows = db.get_signal_watchlist()
+        rows = await asyncio.to_thread(db.get_signal_watchlist)
         wl   = sorted([r["ticker"] for r in rows if r.get("ticker")])
         await broadcaster.publish({"type": "watchlist_update", "action": "add",
                                    "ticker": ticker, "watchlist": wl})
@@ -404,9 +407,9 @@ async def watchlist_add(body: WatchlistBody):
 async def watchlist_remove(body: WatchlistBody):
     try:
         ticker = body.ticker.upper().strip()
-        db.remove_signal_watchlist(ticker)
+        await asyncio.to_thread(db.remove_signal_watchlist, ticker)
         _refresh_signal_watcher()
-        rows = db.get_signal_watchlist()
+        rows = await asyncio.to_thread(db.get_signal_watchlist)
         wl   = sorted([r["ticker"] for r in rows if r.get("ticker")])
         await broadcaster.publish({"type": "watchlist_update", "action": "remove",
                                    "ticker": ticker, "watchlist": wl})
@@ -418,7 +421,7 @@ async def watchlist_remove(body: WatchlistBody):
 # ── Legacy signal-watchlist ────────────────────────────────────────────────────
 @app.get("/api/signal-watchlist")
 async def get_signal_watchlist():
-    rows = db.get_signal_watchlist()
+    rows = await asyncio.to_thread(db.get_signal_watchlist)
     tickers = [r["ticker"] for r in rows if r.get("ticker")]
     return {"symbols": tickers, "count": len(tickers), "max": 50}
 
@@ -429,7 +432,7 @@ async def set_signal_watchlist(payload: dict):
     corrections = {"ORACL": "ORCL", "TESLA": "TSLA"}
     symbols = [corrections.get(s.upper(), s.upper()) for s in symbols]
     for ticker in symbols:
-        db.add_signal_watchlist(ticker)
+        await asyncio.to_thread(db.add_signal_watchlist, ticker)
     logger.info(f"Signal watchlist bulk-set: {len(symbols)} symbols")
     _refresh_signal_watcher()
     return {"accepted": symbols, "count": len(symbols)}
@@ -450,13 +453,16 @@ async def reset_vwap():
 # ── Market Monitor ─────────────────────────────────────────────────────────────
 @app.get("/api/market-monitor")
 async def get_market_monitor(refresh: int = Query(0)):
-    rows    = db.get_signal_watchlist()
+    rows    = await asyncio.to_thread(db.get_signal_watchlist)
     tickers = [r["ticker"] for r in rows if r.get("ticker")]
     if not tickers:
         return {"data": [], "ticker_count": 0,
                 "message": "No tickers in watchlist."}
-    loop   = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, get_cached_monitor, tickers, bool(refresh))
+    # run_in_executor is equivalent to asyncio.to_thread for sync callables.
+    # get_cached_monitor internally uses a ThreadPoolExecutor (20 workers) to
+    # fetch yfinance data for all watchlist tickers concurrently, so the total
+    # wall time is ~2-3s for 50 tickers instead of the ~25s sequential baseline.
+    result = await asyncio.to_thread(get_cached_monitor, tickers, bool(refresh))
     return result
 
 

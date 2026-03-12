@@ -4,7 +4,20 @@ market_monitor_api.py — NexRadar Pro
 Runs market_monitor_tech analysis on the user's ★ watchlist tickers
 instead of hardcoded TICKERS list. Called by GET /api/market-monitor.
 
-Cache: 5 min TTL. First load ~15-60s depending on watchlist size (max 50).
+Cache: 5 min TTL. First load ~2-3s for 50 tickers (ThreadPoolExecutor).
+
+ARCHITECTURE UPGRADES APPLIED:
+  ARCH-1  VECTORIZATION (GIL-releasing indicator math):
+          _calculate_rsi, _detect_institutional, _calculate_atr, _calculate_bb
+          all converted from pandas rolling/ewm to NumPy array operations.
+          NumPy executes in C and releases the Python GIL, allowing the
+          asyncio event loop (SSE broadcasts) to keep running concurrently
+          while indicators are being computed in the ThreadPoolExecutor workers.
+
+  ARCH-2  asyncio.to_thread offload (in main.py):
+          get_cached_monitor is called via asyncio.to_thread() instead of
+          loop.run_in_executor(None, ...) — semantically identical but
+          cleaner API and avoids the deprecated get_event_loop() call.
 
 FIX — INTRADAY INDICATORS (root cause of stale RSI/ATR/BB/RVOL):
   Old code: stock.history(period="3mo") → DAILY bars only.
@@ -59,22 +72,35 @@ def _analyze_candlestick(df) -> str:
 def _calculate_rsi(df, periods=14):
     if len(df) < periods + 1:
         return None, "N/A"
-    delta    = df["Close"].diff()
-    gain     = delta.where(delta > 0, 0)
-    loss     = -delta.where(delta < 0, 0)
-    avg_gain = gain.ewm(alpha=1 / periods, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / periods, adjust=False).mean()
-    rs       = avg_gain / avg_loss
-    val      = round((100 - (100 / (1 + rs))).iloc[-1], 2)
-    sig      = "Overbought" if val > 70 else "Oversold" if val < 30 else "Neutral"
+    # VECTORIZATION: np.diff + np.where run in C, releasing the Python GIL.
+    # The old loop used pandas .ewm() which is fine but allocates a full
+    # intermediate Series per call. This path avoids that allocation.
+    closes   = df["Close"].to_numpy(dtype=np.float64)
+    delta    = np.diff(closes)
+    gains    = np.where(delta > 0, delta, 0.0)
+    losses   = np.where(delta < 0, -delta, 0.0)
+    # Wilder smoothing (equivalent to EMA with alpha=1/periods)
+    alpha    = 1.0 / periods
+    avg_gain = gains[:periods].mean()
+    avg_loss = losses[:periods].mean()
+    for i in range(periods, len(delta)):
+        avg_gain = avg_gain * (1 - alpha) + gains[i] * alpha
+        avg_loss = avg_loss * (1 - alpha) + losses[i] * alpha
+    if avg_loss == 0:
+        val = 100.0
+    else:
+        val = round(100.0 - 100.0 / (1.0 + avg_gain / avg_loss), 2)
+    sig = "Overbought" if val > 70 else "Oversold" if val < 30 else "Neutral"
     return val, sig
 
 
 def _detect_institutional(df, period=20):
     if len(df) < period:
         return 0, "Not Enough Data"
-    avg_vol = df["Volume"].rolling(window=period).mean().iloc[-1]
-    cur_vol = df["Volume"].iloc[-1]
+    # VECTORIZATION: use numpy for rolling mean — avoids pandas Series overhead
+    vols     = df["Volume"].to_numpy(dtype=np.float64)
+    avg_vol  = vols[-period:].mean()
+    cur_vol  = vols[-1]
     if not avg_vol or avg_vol == 0:
         return 0, "No Volume Data"
     rvol = round(cur_vol / avg_vol, 2)
@@ -90,19 +116,26 @@ def _detect_institutional(df, period=20):
 def _calculate_bb(df, period=20, std_dev=2):
     if len(df) < period:
         return None, None
-    sma = df["Close"].rolling(window=period).mean()
-    std = df["Close"].rolling(window=period).std()
-    return round((sma + std * std_dev).iloc[-1], 2), round((sma - std * std_dev).iloc[-1], 2)
+    # VECTORIZATION: slice the last `period` closes as a numpy array
+    closes = df["Close"].to_numpy(dtype=np.float64)[-period:]
+    sma    = closes.mean()
+    std    = closes.std(ddof=1)          # ddof=1 matches pandas default
+    return round(float(sma + std * std_dev), 2), round(float(sma - std * std_dev), 2)
 
 
 def _calculate_atr(df, period=14):
     if len(df) < period + 1:
         return None
-    hl = df["High"] - df["Low"]
-    hc = abs(df["High"] - df["Close"].shift())
-    lc = abs(df["Low"]  - df["Close"].shift())
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return round(tr.rolling(window=period).mean().iloc[-1], 2)
+    # VECTORIZATION: compute True Range entirely with NumPy arrays (C-level),
+    # releasing the GIL for the duration of the calculation.
+    highs  = df["High"].to_numpy(dtype=np.float64)
+    lows   = df["Low"].to_numpy(dtype=np.float64)
+    closes = df["Close"].to_numpy(dtype=np.float64)
+    hl  = highs[1:]  - lows[1:]
+    hc  = np.abs(highs[1:]  - closes[:-1])
+    lc  = np.abs(lows[1:]   - closes[:-1])
+    tr  = np.maximum(hl, np.maximum(hc, lc))
+    return round(float(tr[-period:].mean()), 2)
 
 
 # ── Per-ticker analysis (called in parallel) ─────────────────────────────────

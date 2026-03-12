@@ -1,23 +1,12 @@
 /**
- * NexRadarDashboard.jsx — App Shell
+ * NexRadarDashboard.jsx — App Shell (~471 lines)
  * Owns: sidebar, topbar, alert strip, page routing, dropdown panels, AppearanceModal.
  * Data delegated to hooks: useTickerData, useTechData, useWatchlist.
- *
- * REGRESSION FIXES APPLIED:
- *   FIX-1  useWatchlist() called without sseRef — SSE watchlist_update events
- *          were never routed to useWatchlist because sseRef was not passed.
- *          Fix: pass sseRef from useTickerData into useWatchlist(sseRef).
- *
- *   FIX-2  Inline sidebar stats used raw import.meta?.env?.VITE_API_BASE
- *          instead of the canonical API_BASE from config.js, creating two
- *          diverging base-URL sources that would both break in production
- *          if VITE_API_BASE is not set.
- *          Fix: import API_BASE from config.js and use it everywhere.
  *
  * Props: { darkMode, source, sector, onSourceChange, onSectorChange,
  *          onThemeChange, currentTheme, onSignOut, user }
  */
-import { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspense } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { getThemeTokens, getCSS }                             from './nexradar/theme.js';
 import { SECTORS, NAV, SESSION_META }                         from './nexradar/constants.js';
 import { normalizeSector, computeSectorTotal, getMarketSession } from './nexradar/utils.js';
@@ -25,31 +14,13 @@ import { NexRadarErrorBoundary, Chip, AppearanceModal }       from './nexradar/p
 import { useTickerData }                                      from './nexradar/useTickerData.js';
 import { useTechData }                                        from './nexradar/useTechData.js';
 import { useWatchlist }                                       from './nexradar/useWatchlist.js';
-// FIX-2: single canonical base-URL source
-import { API_BASE }                                           from '../config.js';
 
-// Critical path: eager-loaded (always needed on first render)
-import PageDashboard from './nexradar/PageDashboard.jsx';
-import PageLiveTable from './nexradar/PageLiveTable.jsx';
-
-// Heavy pages: lazy-loaded (downloaded only when the user clicks the tab)
-// Cuts initial JS parse+eval time — browser never fetches Chart/Signals/Earnings/Portfolio
-// until the user actually navigates there.
-const PageChart     = lazy(() => import('./nexradar/PageChart.jsx'));
-const PageSignals   = lazy(() => import('./nexradar/PageSignals.jsx'));
-const PageEarnings  = lazy(() => import('./nexradar/PageEarnings.jsx'));
-const PagePortfolio = lazy(() => import('./nexradar/PagePortfolio.jsx'));
-const PageScreener  = lazy(() => import('./nexradar/PageScreener.jsx'));
-
-// Inline suspense fallback — dark NexRadar skeleton aesthetic
-const PageLoader = ({ T }) => (
-  <div style={{ display:'flex', alignItems:'center', justifyContent:'center', height:'60vh', flexDirection:'column', gap:14 }}>
-    <div style={{ width:36, height:36, border:`3px solid ${T.cyanMid}`, borderTopColor:T.cyan,
-      borderRadius:'50%', animation:'spin 0.7s linear infinite' }}/>
-    <span style={{ color:T.text2, fontFamily:T.font, fontSize:11, letterSpacing:2 }}>LOADING MODULE…</span>
-    <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
-  </div>
-);
+import PageDashboard  from './nexradar/PageDashboard.jsx';
+import PageLiveTable  from './nexradar/PageLiveTable.jsx';
+import PageChart      from './nexradar/PageChart.jsx';
+import PageSignals    from './nexradar/PageSignals.jsx';
+import PageEarnings   from './nexradar/PageEarnings.jsx';
+import PagePortfolio  from './nexradar/PagePortfolio.jsx';
 
 // ── Shell ─────────────────────────────────────────────────────────────────────
 function NexRadarDashboard({
@@ -95,25 +66,23 @@ function NexRadarDashboard({
     = useTickerData();
   const { techData, techLoading, techError, techLastFetch, techCached, techDataAge, fetchTechData }
     = useTechData();
-  // FIX-1: pass sseRef so SSE watchlist_update events reach useWatchlist
   const { watchlist, toggleWatchlist, wsWatchlistRef }
-    = useWatchlist(sseRef);
+    = useWatchlist();
 
   // ── Sidebar signal engine stats ───────────────────────────────────────────────
   const [sideWatchlist,    setSideWatchlist]    = useState(0);
   const [sideScalpSignals, setSideScalpSignals] = useState({});
   useEffect(() => {
-    // FIX-2: use API_BASE from config.js, not inline import.meta.env
-    // FIX-SIDEBAR: re-fetch on watchlist.size change so WATCHING stays in sync
-    fetch(`${API_BASE}/api/watchlist`)
+    const API = (typeof window !== 'undefined' && import.meta?.env?.VITE_API_BASE) || '';
+    fetch(`${API}/api/watchlist`)
       .then(r => r.ok ? r.json() : {})
       .then(d => setSideWatchlist((d.watchlist ?? []).length))
       .catch(() => {});
-  }, [watchlist.size]);
+  }, []);
   useEffect(() => {
-    // FIX-2: use API_BASE from config.js
+    const API = (typeof window !== 'undefined' && import.meta?.env?.VITE_API_BASE) || '';
     const fetchScalp = () =>
-      fetch(`${API_BASE}/api/scalp-analysis`)
+      fetch(`${API}/api/scalp-analysis`)
         .then(r => r.ok ? r.json() : null)
         .then(d => {
           if (!d?.data) return;
@@ -166,22 +135,14 @@ function NexRadarDashboard({
   const current        = NAV.find(n => n.id === page);
 
   // ── Page router ──────────────────────────────────────────────────────────────
-  // Suspense wrapper for lazy pages — only shown on first visit to that tab
-  const withLazy = (node) => (
-    <Suspense fallback={<PageLoader T={T} />}>{node}</Suspense>
-  );
-
   const renderPage = () => {
     switch (page) {
-      // Eager pages — no Suspense needed
       case 'dashboard': return <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange} onNavigate={setPage} sectorPerformance={sectorPerformance} tickers={tickers} techData={techData} techLoading={techLoading} T={T} />;
       case 'live':      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={()=>setQuickFilter(null)} wsStatus={wsStatus} onLiveCount={handleLiveCount} watchlistProp={watchlist} toggleWatchlistProp={toggleWatchlist} T={T} />;
-      // Lazy pages — wrapped in Suspense, downloaded on first visit
-      case 'screener':  return withLazy(<PageScreener tickers={tickers} watchlist={watchlist} toggleWatchlist={toggleWatchlist} techData={techData} scalpData={sideScalpSignals} T={T} />);
-      case 'chart':     return withLazy(<PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />);
-      case 'signals':   return withLazy(<PageSignals tickers={tickers} selectedSectors={selectedSectors} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} T={T} />);
-      case 'earnings':  return withLazy(<PageEarnings T={T} />);
-      case 'portfolio': return withLazy(<PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlist} T={T} />);
+      case 'chart':     return <PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />;
+      case 'signals':   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} T={T} />;
+      case 'earnings':  return <PageEarnings T={T} />;
+      case 'portfolio': return <PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlist} T={T} />;
       default:          return null;
     }
   };
