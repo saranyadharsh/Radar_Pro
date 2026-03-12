@@ -60,7 +60,7 @@ POLYGON_REST_URL = "https://api.polygon.io/v2"
 SNAPSHOT_INTERVAL_S  = 2      # seconds between snapshot broadcasts
 PORTFOLIO_REFRESH_S  = 30
 AH_CLOSE_REFRESH_S   = 300    # 5 min  -  refresh AH closes during extended hours
-DB_WRITE_INTERVAL_S  = 5
+DB_WRITE_INTERVAL_S  = 300
 HIST_FETCH_WORKERS   = 8
 TICK_BATCH_SIZE      = 100    # ticks buffered before a flush
 
