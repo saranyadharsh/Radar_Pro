@@ -149,15 +149,20 @@ def _analyze_ticker(ticker: str) -> Dict:
     time drops to ~2–3 s for 50 tickers and no FastAPI worker is starved.
     """
     try:
+        # Small stagger: prevents all ThreadPool workers from firing their
+        # first yfinance request at the exact same millisecond, which looks
+        # like a burst attack to Yahoo's rate limiter.
+        time.sleep(0.1)
         stock = yf.Ticker(ticker)
 
-        # Fundamentals — static
-        info      = stock.info
-        mkt_cap   = info.get("marketCap", 0)
-        fcf       = info.get("freeCashflow", 0)
-        de_raw    = info.get("debtToEquity", None)
-        de        = round(de_raw / 100, 2) if de_raw is not None else None
-        fcf_yield = round((fcf / mkt_cap) * 100, 2) if mkt_cap and fcf and mkt_cap > 0 else None
+        # NOTE: stock.info intentionally removed — it fires a separate Yahoo
+        # HTTP request per ticker. With 20 concurrent ThreadPool workers all
+        # hitting Yahoo simultaneously, it triggers rate-limiting/IP blocks in
+        # prod (Render shared IP), causing every ticker to return "Error".
+        # FCF yield and D/E are shown as None — acceptable trade-off for
+        # reliability. Re-add with a dedicated slow background job if needed.
+        fcf_yield = None
+        de        = None
 
         # Daily bars — SMA50 / Trend only
         daily = stock.history(period="3mo", interval="1d")
@@ -221,7 +226,7 @@ def _analyze_ticker(ticker: str) -> Dict:
             }
         else:
             # Intraday unavailable (weekend/holiday) — degrade gracefully
-            fallback_price = round(daily["Close"].iloc[-1], 2) if not daily.empty else (info.get("currentPrice", 0) or 0)
+            fallback_price = round(daily["Close"].iloc[-1], 2) if not daily.empty else 0
             return {
                 "ticker": ticker, "price": fallback_price,
                 "sma_50": sma50, "atr": None, "bb_status": "N/A",
@@ -247,10 +252,12 @@ def _analyze_ticker(ticker: str) -> Dict:
 
 
 # ── Main analysis loop ────────────────────────────────────────────────────────
-# Thread-Pool-Fix: MAX_WORKERS=20 keeps yfinance concurrency high enough to
-# fetch 50 tickers in ~2-3s while staying within yfinance's rate-limit safety
-# margin. Raising this above 30 risks HTTP 429s from Yahoo Finance.
-_MONITOR_MAX_WORKERS = 20
+# Thread-Pool-Fix: MAX_WORKERS=5 keeps concurrent yfinance requests low enough
+# to avoid Yahoo Finance rate-limiting on Render's shared IP. 20 simultaneous
+# requests all hitting Yahoo at once was the root cause of all-"Error" results
+# in prod. 5 workers still processes 50 tickers in ~5-6s — well within the
+# 5-min cache TTL.
+_MONITOR_MAX_WORKERS = 5
 
 def run_market_monitor(ticker_list: List[str]) -> List[Dict]:
     """
