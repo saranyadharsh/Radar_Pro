@@ -40,6 +40,8 @@ const PageSignals   = lazy(() => import('./nexradar/PageSignals.jsx'));
 const PageEarnings  = lazy(() => import('./nexradar/PageEarnings.jsx'));
 const PagePortfolio = lazy(() => import('./nexradar/PagePortfolio.jsx'));
 const PageScreener  = lazy(() => import('./nexradar/PageScreener.jsx'));
+const PageScanner   = lazy(() => import('./nexradar/PageScanner.jsx'));
+import AlertToast from './nexradar/AlertToast.jsx';
 
 // Inline suspense fallback — dark NexRadar skeleton aesthetic
 const PageLoader = ({ T }) => (
@@ -72,6 +74,21 @@ function NexRadarDashboard({
   const [chartInitSymbol,setChartInitSymbol]= useState('');
   const searchInputRef                       = useRef('');
   const [sideCollapsed,  setSideCollapsed]  = useState(false);
+  const [isMobile,       setIsMobile]       = useState(() => window.innerWidth < 768);
+  const [mobileDrawer,   setMobileDrawer]   = useState(false);
+  const [liveAlerts,     setLiveAlerts]     = useState([]);
+
+  useEffect(() => {
+    const handler = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', handler);
+    return () => window.removeEventListener('resize', handler);
+  }, []);
+
+  useEffect(() => {
+    const handler = (e) => setLiveAlerts(prev => [e.detail, ...prev].slice(0, 6));
+    window.addEventListener('nexradar_alert', handler);
+    return () => window.removeEventListener('nexradar_alert', handler);
+  }, []);
   const [headerPanel,    setHeaderPanel]    = useState(null);
 
   // ── Theme tokens ─────────────────────────────────────────────────────────────
@@ -181,6 +198,7 @@ function NexRadarDashboard({
       case 'chart':     return withLazy(<PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />);
       case 'signals':   return withLazy(<PageSignals tickers={tickers} selectedSectors={selectedSectors} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} T={T} />);
       case 'earnings':  return withLazy(<PageEarnings T={T} />);
+      case 'scanner':  return withLazy(<PageScanner T={T} onNavigateToChart={(sym) => { setChartInitSymbol(sym); setPage('chart'); }} />);
       case 'portfolio': return withLazy(<PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlist} T={T} />);
       default:          return null;
     }
@@ -213,7 +231,7 @@ function NexRadarDashboard({
       <style>{getCSS(T)}</style>
 
       {/* ── SIDEBAR ── */}
-      <div style={{ width:sideCollapsed?56:218, minWidth:sideCollapsed?56:218, background:T.bg1, borderRight:`1px solid ${T.border}`, display:'flex', flexDirection:'column', transition:'width 0.22s,min-width 0.22s', overflow:'hidden' }}>
+      <div className="nexradar-sidebar" style={{ width:sideCollapsed?56:218, minWidth:sideCollapsed?56:218, background:T.bg1, borderRight:`1px solid ${T.border}`, display:'flex', flexDirection:'column', transition:'width 0.22s,min-width 0.22s', overflow:'hidden' }}>
         {/* Logo */}
         <div style={{ padding:'17px 13px', borderBottom:`1px solid ${T.border}`, display:'flex', alignItems:'center', gap:10, overflow:'hidden', flexShrink:0 }}>
           <div style={{ width:30, height:30, borderRadius:7, background:`linear-gradient(135deg,${T.cyan},#0055bb)`, display:'flex', alignItems:'center', justifyContent:'center', fontWeight:800, color:'#000', fontSize:13, flexShrink:0 }}>N</div>
@@ -264,7 +282,7 @@ function NexRadarDashboard({
       </div>
 
       {/* ── MAIN ── */}
-      <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
+      <div className="nexradar-main" style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
         {/* Top bar */}
         <div style={{ background:T.bg1, borderBottom:`1px solid ${T.border}`, padding:'0 20px', height:56, display:'flex', alignItems:'center', gap:14, flexShrink:0, position:'relative' }}>
           <span style={{ fontFamily:T.font, fontWeight:700, fontSize:16, color:T.text0, letterSpacing:0.5 }}>
@@ -410,10 +428,14 @@ function NexRadarDashboard({
                 <button onClick={()=>setHeaderPanel(null)} style={{ background:'none', border:'none', color:T.text2, cursor:'pointer', fontSize:16, padding:0 }}>✕</button>
               </div>
               {[
-                {label:'Broadcast Throttle', key:'throttle',  value:'350ms',        note:'Min interval between tick broadcasts'},
-                {label:'Portfolio Refresh',  key:'portfolio', value:'30s',          note:'How often portfolio/monitor reloads'},
-                {label:'Display Cap',        key:'cap',       value:'1 600 tickers',note:'Max tickers shown across all sectors'},
-                {label:'AH Close Refresh',   key:'ah',        value:'120s',         note:'After-hours closing price refresh rate'},
+                // BUG-13 FIX: values now match actual ws_engine.py constants
+                // Throttle 250ms = tick_flush_loop sleep(0.25)
+                // AH Close 300s  = AH_CLOSE_REFRESH_S (updated from 60s, BUG-07)
+                // Cap 6200       = LIVE_DISPLAY_CAP in supabase_db.py
+                {label:'Broadcast Throttle', key:'throttle',  value:'250ms',         note:'Tick-batch flush interval (ws_engine tick_flush_loop)'},
+                {label:'Portfolio Refresh',  key:'portfolio', value:'30s',           note:'How often portfolio/monitor reloads'},
+                {label:'Display Cap',        key:'cap',       value:'6 200 tickers', note:'Max tickers in live cache (LIVE_DISPLAY_CAP)'},
+                {label:'AH Close Refresh',   key:'ah',        value:'300s',          note:'After-hours closing price refresh (watchlist-scoped)'},
               ].map(s=>(
                 <div key={s.key} style={{ padding:'11px 16px', borderBottom:`1px solid ${T.border}` }}>
                   <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
@@ -490,10 +512,57 @@ function NexRadarDashboard({
         )}
 
         {/* Page content */}
-        <div key={page} style={{ flex:1, overflowY:'auto', padding:18 }}>
+        <div key={page} className="nexradar-page" style={{ flex:1, overflowY:'auto', padding:18 }}>
           {renderPage()}
         </div>
       </div>
+
+      {/* ── MOBILE BOTTOM NAV ── */}
+      <nav className="mobile-tabbar">
+        {[
+          { id: 'dashboard', icon: '⬡', label: 'Home'    },
+          { id: 'live',      icon: '◈', label: 'Live'     },
+          { id: 'scanner',   icon: '◈', label: 'Scanner'  },
+          { id: 'signals',   icon: '◉', label: 'Signals'  },
+          { id: '__more__',  icon: '⋯', label: 'More'     },
+        ].map(n => (
+          <button key={n.id}
+            className={`mobile-tab${n.id === '__more__' ? (mobileDrawer ? ' active' : '') : (page === n.id ? ' active' : '')}`}
+            onClick={() => { if (n.id === '__more__') setMobileDrawer(d => !d); else { setPage(n.id); setMobileDrawer(false); } }}
+            style={{ color: n.id === '__more__' ? (mobileDrawer ? T.cyan : T.text2) : (page === n.id ? T.cyan : T.text2) }}>
+            <span className="mob-icon">{n.icon}</span>
+            <span className="mob-label">{n.label}</span>
+          </button>
+        ))}
+      </nav>
+
+      {/* Mobile "More" drawer */}
+      {mobileDrawer && isMobile && (
+        <>
+          <div style={{ position:'fixed', inset:0, zIndex:4990, background:'rgba(0,0,0,0.5)' }}
+               onClick={() => setMobileDrawer(false)}/>
+          <div style={{ position:'fixed', bottom:58, left:0, right:0, background:T.bg1, borderTop:`1px solid ${T.border}`, borderRadius:'16px 16px 0 0', padding:16, zIndex:5000, display:'flex', flexDirection:'column', gap:4, animation:'slideUp 0.22s ease' }}>
+            <div style={{ color:T.text2, fontSize:9, fontWeight:700, letterSpacing:2, padding:'4px 8px 8px' }}>MORE PAGES</div>
+            {[
+              { id:'screener',  icon:'⌖', label:'Screener'  },
+              { id:'earnings',  icon:'◎', label:'Earnings'  },
+              { id:'portfolio', icon:'◆', label:'Portfolio' },
+              { id:'chart',     icon:'◇', label:'Chart'     },
+            ].map(n => (
+              <button key={n.id} onClick={() => { setPage(n.id); setMobileDrawer(false); }}
+                style={{ display:'flex', alignItems:'center', gap:14, padding:'12px 16px', borderRadius:10, background:page===n.id?T.cyanDim:'transparent', border:page===n.id?`1px solid ${T.cyanMid}`:'1px solid transparent', color:page===n.id?T.cyan:T.text0, fontFamily:T.font, fontSize:14, fontWeight:500, cursor:'pointer', transition:'all 0.15s', textAlign:'left' }}
+                onMouseEnter={e=>e.currentTarget.style.background=T.bg2}
+                onMouseLeave={e=>e.currentTarget.style.background=page===n.id?T.cyanDim:'transparent'}>
+                <span style={{ fontSize:18 }}>{n.icon}</span>{n.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      {/* Alert toasts — Feature #1 */}
+      <AlertToast alerts={liveAlerts} setAlerts={setLiveAlerts} T={T} />
+
     </div>
   );
 }

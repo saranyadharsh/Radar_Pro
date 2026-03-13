@@ -53,9 +53,9 @@
 """
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
+import asyncio
 import threading
 import logging
-import subprocess
 import sys
 import os
 from collections import deque
@@ -431,6 +431,89 @@ class IndicatorCalculator:
               for i in range(1, len(agg_h))]
         return float(np.mean(tr[-p:])) if tr else 0.0
 
+    @staticmethod
+    def _aggregate_bars(bars_list: list, n: int) -> list:
+        """Aggregate 1-min bars into n-min OHLCV dicts. Used by MTF scanner."""
+        result = []
+        for i in range(0, len(bars_list) - n + 1, n):
+            chunk = bars_list[i:i + n]
+            result.append({
+                "open":   chunk[0].open,
+                "high":   max(b.high   for b in chunk),
+                "low":    min(b.low    for b in chunk),
+                "close":  chunk[-1].close,
+                "volume": sum(b.volume for b in chunk),
+            })
+        return result
+
+    def get_mtf_indicators(self) -> dict:
+        """
+        Compute 5m and 15m trend/momentum indicators from the existing 1m bars deque.
+        Returns: { "5m": {...}, "15m": {...}, "weighted_sub": float, "aligned": bool }
+        Called by ScalpingSignalEngine.get_mtf_snapshot().
+        """
+        bars_list = list(self.bars)
+
+        def _ema_arr(values, period):
+            if len(values) < period:
+                return float(np.mean(values)) if len(values) > 0 else 0.0
+            k = 2.0 / (period + 1)
+            ema = float(np.mean(values[:period]))
+            for v in values[period:]:
+                ema = v * k + ema * (1 - k)
+            return ema
+
+        def _rsi_arr(closes, period=14):
+            if len(closes) < period + 1:
+                return 50.0
+            deltas = np.diff(closes)
+            gains  = np.where(deltas > 0, deltas, 0.0)
+            losses = np.where(deltas < 0, -deltas, 0.0)
+            avg_g  = float(np.mean(gains[-period:]))
+            avg_l  = float(np.mean(losses[-period:]))
+            if avg_l == 0:
+                return 100.0
+            return round(100.0 - 100.0 / (1 + avg_g / avg_l), 1)
+
+        vwap_ref = 0.0
+        if self._vwap_cum_vol > 0:
+            vwap_ref = self._vwap_cum_pv / self._vwap_cum_vol
+
+        def _tf_indicators(agg_bars):
+            if len(agg_bars) < 5:
+                return None
+            closes = np.array([b["close"] for b in agg_bars])
+            ema8   = _ema_arr(closes, 8)
+            ema21  = _ema_arr(closes, 21)
+            rsi    = _rsi_arr(closes)
+            last_c = float(closes[-1])
+            vwap_above = last_c > vwap_ref if vwap_ref > 0 else None
+            if ema8 > ema21 and last_c > ema8:
+                trend = "Bullish"
+            elif ema8 < ema21 and last_c < ema8:
+                trend = "Bearish"
+            else:
+                trend = "Sideways"
+            return {"ema8": round(ema8, 4), "ema21": round(ema21, 4),
+                    "rsi": rsi, "vwap_above": vwap_above,
+                    "trend": trend, "bars_count": len(agg_bars)}
+
+        tf5  = _tf_indicators(self._aggregate_bars(bars_list, 5))
+        tf15 = _tf_indicators(self._aggregate_bars(bars_list, 15))
+
+        def _score(tf):
+            if tf is None: return 0
+            return 1 if tf["trend"] == "Bullish" else -1 if tf["trend"] == "Bearish" else 0
+
+        weighted_sub = _score(tf5) * 0.35 + _score(tf15) * 0.25
+        aligned = (tf5 is not None and tf15 is not None
+                   and tf5["trend"] == tf15["trend"]
+                   and tf5["trend"] != "Sideways")
+
+        return {"5m": tf5, "15m": tf15,
+                "weighted_sub": round(weighted_sub, 3), "aligned": aligned,
+                "vwap_ref": round(vwap_ref, 4)}
+
     def _compute(self, bar: OHLCVBar) -> dict:
         closes  = self._arr('close')
         opens   = self._arr('open')          # needed for order block + volume delta
@@ -600,25 +683,72 @@ class ScalpingSignalEngine:
         """Hook for cleanup."""
         logger.info("Scalping Signal Engine stopped")
 
-    def on_tick(self, ticker: str, price: float, ts_ms: Optional[int] = None):
+    def on_tick(
+        self,
+        ticker: str,
+        price: float,
+        ts_ms: Optional[int] = None,
+        # ── Feature: LULD circuit breaker ─────────────────────────────────────
+        is_halted: bool      = False,
+        halt_state: Optional[int] = None,
+        # ── Feature: NOI institutional filter ─────────────────────────────────
+        imbalance_size: int  = 0,
+        imbalance_side: str  = "N",   # "B"=buy, "S"=sell, "N"=none
+    ):
         """
-        Entry point from ws_engine.py. 
-        Note: This engine prefers 1-min aggregate bars. 
-        For raw ticks, we treat them as minute-snapshots.
+        Entry point from ws_engine.py.
+        Receives live tick data enriched with Advanced plan indicators.
+
+        Circuit breaker (is_halted):
+          Immediately returns if the stock is in an LULD halt — prevents
+          generating signals on frozen prices / bad ticks during the halt.
+
+        AH NOI filter (imbalance_side):
+          In pre/after-hours sessions, rejects momentum signals whose price
+          direction conflicts with institutional order imbalance, avoiding
+          'bull traps' and 'bear traps' caused by thin retail liquidity.
         """
         if ticker not in self._watched:
+            return
+
+        # ── LULD circuit breaker ───────────────────────────────────────────────
+        if is_halted:
+            # Stock is frozen — do NOT process bars or generate signals.
+            # Avoids: slippage on halt entry, RSI skew from bad ticks,
+            # false volume-spike signals from halt-related prints.
+            logger.debug(f"SIGNAL SUPPRESSED: {ticker} LULD halt state={halt_state}")
             return
 
         et_tz = pytz.timezone("America/New_York")
         ts = datetime.fromtimestamp(ts_ms/1000.0, tz=et_tz) if ts_ms else datetime.now(et_tz)
 
-        # Create a 'pseudo-bar' from the live tick. 
+        # ── NOI institutional AH filter ────────────────────────────────────────
+        # Only active during pre-market / after-hours when liquidity is thin.
+        # Filters: rising price + institutional SELL imbalance = likely bull trap.
+        #          falling price + institutional BUY  imbalance = likely bear trap.
+        if imbalance_side in ("B", "S") and imbalance_size > 0:
+            session = _get_session(ts)
+            if session in (MarketSession.PRE, MarketSession.AFTER):
+                with self._lock:
+                    calc = self._calcs.get(ticker)
+                    if calc and calc._latest_ind is not None:
+                        last_close = calc._latest_ind.get("close", price)
+                        price_rising  = price > last_close * 1.001   # >0.1% up
+                        price_falling = price < last_close * 0.999   # >0.1% down
+                        if price_rising  and imbalance_side == "S":
+                            logger.debug(f"NOI FILTER: {ticker} price↑ but imbalance=SELL — skipping")
+                            return
+                        if price_falling and imbalance_side == "B":
+                            logger.debug(f"NOI FILTER: {ticker} price↓ but imbalance=BUY — skipping")
+                            return
+
+        # Create a 'pseudo-bar' from the live tick.
         # (WSEngine provides 1m aggregates 'A' or live trades 'T' through this)
         bar = OHLCVBar(
             timestamp=ts,
             open=price, high=price, low=price, close=price, volume=0
         )
-        
+
         self.process_aggregate_bar(ticker, bar)
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -834,6 +964,67 @@ class ScalpingSignalEngine:
         order = {"BUY": 0, "SELL": 1, "HOLD": 2, "warming_up": 3}
         rows.sort(key=lambda r: (order.get(r.get("signal", "warming_up"), 3),
                                   -r.get("confidence", 0)))
+        return rows
+
+    def get_mtf_snapshot(self, watchlist: list) -> list:
+        """
+        Multi-timeframe confluence scanner.
+        Returns per-watchlist-symbol rows with 1m/5m/15m trend alignment.
+        Called by GET /api/mtf-scanner.
+        """
+        rows = []
+        with self._lock:
+            calcs_copy = {k: v for k, v in self._calcs.items() if k in watchlist}
+
+        for symbol, calc in calcs_copy.items():
+            if len(calc.bars) < 27:
+                continue
+
+            snap_list = self.get_scalp_snapshot([symbol])
+            snap_1m   = next((r for r in snap_list if r.get("status") != "warming_up"), None)
+            if snap_1m is None:
+                continue
+
+            mtf = calc.get_mtf_indicators()
+            tf5  = mtf.get("5m")
+            tf15 = mtf.get("15m")
+
+            trend_1m = snap_1m.get("trend", "Sideways")
+            score_1m = snap_1m.get("score", 0.0)
+            trend_score_1m = 1 if trend_1m == "Bullish" else (-1 if trend_1m == "Bearish" else 0)
+            confluence = round(
+                max(-1.0, min(1.0, trend_score_1m * 0.40 + mtf["weighted_sub"])),
+                3
+            )
+
+            abs_c = abs(confluence)
+            tier  = "A" if abs_c >= 0.75 else "B" if abs_c >= 0.50 else "C" if abs_c >= 0.30 else "D"
+            direction = "BULL" if confluence > 0.05 else ("BEAR" if confluence < -0.05 else "NEUTRAL")
+
+            rows.append({
+                "ticker":          symbol,
+                "price":           snap_1m.get("price", 0),
+                "signal_1m":       snap_1m.get("signal", "HOLD"),
+                "score_1m":        round(score_1m, 3),
+                "strength":        snap_1m.get("strength", "WEAK"),
+                "trend_1m":        trend_1m,
+                "trend_5m":        tf5["trend"]  if tf5  else "—",
+                "trend_15m":       tf15["trend"] if tf15 else "—",
+                "rsi_1m":          snap_1m.get("rsi", 50),
+                "rsi_5m":          tf5["rsi"]    if tf5  else None,
+                "rsi_15m":         tf15["rsi"]   if tf15 else None,
+                "vwap_above_5m":   tf5["vwap_above"]  if tf5  else None,
+                "vwap_above_15m":  tf15["vwap_above"] if tf15 else None,
+                "bars_5m":         tf5["bars_count"]  if tf5  else 0,
+                "bars_15m":        tf15["bars_count"] if tf15 else 0,
+                "aligned":         mtf["aligned"],
+                "confluence":      confluence,
+                "direction":       direction,
+                "tier":            tier,
+                "bars_count":      len(calc.bars),
+            })
+
+        rows.sort(key=lambda r: (not r["aligned"], -abs(r["confluence"])))
         return rows
 
     # FIX-5: date-guard scheduler
@@ -1133,6 +1324,192 @@ class ScalpingSignalEngine:
             timestamp   = bar.timestamp,
             session     = session,
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SMART ALERTS ENGINE  — Feature #1
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ALERT_COOLDOWN_SEC = 300   # 5 min per ticker+type
+
+
+class SmartAlertsEngine:
+    """
+    Edge-triggered alert engine on top of ScalpingSignalEngine.
+    Polls get_scalp_snapshot() every POLL_SEC seconds, diffs indicator
+    state, fires SSE type:"alert" events on state transitions only.
+
+    Alert types: VWAP_RECLAIM, VWAP_BREAK, EMA_BULL_CROSS, EMA_BEAR_CROSS,
+                 RVOL_SPIKE, HOD_BREAK, LOD_BREAK, STRONG_BUY, STRONG_SELL
+
+    BUG-02 FIX: broadcast_cb is SSEBroadcaster.publish which is async def.
+    Calling it synchronously from this background thread returns an unawaited
+    coroutine — silently dropped. Fix: store event loop, use
+    asyncio.run_coroutine_threadsafe() identically to WSEngine._broadcast().
+    """
+
+    POLL_SEC = 10
+
+    def __init__(self, engine: "ScalpingSignalEngine", broadcast_cb=None, loop=None):
+        self._engine       = engine
+        self._broadcast_cb = broadcast_cb
+        self._loop         = loop          # BUG-02: asyncio event loop for threadsafe dispatch
+        self._watchlist: list = []
+        self._prev:      dict = {}
+        self._cooldowns: dict = {}
+        self._lock        = threading.Lock()
+        self.alert_history = deque(maxlen=100)
+        self._shutdown    = threading.Event()
+
+    def set_watchlist(self, symbols: list):
+        with self._lock:
+            self._watchlist = list(symbols)
+
+    def start(self):
+        t = threading.Thread(target=self._loop, daemon=True, name="smart-alerts")
+        t.start()
+        logger.info("SmartAlertsEngine started")
+
+    def stop(self):
+        self._shutdown.set()
+
+    def get_recent_alerts(self, limit: int = 50) -> list:
+        with self._lock:
+            return list(self.alert_history)[:limit]
+
+    def _loop(self):
+        while not self._shutdown.is_set():
+            try:
+                self._check()
+            except Exception as exc:
+                logger.warning(f"SmartAlertsEngine poll error: {exc}")
+            self._shutdown.wait(self.POLL_SEC)
+
+    def _check(self):
+        with self._lock:
+            watchlist = list(self._watchlist)
+        if not watchlist:
+            return
+
+        rows = self._engine.get_scalp_snapshot(watchlist)
+        now  = std_time.time()
+
+        for row in rows:
+            if row.get("status") == "warming_up":
+                continue
+
+            ticker     = row["ticker"]
+            prev       = self._prev.get(ticker, {})
+
+            close      = row.get("price", 0)
+            vwap       = row.get("vwap", 0)
+            vwap_pos   = row.get("vwap_status", "")
+            trend      = row.get("trend", "")
+            vol_ratio  = row.get("volume", 1.0)
+            signal     = row.get("signal", "HOLD")
+            strength   = row.get("strength", "WEAK")
+            score      = row.get("score", 0.0)
+            resistance = row.get("resistance", 0)
+            support    = row.get("support", 0)
+
+            p_vwap_pos   = prev.get("vwap_pos", "")
+            p_trend      = prev.get("trend", "")
+            p_vol_ratio  = prev.get("vol_ratio", 0)
+            p_signal     = prev.get("signal", "HOLD")
+            p_close      = prev.get("close", close)
+            p_resistance = prev.get("resistance", resistance)
+            p_support    = prev.get("support", support)
+
+            candidates = []
+
+            if p_vwap_pos == "BELOW" and vwap_pos == "ABOVE" and vwap > 0:
+                candidates.append(("VWAP_RECLAIM", "🔼", "VWAP Reclaim",
+                    f"Reclaimed VWAP at ${close:.2f} (VWAP ${vwap:.2f})", "green"))
+
+            if p_vwap_pos == "ABOVE" and vwap_pos == "BELOW" and vwap > 0:
+                candidates.append(("VWAP_BREAK", "🔽", "VWAP Break",
+                    f"Broke below VWAP at ${close:.2f} (VWAP ${vwap:.2f})", "red"))
+
+            if p_trend in ("Bearish", "Sideways") and trend == "Bullish":
+                candidates.append(("EMA_BULL_CROSS", "📈", "EMA Bull Cross",
+                    f"EMA 8 crossed above EMA 21 at ${close:.2f}", "green"))
+
+            if p_trend in ("Bullish", "Sideways") and trend == "Bearish":
+                candidates.append(("EMA_BEAR_CROSS", "📉", "EMA Bear Cross",
+                    f"EMA 8 crossed below EMA 21 at ${close:.2f}", "red"))
+
+            if p_vol_ratio < 2.0 and vol_ratio >= 2.0:
+                candidates.append(("RVOL_SPIKE", "🔥", "Volume Spike",
+                    f"RVOL {vol_ratio:.1f}× — unusual volume surge", "gold"))
+
+            if p_close < p_resistance and close >= resistance and resistance > 0:
+                candidates.append(("HOD_BREAK", "🚀", "HOD Break",
+                    f"Breaking session high at ${close:.2f}", "cyan"))
+
+            if p_close > p_support and close <= support and support > 0:
+                candidates.append(("LOD_BREAK", "🕳", "LOD Break",
+                    f"Breaking session low at ${close:.2f}", "red"))
+
+            if p_signal != "BUY" and signal == "BUY" and strength in ("STRONG", "MODERATE"):
+                candidates.append(("STRONG_BUY", "⚡", "Strong Buy Signal",
+                    f"Score {score:+.2f} — {strength} conviction LONG", "green"))
+
+            if p_signal != "SELL" and signal == "SELL" and strength in ("STRONG", "MODERATE"):
+                candidates.append(("STRONG_SELL", "⚡", "Strong Sell Signal",
+                    f"Score {score:+.2f} — {strength} conviction SHORT", "red"))
+
+            for (atype, emoji, title, message, color) in candidates:
+                key = (ticker, atype)
+                if now - self._cooldowns.get(key, 0) < ALERT_COOLDOWN_SEC:
+                    continue
+                self._cooldowns[key] = now
+
+                alert = {
+                    "type":     atype,
+                    "emoji":    emoji,
+                    "title":    f"{ticker} {title}",
+                    "message":  message,
+                    "color":    color,
+                    "ticker":   ticker,
+                    "price":    close,
+                    "score":    round(score, 3),
+                    "signal":   signal,
+                    "strength": strength,
+                    "ts":       int(now * 1000),
+                }
+                with self._lock:
+                    self.alert_history.appendleft(alert)
+
+                if self._broadcast_cb:
+                    # BUG-02 FIX: broadcaster.publish is async def — calling it
+                    # synchronously returns a coroutine that is never awaited,
+                    # silently dropping every alert. Use run_coroutine_threadsafe
+                    # exactly as WSEngine._broadcast() does.
+                    try:
+                        if self._loop and not self._loop.is_closed():
+                            coro   = self._broadcast_cb({"type": "alert", "data": alert})
+                            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+                            future.add_done_callback(
+                                lambda f: f.exception() if not f.cancelled() else None
+                            )
+                        else:
+                            # Fallback: loop not available (unit tests / Streamlit mode)
+                            logger.debug("Alert broadcast: no event loop — alert stored in history only")
+                    except Exception as exc:
+                        logger.warning(f"Alert broadcast error: {exc}")
+
+                logger.info(f"ALERT {emoji} {atype} {ticker} @ ${close:.2f}")
+
+            self._prev[ticker] = {
+                "vwap_pos":   vwap_pos,
+                "trend":      trend,
+                "vol_ratio":  vol_ratio,
+                "signal":     signal,
+                "strength":   strength,
+                "close":      close,
+                "support":    support,
+                "resistance": resistance,
+            }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

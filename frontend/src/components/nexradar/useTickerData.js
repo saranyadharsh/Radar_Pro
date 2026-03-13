@@ -195,6 +195,59 @@ export function useTickerData() {
             tickerCacheDirtyRef.current = true;
             return;
           }
+          if (msg.type === 'alert') {
+            window.dispatchEvent(new CustomEvent('nexradar_alert', { detail: msg.data }));
+            if (msg.data) {
+              const a = msg.data;
+              _pushNotif({
+                type:   a.type,
+                icon:   a.emoji,
+                color:  a.color === 'green' ? '#00e676'
+                       : a.color === 'red'  ? '#ff3d5a'
+                       : a.color === 'gold' ? '#ffc400'
+                       : a.color === 'cyan' ? '#00d4ff'
+                       : '#8ba3b8',
+                ticker: a.ticker,
+                title:  a.title,
+                sub:    a.message,
+              });
+            }
+            return;
+          }
+          if (msg.type === 'halt_alert') {
+            // Dispatch to window so PageLiveTable / any subscriber can react
+            window.dispatchEvent(new CustomEvent('nexradar_halt', { detail: msg }));
+            // Push to bell panel
+            const isHalted = msg.is_halted;
+            // BUG-12 FIX: prefix type with 'luld_' so cooldown key is
+            // 'AAPL_luld_halt' not 'AAPL_halt' — prevents collision with any
+            // ticker whose symbol is literally 'HALT' or 'RESUME'.
+            if (isHalted) {
+              _pushNotif({
+                type:   'luld_halt',
+                icon:   '⛔',
+                color:  '#ff3d5a',
+                ticker: msg.ticker,
+                title:  `${msg.ticker} TRADING HALT`,
+                sub:    msg.label || 'LULD volatility halt',
+              });
+            } else {
+              _pushNotif({
+                type:   'luld_resume',
+                icon:   '✅',
+                color:  '#00e676',
+                ticker: msg.ticker,
+                title:  `${msg.ticker} TRADING RESUMED`,
+                sub:    'LULD halt lifted — trading active',
+              });
+            }
+            return;
+          }
+          if (msg.type === 'noi_update') {
+            // Dispatch for NOI imbalance meter (informational, no bell)
+            window.dispatchEvent(new CustomEvent('nexradar_noi', { detail: msg }));
+            return;
+          }
           if (msg.type === 'control') return;
         } catch (err) {
           console.debug('[NexRadar] SSE parse error:', err);
@@ -212,11 +265,22 @@ export function useTickerData() {
 
     connectSSE();
 
-    // Midnight reset
+    // Midnight reset — fires at 09:30 ET to flush stale overnight data.
+    // BUG-14 FIX: Was using browser local time (next.setHours(9,30)) which fires at
+    // 09:30 Mountain = 11:30 ET for Denver users — 2hrs late into market session.
+    // Fix: compute ET time explicitly via toLocaleString, identical to the
+    // market-open heartbeat pattern already used above in this same file.
     const scheduleMidnight = () => {
-      const now  = new Date(), next = new Date(now);
-      next.setHours(9, 30, 0, 0);
-      if (next <= now) next.setDate(next.getDate() + 1);
+      const nowUtc  = new Date();
+      // Build an ET "clock" without relying on the browser's local timezone
+      const etNow   = new Date(nowUtc.toLocaleString("en-US", { timeZone: "America/New_York" }));
+      const etNext  = new Date(etNow);
+      etNext.setHours(9, 30, 0, 0);          // 09:30:00.000 ET
+      if (etNext <= etNow) etNext.setDate(etNext.getDate() + 1);   // already past → tomorrow
+      // Convert the ET target back to UTC ms for setTimeout
+      const etOffsetMs  = nowUtc.getTime() - etNow.getTime();       // UTC - ET = offset
+      const fireAtUtcMs = etNext.getTime() + etOffsetMs;
+      const msUntil     = fireAtUtcMs - nowUtc.getTime();
       midnightTimerRef.current = setTimeout(() => {
         if (cancelled) return;
         tickerCacheRef.current      = new Map();
@@ -224,7 +288,7 @@ export function useTickerData() {
         setTickers(new Map());
         fetchSnapshot();
         scheduleMidnight();
-      }, next - now);
+      }, Math.max(msUntil, 1000));            // safety floor: never fire < 1s from now
     };
     scheduleMidnight();
 

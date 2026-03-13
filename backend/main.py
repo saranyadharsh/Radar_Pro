@@ -40,7 +40,7 @@ from typing import AsyncGenerator, Set
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request  # BUG-01 FIX: HTTPException at module level
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -163,9 +163,31 @@ async def lifespan(app: FastAPI):
     logger.info("✅ WSEngine started")
     app.state.engine = engine
 
+    # Feature #1 — Smart Alerts Engine
+    try:
+        from backend.Scalping_Signal import SmartAlertsEngine
+    except ModuleNotFoundError:
+        from Scalping_Signal import SmartAlertsEngine
+    _ae = SmartAlertsEngine(engine=engine._signal_watcher, broadcast_cb=broadcaster.publish, loop=loop)  # BUG-02 FIX: pass loop
+    try:
+        _ae_rows = db.get_signal_watchlist()
+        _ae.set_watchlist([r["ticker"] for r in _ae_rows if r.get("ticker")])
+    except Exception:
+        pass
+    _ae.start()
+    app.state.alerts_engine = _ae
+    logger.info("✅ SmartAlertsEngine started")
+
     yield
 
     logger.info("🛑 Shutting down …")
+    # BUG-03 FIX: Stop SmartAlertsEngine BEFORE WSEngine so poll thread
+    # doesn't access signal_watcher after it's torn down.
+    try:
+        app.state.alerts_engine.stop()
+        logger.info("SmartAlertsEngine stopped.")
+    except Exception:
+        pass
     engine.shutdown()
     logger.info("Shutdown complete.")
 
@@ -369,15 +391,28 @@ class WatchlistBody(BaseModel):
     ticker: str
 
 
-def _refresh_signal_watcher():
-    """Push updated watchlist from Supabase to WSEngine (replaces pub/sub)."""
+async def _refresh_signal_watcher():
+    """Push updated watchlist to WSEngine signal watcher + SmartAlertsEngine.
+    BUG-06 FIX: Made async; Supabase call offloaded to thread pool via to_thread().
+    Was: synchronous db call blocked the event loop for 50-200ms per watchlist edit,
+    stalling ALL SSE clients. Now: non-blocking, event loop stays responsive.
+    """
     try:
         engine = app.state.engine
         if engine and engine._signal_watcher:
-            rows = db.get_signal_watchlist()
-            engine._signal_watcher.set_watchlist(
-                [r["ticker"] for r in rows if r.get("ticker")]
-            )
+            rows    = await asyncio.to_thread(db.get_signal_watchlist)
+            tickers = [r["ticker"] for r in rows if r.get("ticker")]
+            engine._signal_watcher.set_watchlist(tickers)
+            # Keep AH close refresh scoped to watchlist (BUG-07 companion fix)
+            try:
+                engine.set_watchlist_tickers(tickers)
+            except AttributeError:
+                pass
+            # Also sync alerts engine
+            try:
+                app.state.alerts_engine.set_watchlist(tickers)
+            except AttributeError:
+                pass
     except Exception as e:
         logger.warning(f"_refresh_signal_watcher: {e}")
 
@@ -394,7 +429,7 @@ async def watchlist_add(body: WatchlistBody):
     try:
         ticker = body.ticker.upper().strip()
         await asyncio.to_thread(db.add_signal_watchlist, ticker)
-        _refresh_signal_watcher()
+        await _refresh_signal_watcher()  # BUG-06 FIX: await async version
         rows = await asyncio.to_thread(db.get_signal_watchlist)
         wl   = sorted([r["ticker"] for r in rows if r.get("ticker")])
         await broadcaster.publish({"type": "watchlist_update", "action": "add",
@@ -409,7 +444,7 @@ async def watchlist_remove(body: WatchlistBody):
     try:
         ticker = body.ticker.upper().strip()
         await asyncio.to_thread(db.remove_signal_watchlist, ticker)
-        _refresh_signal_watcher()
+        await _refresh_signal_watcher()  # BUG-06 FIX: await async version
         rows = await asyncio.to_thread(db.get_signal_watchlist)
         wl   = sorted([r["ticker"] for r in rows if r.get("ticker")])
         await broadcaster.publish({"type": "watchlist_update", "action": "remove",
@@ -470,7 +505,7 @@ async def get_market_monitor(refresh: int = Query(0)):
 # ── Scalp Analysis ─────────────────────────────────────────────────────────────
 @app.get("/api/scalp-analysis")
 async def get_scalp_analysis():
-    rows              = db.get_signal_watchlist()
+    rows              = await asyncio.to_thread(db.get_signal_watchlist)  # BUG-06 FIX
     watchlist_tickers = {r["ticker"] for r in rows if r.get("ticker")}
     if not watchlist_tickers:
         return {"data": [], "message": "No tickers in watchlist."}
@@ -510,7 +545,7 @@ async def get_opportunity_scanner():
     RS source: ws_engine._cache["SPY"]["percent_change"] — live Polygon tick,
     no extra network calls, no new data source.
     """
-    rows = db.get_signal_watchlist()
+    rows = await asyncio.to_thread(db.get_signal_watchlist)  # BUG-06 FIX
     watchlist_tickers = {r["ticker"] for r in rows if r.get("ticker")}
     if not watchlist_tickers:
         return {"data": [], "spy_pct": None, "message": "No tickers in watchlist."}
@@ -606,6 +641,50 @@ async def get_opportunity_scanner():
         "ticker_count": len(enriched),
         "generated_at": int(_time.time()),
     }
+
+
+# ── Feature #1: Smart Alerts ──────────────────────────────────────────────────
+@app.get("/api/alerts")
+async def get_alerts(limit: int = Query(50, ge=1, le=200)):
+    """Returns recent alerts from SmartAlertsEngine. Real-time via SSE type:alert."""
+    try:
+        ae = app.state.alerts_engine
+        return {
+            "data":         ae.get_recent_alerts(limit),
+            "count":        len(ae.alert_history),
+            "generated_at": int(time.time()),
+        }
+    except AttributeError:
+        return {"data": [], "count": 0, "message": "Alert engine not initialised"}
+
+
+# ── Feature #4: Multi-Timeframe Scanner ──────────────────────────────────────
+@app.get("/api/mtf-scanner")
+async def get_mtf_scanner():
+    """1m + 5m + 15m trend confluence scanner for watchlist symbols."""
+    try:
+        rows = await asyncio.to_thread(db.get_signal_watchlist)  # BUG-06 FIX
+        watchlist = [r["ticker"] for r in rows if r.get("ticker")]
+        if not watchlist:
+            return {"data": [], "message": "No watchlist symbols configured"}
+
+        eng  = app.state.engine
+        data = eng._signal_watcher.get_mtf_snapshot(watchlist) if eng and eng._signal_watcher else []
+
+        cache = eng._cache if eng else {}
+        spy_e = cache.get("SPY", {})
+        qqq_e = cache.get("QQQ", {})
+
+        return {
+            "data":         data,
+            "ticker_count": len(data),
+            "spy_pct":      spy_e.get("percent_change"),
+            "qqq_pct":      qqq_e.get("percent_change"),
+            "generated_at": int(time.time()),
+        }
+    except Exception as e:
+        logger.error(f"MTF scanner error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── Yahoo Finance Proxy — Quote ────────────────────────────────────────────────

@@ -9,7 +9,7 @@ import { fmt2, pct, fmtVol, normalizeSector } from "./utils.js";
 import { SectionHeader, SectorPills, TVChart, MatrixCell } from "./primitives.jsx";
 
 // ─── Memoized table row — skips re-render when visible data unchanged ─────────
-const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatchlist, subMode, gridCols, scalpSignals, setSelectedSymbol, T }) {
+const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatchlist, subMode, gridCols, scalpSignals, setSelectedSymbol, haltedTickers, noiBySym, T }) {
   // MH: use day-over-day change_value / percent_change
   // AH: use ah_dollar / ah_pct (live_price vs today_close)
   const ahDollar    = ticker.ah_dollar    ?? (ticker.today_close > 0 ? ticker.live_price - ticker.today_close : ticker.change_value) ?? 0;
@@ -18,8 +18,10 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
   const displayPct  = subMode === 'AH' ? ahPct    : (ticker.percent_change || 0);
   const isPositive  = displayChg >= 0;
   const changeColor = isPositive ? T.green : T.red;
+  const isHalted    = haltedTickers?.has(ticker.ticker) ?? ticker.is_halted ?? false;
+  const noi         = noiBySym?.[ticker.ticker] ?? null;
   return (
-    <div className="tr-hover" style={{ display:"grid", gridTemplateColumns:gridCols, borderBottom:`1px solid ${T.border}` }}>
+    <div className={`tr-hover${isHalted ? ' halt-row' : ''}`} style={{ display:"grid", gridTemplateColumns:gridCols, borderBottom:`1px solid ${T.border}` }}>
       {subMode === "MH" ? (
         <>
           <div style={{ padding:"10px 14px", display:"flex", alignItems:"flex-start", gap:10 }}>
@@ -31,6 +33,7 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
               <div onClick={() => setSelectedSymbol(s => s===ticker.ticker?null:ticker.ticker)} title="Click to view chart"
                 style={{ color:T.cyan, fontSize:13, fontFamily:T.font, fontWeight:700, textDecoration:"underline", textDecorationColor:T.cyan+"40", marginBottom:3, lineHeight:1.2, cursor:"pointer" }}>
                 {ticker.ticker}
+                {isHalted && <span className="halt-badge">⛔ HALT</span>}
               </div>
               <div style={{ color:T.text2, fontSize:10, fontFamily:T.font, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", maxWidth:"100%", lineHeight:1.3 }}>
                 {ticker.company_name && ticker.company_name !== ticker.ticker ? ticker.company_name : <span style={{ opacity:0.4 }}>—</span>}
@@ -56,6 +59,20 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
                     {sig.signal==="BUY"?"▲ BUY":sig.signal==="SELL"?"▼ SELL":"◈ HOLD"}
                   </span>
                   <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>{sig.strength} · {sig.prediction}%</span>
+                  {noi && noi.imbalance_side !== 'N' && (
+                    <div style={{ display:'flex', alignItems:'center', gap:4, marginTop:2 }}>
+                      <div className="noi-bar-wrap">
+                        <div className="noi-bar-fill" style={{
+                          background: noi.imbalance_side==='B' ? '#00e676' : '#ff3d5a',
+                          width: noi.imbalance_side==='B' ? '70%' : '30%',
+                          left: noi.imbalance_side==='B' ? '30%' : '0%',
+                        }}/>
+                      </div>
+                      <span style={{ color:noi.imbalance_side==='B'?'#00e676':'#ff3d5a', fontSize:8, fontWeight:700 }}>
+                        {noi.imbalance_side==='B'?'BUY IMBAL':'SELL IMBAL'}
+                      </span>
+                    </div>
+                  )}
                 </div>
               );
             })()}
@@ -71,6 +88,7 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
               <div onClick={() => setSelectedSymbol(s => s===ticker.ticker?null:ticker.ticker)} title="Click to view chart"
                 style={{ color:T.cyan, fontSize:13, fontFamily:T.font, fontWeight:700, textDecoration:"underline", textDecorationColor:T.cyan+"40", marginBottom:3, lineHeight:1.2, cursor:"pointer" }}>
                 {ticker.ticker}
+                {isHalted && <span className="halt-badge">⛔ HALT</span>}
               </div>
               <div style={{ color:T.text2, fontSize:10, fontFamily:T.font, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", maxWidth:"100%", lineHeight:1.3 }}>
                 {ticker.company_name && ticker.company_name !== ticker.ticker ? ticker.company_name : <span style={{ opacity:0.4 }}>—</span>}
@@ -96,7 +114,9 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
   prev.isWatched           === next.isWatched &&
   prev.subMode             === next.subMode &&
   prev.gridCols            === next.gridCols &&
-  prev.scalpSignals?.[prev.ticker.ticker]?.signal === next.scalpSignals?.[next.ticker.ticker]?.signal
+  prev.scalpSignals?.[prev.ticker.ticker]?.signal === next.scalpSignals?.[next.ticker.ticker]?.signal &&
+  prev.haltedTickers?.has(prev.ticker.ticker) === next.haltedTickers?.has(next.ticker.ticker) &&
+  (prev.noiBySym?.[prev.ticker.ticker]?.imbalance_side) === (next.noiBySym?.[next.ticker.ticker]?.imbalance_side)
 ));
 
 export default function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", wsWatchlistRef = null, quickFilter = null, onClearQuickFilter = null, wsStatus = 'connected', onLiveCount = null, watchlistProp = null, toggleWatchlistProp = null, T }) {
@@ -113,11 +133,20 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
   const [sortDir,      setSortDir]      = useState("desc");
   const [scalpSignals, setScalpSignals] = useState({});
   const [earningsTickers, setEarningsTickers] = useState(new Set());
+  const [haltedTickers,  setHaltedTickers]  = useState(new Set());
+  // BUG-10 FIX: noiBySym stored in ref, flushed to state at 500ms intervals.
+  // Old pattern: setNoiBySym(prev=>({...prev,[tk]:...})) created a full object
+  // copy on EVERY NOI SSE event — during auctions that's 10-50 events/sec,
+  // causing continuous React reconciles of all subscribed rows. New pattern:
+  // writes go to noiBySymRef (zero allocations), state flush every 500ms.
+  const [noiBySym,       setNoiBySym]        = useState({});
   const [subModeOverride, setSubModeOverride] = useState(null);
   const [matrixInterval,  setMatrixInterval]  = useState("5");
 
-  const tableScrollRef = useRef(null);
-  const tickerArrayRef = useRef([]);
+  const tableScrollRef  = useRef(null);
+  const tickerArrayRef  = useRef([]);
+  const noiBySymRef     = useRef({});   // BUG-10 FIX: raw mutable map, avoids spread copy on every NOI event
+  const noiFlushTimerRef = useRef(null);
   const ITEMS_PER_PAGE = 50;
 
   // Fallback local watchlist when not provided from root
@@ -158,6 +187,47 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
     poll();
     const id = setInterval(poll, 30_000);
     return () => clearInterval(id);
+  }, []);
+
+  // LULD halt tracking
+  useEffect(() => {
+    const handler = (e) => {
+      const { ticker, is_halted } = e.detail;
+      if (!ticker) return;
+      setHaltedTickers(prev => {
+        const next = new Set(prev);
+        if (is_halted) next.add(ticker);
+        else next.delete(ticker);
+        return next;
+      });
+    };
+    window.addEventListener('nexradar_halt', handler);
+    return () => window.removeEventListener('nexradar_halt', handler);
+  }, []);
+
+  // NOI imbalance tracking — BUG-10 FIX: write to ref, flush to state every 500ms.
+  // Eliminates the full-object spread ({...prev}) on every SSE event.
+  useEffect(() => {
+    const handler = (e) => {
+      const { ticker, imbalance_side, imbalance_size } = e.detail;
+      if (!ticker) return;
+      noiBySymRef.current[ticker] = { imbalance_side, imbalance_size };
+      // Schedule a flush if one isn't already pending
+      if (!noiFlushTimerRef.current) {
+        noiFlushTimerRef.current = setTimeout(() => {
+          noiFlushTimerRef.current = null;
+          setNoiBySym({ ...noiBySymRef.current });
+        }, 500);
+      }
+    };
+    window.addEventListener('nexradar_noi', handler);
+    return () => {
+      window.removeEventListener('nexradar_noi', handler);
+      if (noiFlushTimerRef.current) {
+        clearTimeout(noiFlushTimerRef.current);
+        noiFlushTimerRef.current = null;
+      }
+    };
   }, []);
 
   // Today's earnings tickers
@@ -353,7 +423,7 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
               {tickers.size===0&&wsStatus==='disconnected'&&<div style={{ padding:40, textAlign:"center", color:T.red, fontSize:13, fontFamily:T.font }}>❌ WebSocket disconnected — reconnecting</div>}
               {paginatedTickers.length===0&&tickers.size>0&&<div style={{ padding:40, textAlign:"center", color:T.text2, fontSize:13, fontFamily:T.font }}>No tickers match the current filter</div>}
               {paginatedTickers.map((ticker,i) => (
-                <LiveTableRow key={ticker.ticker||i} ticker={ticker} isWatched={watchlist.has(ticker.ticker)} toggleWatchlist={toggleWatchlist} subMode={subMode} gridCols={gridCols} scalpSignals={scalpSignals} setSelectedSymbol={setSelectedSymbol} T={T}/>
+                <LiveTableRow key={ticker.ticker||i} ticker={ticker} isWatched={watchlist.has(ticker.ticker)} toggleWatchlist={toggleWatchlist} subMode={subMode} gridCols={gridCols} scalpSignals={scalpSignals} setSelectedSymbol={setSelectedSymbol} haltedTickers={haltedTickers} noiBySym={noiBySym} T={T}/>
               ))}
               {paginatedTickers.length>=10&&<div style={{ position:"sticky", bottom:0, left:0, right:0, height:40, background:`linear-gradient(to bottom,transparent,${T.bg1})`, pointerEvents:"none" }}/>}
             </div>
