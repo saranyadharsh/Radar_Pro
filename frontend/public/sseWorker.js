@@ -59,6 +59,7 @@ const state = {
   ports:   new Set(),  // one MessagePort per connected tab
   feedOk:  null,       // last known feed_status.ok — replayed to new tab ports
   attempt: 0,          // reconnect backoff counter
+  apiBase: '',         // set once by the first tab — absolute URL e.g. https://api.nexradar.info
 }
 
 // HOP-2: explicit backoff table — no surprise long waits from 2**n formulas
@@ -94,9 +95,17 @@ function broadcast(msg) {
 // ── SSE connect ───────────────────────────────────────────────────────────────
 
 function connect() {
+  if (!state.apiBase) {
+    // apiBase not set yet — wait for first tab to send it via 'set_api_base'
+    console.warn('[sseWorker] connect() called before apiBase set — deferring')
+    return
+  }
   // HOP-3-C: include client_ts — backend returns lightweight "reconnected" ack
   // (30 bytes) instead of full 3MB snapshot when worker cache is fresh.
-  const url = `/api/stream?client_ts=${state.snapTs}`
+  // CRITICAL: use absolute URL — worker origin is nexradar.info (frontend),
+  // but the API lives at api.nexradar.info. A relative /api/stream would hit
+  // the static file server and fail. apiBase is passed by the first tab.
+  const url = `${state.apiBase}/api/stream?client_ts=${state.snapTs}`
   state.es  = new EventSource(url)
 
   state.es.onopen = () => {
@@ -212,14 +221,24 @@ self.onconnect = (e) => {
         port.postMessage({ type: 'feed_status', ok: state.feedOk })
       }
     }
+
+    // Tab sends its API base URL on first connect so the worker can open
+    // an absolute EventSource URL. Without this the worker uses a relative
+    // URL (/api/stream) which resolves to the FRONTEND origin (nexradar.info)
+    // instead of the API origin (api.nexradar.info) — causing immediate 404.
+    if (event.data?.type === 'set_api_base' && event.data.base && !state.apiBase) {
+      state.apiBase = event.data.base.replace(/\/$/, '') // strip trailing slash
+      console.log(`[sseWorker] apiBase set to: ${state.apiBase}`)
+      // Now safe to open the SSE connection
+      if (!state.es && !backoffTimer) {
+        connect()
+      }
+    }
   }
 
   port.onmessageerror = () => state.ports.delete(port)
   port.start()
 
-  // Start the SSE connection only on the very first tab connect.
-  // Subsequent tabs reuse the same EventSource via broadcast fan-out.
-  if (!state.es && !backoffTimer) {
-    connect()
-  }
+  // Connection is started when the first tab sends { type: 'set_api_base', base: '...' }.
+  // Subsequent tabs reuse the same EventSource — no reconnect needed.
 }

@@ -308,14 +308,72 @@ async def lifespan(app: FastAPI):
     # v6.3-2 HYBRID WARM-UP: seed today's 1-min bars from Polygon REST so every
     # watchlist ticker's IndicatorCalculator has 27+ bars immediately on startup.
     # Without this, RSI/EMA/BB are unavailable for 27 min after a mid-session restart.
-    # seed_history_from_rest() runs in a background thread — startup is not blocked.
+    #
+    # ROOT CAUSE FIX: seed_history_from_rest() lives on SignalWatchlistManager,
+    # but engine._signal_watcher is a ScalpingSignalEngine. We call the seed
+    # function directly using urllib.request + Polygon REST, feeding bars into
+    # engine._signal_watcher.process_aggregate_bar() which ScalpingSignalEngine
+    # already exposes. Runs in a background thread — startup is not blocked.
     try:
         _api_key = engine._api_key
-        if _api_key and engine._signal_watcher:
-            logger.info("v6.3: Seeding indicator history from Polygon REST (background)…")
-            engine._signal_watcher.seed_history_from_rest(_api_key)
+        _sw      = engine._signal_watcher   # ScalpingSignalEngine instance
+        if _api_key and _sw:
+            import threading as _threading
+            import urllib.request as _urllib
+            import json as _json
+            import pytz as _pytz
+            from datetime import datetime as _dt
+
+            try:
+                from backend.Scalping_Signal import OHLCVBar
+            except ModuleNotFoundError:
+                from Scalping_Signal import OHLCVBar
+
+            def _seed_on_startup():
+                try:
+                    et_tz   = _pytz.timezone("America/New_York")
+                    today   = _dt.now(et_tz).strftime("%Y-%m-%d")
+                    targets = list(_sw._watched) if hasattr(_sw, "_watched") else []
+                    if not targets:
+                        # Fallback: read watchlist from DB directly
+                        _rows   = db.get_signal_watchlist()
+                        targets = [r["ticker"] for r in _rows if r.get("ticker")]
+                    if not targets:
+                        logger.info("Startup seed: watchlist empty — skipping")
+                        return
+                    logger.info(f"v6.3: Seeding {len(targets)} tickers from Polygon REST…")
+                    seeded = 0
+                    for sym in targets:
+                        try:
+                            url = (
+                                f"https://api.polygon.io/v2/aggs/ticker/{sym}"
+                                f"/range/1/minute/{today}/{today}"
+                                f"?adjusted=true&sort=asc&limit=390&apiKey={_api_key}"
+                            )
+                            with _urllib.urlopen(url, timeout=10) as _resp:
+                                _data = _json.loads(_resp.read().decode())
+                            for r in _data.get("results", []):
+                                ts  = _dt.fromtimestamp(r["t"] / 1000.0, tz=et_tz)
+                                bar = OHLCVBar(
+                                    timestamp = ts,
+                                    open      = float(r.get("o", 0)),
+                                    high      = float(r.get("h", 0)),
+                                    low       = float(r.get("l", 0)),
+                                    close     = float(r.get("c", 0)),
+                                    volume    = float(r.get("v", 0)),
+                                )
+                                if bar.close > 0:
+                                    _sw.process_aggregate_bar(sym, bar)
+                            seeded += 1
+                        except Exception as _e:
+                            logger.debug(f"Startup seed {sym}: {_e}")
+                    logger.info(f"v6.3: Seeded {seeded}/{len(targets)} watchlist tickers")
+                except Exception as _e:
+                    logger.error(f"Startup seed thread error: {_e}")
+
+            _threading.Thread(target=_seed_on_startup, daemon=True, name="StartupSeed").start()
     except Exception as _e:
-        logger.warning(f"seed_history_from_rest on startup failed: {_e}")
+        logger.warning(f"Startup seed setup failed: {_e}")
 
     yield
 
@@ -645,14 +703,56 @@ async def watchlist_add(body: WatchlistBody):
         await _refresh_signal_watcher()
         # v6.3-2 HYBRID WARM-UP: seed the newly-added ticker immediately so
         # its tech indicators are available within seconds, not 27 minutes.
+        # Uses process_aggregate_bar on ScalpingSignalEngine directly —
+        # seed_history_from_rest lives on SignalWatchlistManager, not here.
         try:
             _eng = getattr(app.state, "engine", None)
-            if _eng and getattr(_eng, "_api_key", None) and _eng._signal_watcher:
-                _eng._signal_watcher.seed_history_from_rest(
-                    _eng._api_key, symbols=[ticker]
-                )
+            _sw  = _eng._signal_watcher if _eng else None
+            _key = getattr(_eng, "_api_key", None)
+            if _sw and _key:
+                import threading as _t2
+                import urllib.request as _ur2
+                import json as _j2
+                import pytz as _tz2
+                from datetime import datetime as _dt2
+
+                try:
+                    from backend.Scalping_Signal import OHLCVBar as _Bar
+                except ModuleNotFoundError:
+                    from Scalping_Signal import OHLCVBar as _Bar
+
+                def _seed_ticker(_sym=ticker, _sw=_sw, _key=_key):
+                    try:
+                        et  = _tz2.timezone("America/New_York")
+                        day = _dt2.now(et).strftime("%Y-%m-%d")
+                        url = (
+                            f"https://api.polygon.io/v2/aggs/ticker/{_sym}"
+                            f"/range/1/minute/{day}/{day}"
+                            f"?adjusted=true&sort=asc&limit=390&apiKey={_key}"
+                        )
+                        with _ur2.urlopen(url, timeout=10) as r:
+                            data = _j2.loads(r.read().decode())
+                        count = 0
+                        for rb in data.get("results", []):
+                            ts  = _dt2.fromtimestamp(rb["t"] / 1000.0, tz=et)
+                            bar = _Bar(
+                                timestamp=ts,
+                                open=float(rb.get("o", 0)),
+                                high=float(rb.get("h", 0)),
+                                low=float(rb.get("l", 0)),
+                                close=float(rb.get("c", 0)),
+                                volume=float(rb.get("v", 0)),
+                            )
+                            if bar.close > 0:
+                                _sw.process_aggregate_bar(_sym, bar)
+                                count += 1
+                        logger.info(f"watchlist_add seed: {_sym} {count} bars")
+                    except Exception as e:
+                        logger.debug(f"watchlist_add seed {_sym}: {e}")
+
+                _t2.Thread(target=_seed_ticker, daemon=True, name=f"Seed-{ticker}").start()
         except Exception as _e:
-            logger.warning(f"watchlist_add seed failed for {ticker}: {_e}")
+            logger.debug(f"watchlist_add seed setup: {_e}")
         rows = await asyncio.to_thread(db.get_signal_watchlist)
         wl   = sorted([r["ticker"] for r in rows if r.get("ticker")])
         await broadcaster.publish({

@@ -333,10 +333,10 @@ export function useTickerData() {
         connectDirect()
       }
 
-      // 1. Tell the worker our API base (no-op if worker already knows it,
-      //    but harmless — worker ignores unknown message types)
-      // 2. Request current in-worker cache → worker replies with type="snapshot"
-      //    which handleMsg processes exactly like a real SSE snapshot
+      // CRITICAL: send API_BASE first so the worker can build an absolute URL.
+      // Without this the worker has no URL, never opens EventSource, stays pending.
+      // Must be sent BEFORE get_snapshot so the connection is open when cache is requested.
+      worker.port.postMessage({ type: 'set_api_base', base: API_BASE })
       worker.port.postMessage('get_snapshot')
       worker.port.start()
     }
