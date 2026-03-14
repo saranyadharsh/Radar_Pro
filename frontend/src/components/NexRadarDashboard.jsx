@@ -145,29 +145,44 @@ function NexRadarDashboard({
     const sse = sseRef?.current;
     if (!sse) return;
 
-    const handleMessage = (e) => {
-      try {
-        const payload = JSON.parse(e.data);
-
-        if (payload.type === 'watchlist_snapshot' && Array.isArray(payload.watchlist)) {
-          setSideWatchlist(payload.watchlist.length);
-        } else if (payload.type === 'watchlist_update' && Array.isArray(payload.watchlist)) {
-          setSideWatchlist(payload.watchlist.length);
-        } else if (payload.type === 'signal_snapshot' && Array.isArray(payload.data)) {
-          const m = {};
-          payload.data.forEach(r => { if (!r.status || r.status === 'ok') m[r.ticker] = r; });
-          setSideScalpSignals(m);
-        } else if (payload.type === 'signal_alert' && payload.data) {
-          const r = payload.data;
-          if (!r.status || r.status === 'ok') {
-            setSideScalpSignals(prev => ({ ...prev, [r.ticker]: r }));
-          }
+    const handlePayload = (payload) => {
+      if (!payload || typeof payload !== 'object') return;
+      if (payload.type === 'watchlist_snapshot' && Array.isArray(payload.watchlist)) {
+        setSideWatchlist(payload.watchlist.length);
+      } else if (payload.type === 'watchlist_update' && Array.isArray(payload.watchlist)) {
+        setSideWatchlist(payload.watchlist.length);
+      } else if (payload.type === 'signal_snapshot' && Array.isArray(payload.data)) {
+        const m = {};
+        payload.data.forEach(r => { if (!r.status || r.status === 'ok') m[r.ticker] = r; });
+        setSideScalpSignals(m);
+      } else if (payload.type === 'signal_alert' && payload.data) {
+        const r = payload.data;
+        if (!r.status || r.status === 'ok') {
+          setSideScalpSignals(prev => ({ ...prev, [r.ticker]: r }));
         }
-      } catch {}
+      }
     };
 
-    sse.addEventListener('message', handleMessage);
-    return () => sse.removeEventListener('message', handleMessage);
+    let cleanup = () => {};
+
+    if (sse instanceof SharedWorker) {
+      // SharedWorker: messages arrive as pre-parsed objects on port.onmessage
+      const prevHandler = sse.port.onmessage;
+      sse.port.onmessage = (e) => {
+        if (prevHandler) prevHandler(e);
+        handlePayload(e.data);
+      };
+      cleanup = () => { if (sse.port) sse.port.onmessage = prevHandler; };
+    } else if (typeof sse.addEventListener === 'function') {
+      // Direct EventSource fallback: messages arrive as raw strings
+      const handleMessage = (e) => {
+        try { handlePayload(JSON.parse(e.data)); } catch {}
+      };
+      sse.addEventListener('message', handleMessage);
+      cleanup = () => sse.removeEventListener('message', handleMessage);
+    }
+
+    return cleanup;
   }, [sseRef]);
   const sideSignalCount = useMemo(() =>
     Object.values(sideScalpSignals).filter(r => r.signal === 'BUY' || r.signal === 'SELL').length,
