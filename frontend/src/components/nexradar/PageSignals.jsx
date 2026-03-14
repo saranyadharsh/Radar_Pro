@@ -178,30 +178,52 @@ export default function PageSignals({
     // Cold-start: one REST call while SSE buffer populates
     fetchProData();
 
-    // SSE listener: no polling — server pushes on signal events
     const sse = sseRef?.current;
     if(!sse) return;
 
-    const handleMessage = (e) => {
-      try {
-        const payload = JSON.parse(e.data);
-        if(payload.type === 'signal_snapshot' && Array.isArray(payload.data)){
-          setProData(payload.data);
-          setProLoading(false);
-        } else if(payload.type === 'signal_alert' && payload.data){
-          setProData(prev => {
-            const alert = payload.data;
-            const deduped = prev.filter(r =>
-              !(r.ticker === alert.ticker && r.created_at === alert.created_at)
-            );
-            return [alert, ...deduped].slice(0, 200);
-          });
-        }
-      } catch {}
+    // Handle both SharedWorker (port.onmessage — pre-parsed objects)
+    // and direct EventSource (addEventListener — raw strings via e.data).
+    // SharedWorker: sseRef.current = SharedWorker instance → use port.onmessage
+    // EventSource:  sseRef.current = EventSource instance  → use addEventListener
+    const handlePayload = (payload) => {
+      if(!payload || typeof payload !== 'object') return;
+      if(payload.type === 'signal_snapshot' && Array.isArray(payload.data)){
+        setProData(payload.data);
+        setProLoading(false);
+      } else if(payload.type === 'signal_alert' && payload.data){
+        setProData(prev => {
+          const alert = payload.data;
+          const deduped = prev.filter(r =>
+            !(r.ticker === alert.ticker && r.created_at === alert.created_at)
+          );
+          return [alert, ...deduped].slice(0, 200);
+        });
+      }
     };
 
-    sse.addEventListener('message', handleMessage);
-    return () => sse.removeEventListener('message', handleMessage);
+    let cleanup = () => {};
+
+    if(sse instanceof SharedWorker) {
+      // SharedWorker path — messages arrive as pre-parsed objects on port
+      const prevHandler = sse.port.onmessage;
+      sse.port.onmessage = (e) => {
+        if(prevHandler) prevHandler(e);   // preserve existing handler chain
+        handlePayload(e.data);
+      };
+      cleanup = () => {
+        // Restore previous handler on cleanup
+        if(sse.port) sse.port.onmessage = prevHandler;
+      };
+    } else if(typeof sse.addEventListener === 'function') {
+      // Direct EventSource fallback — messages arrive as raw strings
+      const handleMessage = (e) => {
+        try { handlePayload(JSON.parse(e.data)); } catch {}
+      };
+      sse.addEventListener('message', handleMessage);
+      cleanup = () => sse.removeEventListener('message', handleMessage);
+    }
+
+    return cleanup;
   },[signalView, fetchProData, sseRef]);
 
   const [techSortKey, setTechSortKey] = useState('score');

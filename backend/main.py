@@ -852,6 +852,18 @@ async def get_scalp_analysis():
             )
             ok_rows = [r for r in scalp_rows
                        if not r.get("status") or r.get("status") == "ok"]
+
+            # If engine has no bars yet (weekend / just started / pre-market),
+            # get_scalp_snapshot returns [] because _calcs is empty.
+            # Return warming_up rows so the frontend shows ENGINE WARMING UP
+            # instead of the misleading NO WATCHLIST TICKERS empty state.
+            if not scalp_rows:
+                warming_rows = [{"ticker": t, "status": "warming_up", "bars_count": 0}
+                                for t in sorted(watchlist_tickers)]
+                return {"data": warming_rows, "ticker_count": len(warming_rows),
+                        "ok_count": 0, "warming_count": len(warming_rows),
+                        "message": "Signal engine seeding — bars accumulating."}
+
             return {"data": scalp_rows, "ticker_count": len(scalp_rows),
                     "ok_count": len(ok_rows),
                     "warming_count": max(0, len(watchlist_tickers) - len(scalp_rows))}
