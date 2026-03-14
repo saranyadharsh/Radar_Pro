@@ -152,7 +152,7 @@ export default function PageSignals({
   tickers=new Map(), selectedSectors=['ALL'],
   techData=[], techLoading=false, techError=null,
   techLastFetch=null, techCached=false, techDataAge=0,
-  onForceFetch=()=>{}, T,
+  onForceFetch=()=>{}, sseRef=null, T,
 }) {
   const [signalView, setSignalView] = useState('SIGNALS');
   const [proData,    setProData]    = useState([]);
@@ -161,9 +161,9 @@ export default function PageSignals({
   const [proFilter,  setProFilter]  = useState('ALL');
   const [proSort,    setProSort]    = useState('confidence');
   const [proSortAsc, setProSortAsc] = useState(false);
-  const proIntervalRef = useRef(null);
-
   const fetchProData = useCallback(()=>{
+    // One-shot REST fetch — cold-start fallback only.
+    // During normal operation, data arrives via SSE signal_snapshot / signal_alert.
     setProLoading(true); setProError(null);
     fetch(`${API_BASE}/api/scalp-analysis`)
       .then(r=>{ if(!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
@@ -173,14 +173,36 @@ export default function PageSignals({
   },[]);
 
   useEffect(()=>{
-    if(signalView==='SIGNALS'){
-      fetchProData();
-      proIntervalRef.current=setInterval(fetchProData,30_000);
-    } else {
-      clearInterval(proIntervalRef.current);
-    }
-    return ()=>clearInterval(proIntervalRef.current);
-  },[signalView,fetchProData]);
+    if(signalView!=='SIGNALS') return;
+
+    // Cold-start: one REST call while SSE buffer populates
+    fetchProData();
+
+    // SSE listener: no polling — server pushes on signal events
+    const sse = sseRef?.current;
+    if(!sse) return;
+
+    const handleMessage = (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        if(payload.type === 'signal_snapshot' && Array.isArray(payload.data)){
+          setProData(payload.data);
+          setProLoading(false);
+        } else if(payload.type === 'signal_alert' && payload.data){
+          setProData(prev => {
+            const alert = payload.data;
+            const deduped = prev.filter(r =>
+              !(r.ticker === alert.ticker && r.created_at === alert.created_at)
+            );
+            return [alert, ...deduped].slice(0, 200);
+          });
+        }
+      } catch {}
+    };
+
+    sse.addEventListener('message', handleMessage);
+    return () => sse.removeEventListener('message', handleMessage);
+  },[signalView, fetchProData, sseRef]);
 
   const [techSortKey, setTechSortKey] = useState('score');
   const [techSortAsc, setTechSortAsc] = useState(false);

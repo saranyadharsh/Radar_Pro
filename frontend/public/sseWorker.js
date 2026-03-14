@@ -1,0 +1,225 @@
+/**
+ * sseWorker.js — NexRadar Pro  SharedWorker  (Fix-4 + HOP fixes)
+ * ================================================================
+ * One JS thread shared across ALL tabs of the same origin.
+ * Holds the single EventSource connection permanently.
+ *
+ * Lifecycle:
+ *   - Created when the FIRST tab opens nexradar.info
+ *   - Survives: tab switches, page refreshes, navigation between pages
+ *   - Terminated: only when ALL tabs are closed simultaneously
+ *
+ * Why this fixes the network hikes:
+ *   Before: EventSource lived inside a React component. Every tab switch /
+ *   page refresh / navigation = component unmount = SSE disconnect = backend
+ *   fires full 3 MB snapshot on reconnect = CPU spike = queue fills = spiral.
+ *
+ *   After: EventSource lives here, never in React. Tab switches are invisible
+ *   to the backend. Refresh = new tab connects to same worker via new port,
+ *   requests current cache from memory — zero network round-trip.
+ *
+ * Message protocol (worker → page):
+ *   { type: "snapshot",            data: [...] }   — full state on first connect
+ *   { type: "snapshot_delta",      data: [...] }   — only changed rows (FIX-2)
+ *   { type: "tick_batch",          data: [...] }   — 250ms coalesced ticks
+ *   { type: "tick",                ticker, data }  — single tick
+ *   { type: "feed_status",         ok: bool }      — Polygon WS up/down (FIX-5)
+ *   { type: "session_change",      session: str }  — MH/AH boundary (FIX-3)
+ *   { type: "portfolio_update",    data: [...] }
+ *   { type: "watchlist_update",    ... }
+ *   { type: "watchlist_snapshot",  watchlist: [...] }
+ *   { type: "signal_snapshot",     data: [...] }
+ *   { type: "alert",               data: {...} }
+ *   { type: "halt_alert",          ... }
+ *   { type: "noi_update",          ... }
+ *   { type: "reconnected" }                        — client_ts handshake ack
+ *   { type: "keepalive" }                          — SSE comment, ignored by pages
+ *
+ * Message protocol (page → worker):
+ *   "get_snapshot"   — page just mounted, wants current cache immediately
+ *
+ * HOP FIXES APPLIED:
+ *   HOP-1b  JSON.parse runs here in the worker thread — pages receive
+ *           pre-parsed objects, never raw strings. Zero parse cost on main thread.
+ *   HOP-2   Exponential backoff reconnect: 1s→2s→4s→8s→30s cap.
+ *           Native EventSource auto-reconnect replaced with manual control so
+ *           client_ts is always fresh on each attempt (not stale from original URL).
+ *   HOP-2   Watchdog: if no message in 25s, force reconnect. Catches silent TCP
+ *           drops that EventSource onerror misses on some proxies/load balancers.
+ *   HOP-3-C client_ts passed on every reconnect — backend skips the 3MB snapshot
+ *           if worker cache is <10s old, returning a lightweight "reconnected" ack.
+ */
+
+'use strict'
+
+const state = {
+  es:      null,       // EventSource instance — one for the whole browser session
+  cache:   {},         // ticker → latest row (always current, all msg types merged)
+  snapTs:  0,          // ts of last snapshot/delta — used for client_ts handshake
+  ports:   new Set(),  // one MessagePort per connected tab
+  feedOk:  null,       // last known feed_status.ok — replayed to new tab ports
+  attempt: 0,          // reconnect backoff counter
+}
+
+// HOP-2: explicit backoff table — no surprise long waits from 2**n formulas
+const BACKOFF_MS  = [1000, 2000, 4000, 8000, 30_000]
+const WATCHDOG_MS = 25_000
+
+let backoffTimer  = null
+let watchdogTimer = null
+
+// ── Watchdog ──────────────────────────────────────────────────────────────────
+// Catches silent TCP drops: connections where the socket is technically open
+// but no bytes are flowing (happens behind some Nginx/Cloudflare configurations).
+
+function resetWatchdog() {
+  if (watchdogTimer) clearTimeout(watchdogTimer)
+  watchdogTimer = setTimeout(() => {
+    console.warn('[sseWorker] No SSE message in 25s — forcing reconnect')
+    reconnect()
+  }, WATCHDOG_MS)
+}
+
+// ── Broadcast to all connected tab ports ──────────────────────────────────────
+
+function broadcast(msg) {
+  const dead = []
+  state.ports.forEach(port => {
+    try   { port.postMessage(msg) }
+    catch { dead.push(port) }   // tab closed — port throws on postMessage
+  })
+  dead.forEach(p => state.ports.delete(p))
+}
+
+// ── SSE connect ───────────────────────────────────────────────────────────────
+
+function connect() {
+  // HOP-3-C: include client_ts — backend returns lightweight "reconnected" ack
+  // (30 bytes) instead of full 3MB snapshot when worker cache is fresh.
+  const url = `/api/stream?client_ts=${state.snapTs}`
+  state.es  = new EventSource(url)
+
+  state.es.onopen = () => {
+    state.attempt = 0  // clean connect — reset backoff counter
+    resetWatchdog()
+  }
+
+  state.es.onmessage = (e) => {
+    // HOP-1b: JSON.parse here in worker thread — tabs receive pre-parsed objects.
+    // This is the single biggest win for main-thread responsiveness: parsing
+    // 6200-row snapshots (~40ms) no longer blocks React rendering.
+    let msg
+    try   { msg = JSON.parse(e.data) }
+    catch { return }
+
+    resetWatchdog()  // any message resets the dead-connection watchdog
+
+    // ── Update worker-side cache ──────────────────────────────────────────
+    // Cache is kept current so new/refreshed tabs get instant data via get_snapshot
+    // without any network round-trip.
+
+    if (msg.type === 'snapshot') {
+      // Full state replace — sent only on true first connect or stale reconnect
+      state.cache  = {}
+      ;(msg.data ?? []).forEach(row => { if (row?.ticker) state.cache[row.ticker] = row })
+      state.snapTs = msg.ts ?? Date.now()
+    }
+    else if (msg.type === 'snapshot_delta') {
+      // Only changed rows — merge into existing cache (ws_engine FIX-2)
+      // At market-hours peak: 200-400 rows every 2s instead of 6200
+      ;(msg.data ?? []).forEach(row => { if (row?.ticker) state.cache[row.ticker] = row })
+      state.snapTs = msg.ts ?? Date.now()
+    }
+    else if (msg.type === 'tick_batch') {
+      // 250ms coalesced ticks — merge into cache
+      ;(msg.data ?? []).forEach(row => { if (row?.ticker) state.cache[row.ticker] = row })
+    }
+    else if (msg.type === 'tick') {
+      // Single tick (legacy path)
+      if (msg.ticker && msg.data) state.cache[msg.ticker] = msg.data
+    }
+    else if (msg.type === 'feed_status') {
+      state.feedOk = msg.ok
+      // Fall through to broadcast — pages need this to update wsStatus indicator
+    }
+    else if (msg.type === 'reconnected') {
+      state.attempt = 0
+      // Fall through to broadcast — pages need to clear "reconnecting" banner
+    }
+    else if (msg.type === 'keepalive') {
+      // SSE comment heartbeat — watchdog already reset above, nothing to fan out
+      return
+    }
+
+    // Fan out every message to all connected tab ports as a pre-parsed object
+    broadcast(msg)
+  }
+
+  state.es.onerror = () => {
+    // HOP-2: take manual control of reconnect so we can pass fresh client_ts.
+    // Native EventSource auto-reconnect reuses the original URL — the client_ts
+    // would be stale, defeating the handshake and forcing a full 3MB snapshot.
+    state.es.close()
+    state.es = null
+    reconnect()
+  }
+}
+
+// ── Reconnect with exponential backoff ────────────────────────────────────────
+
+function reconnect() {
+  if (backoffTimer)  clearTimeout(backoffTimer)
+  if (watchdogTimer) clearTimeout(watchdogTimer)
+  if (state.es)      { state.es.close(); state.es = null }
+
+  // Notify all tabs that feed is down so UI can show reconnecting banner
+  broadcast({ type: 'feed_status', ok: false, reason: 'sse_reconnecting' })
+
+  const delay = BACKOFF_MS[Math.min(state.attempt, BACKOFF_MS.length - 1)]
+  state.attempt += 1
+
+  backoffTimer = setTimeout(() => {
+    backoffTimer = null
+    connect()
+  }, delay)
+}
+
+// ── Tab port management ───────────────────────────────────────────────────────
+
+self.onconnect = (e) => {
+  const port = e.ports[0]
+  state.ports.add(port)
+
+  port.onmessage = (event) => {
+    if (event.data === 'get_snapshot') {
+      /**
+       * Tab just mounted (first load OR page refresh OR tab switch).
+       * Return current cache from worker memory — zero network call.
+       * This is why refresh no longer costs a 3MB snapshot:
+       * the worker already has all 6200 rows in state.cache.
+       *
+       * Sent as type="snapshot" — same shape as a real SSE snapshot,
+       * so the existing snapshot handler in useTickerData applies unchanged.
+       */
+      port.postMessage({
+        type: 'snapshot',
+        data: Object.values(state.cache),
+        ts:   state.snapTs,
+      })
+
+      // Replay last known feed status so the tab's wsStatus indicator is correct
+      if (state.feedOk !== null) {
+        port.postMessage({ type: 'feed_status', ok: state.feedOk })
+      }
+    }
+  }
+
+  port.onmessageerror = () => state.ports.delete(port)
+  port.start()
+
+  // Start the SSE connection only on the very first tab connect.
+  // Subsequent tabs reuse the same EventSource via broadcast fan-out.
+  if (!state.es && !backoffTimer) {
+    connect()
+  }
+}

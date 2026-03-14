@@ -1353,7 +1353,8 @@ class SmartAlertsEngine:
     def __init__(self, engine: "ScalpingSignalEngine", broadcast_cb=None, loop=None):
         self._engine       = engine
         self._broadcast_cb = broadcast_cb
-        self._loop         = loop          # BUG-02: asyncio event loop for threadsafe dispatch
+        self._event_loop   = loop          # BUG-02: asyncio event loop for threadsafe dispatch
+        # NOTE: named _event_loop (not _loop) to avoid shadowing the _loop() polling method
         self._watchlist: list = []
         self._prev:      dict = {}
         self._cooldowns: dict = {}
@@ -1486,9 +1487,9 @@ class SmartAlertsEngine:
                     # silently dropping every alert. Use run_coroutine_threadsafe
                     # exactly as WSEngine._broadcast() does.
                     try:
-                        if self._loop and not self._loop.is_closed():
+                        if self._event_loop and not self._event_loop.is_closed():
                             coro   = self._broadcast_cb({"type": "alert", "data": alert})
-                            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+                            future = asyncio.run_coroutine_threadsafe(coro, self._event_loop)
                             future.add_done_callback(
                                 lambda f: f.exception() if not f.cancelled() else None
                             )

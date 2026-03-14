@@ -24,6 +24,15 @@ FIXES applied in this version:
       sorted by change_value desc then sliced to 1 600 — keeping the
       top movers and leaving the tail out.  Portfolio / monitor sources
       are never capped (users own those positions and expect full lists).
+
+  PATCH-SDB-1  Supabase retry/backoff on read failures
+      get_portfolio() and get_monitor() previously had no retry logic.
+      A transient Supabase timeout silently returned [] which
+      _portfolio_loop would then broadcast as empty portfolio data.
+      FIX: _paginate() now retries up to MAX_READ_RETRIES times with
+      exponential backoff (1s → 2s → 4s) before returning partial
+      results. A logger.error is emitted on every failed attempt so
+      Render logs surface the issue immediately.
 """
 
 import os
@@ -48,6 +57,12 @@ _PAGE = 1000
 # 1 500 visible + 100 buffer for frontend sort/filter headroom.
 LIVE_DISPLAY_CAP = 6200
 
+# ── PATCH-SDB-1: Retry configuration ─────────────────────────────────────────
+# Applied to all _paginate() read calls (get_portfolio, get_monitor,
+# get_recent_signals, get_earnings_for_range, get_stock_meta, etc.)
+MAX_READ_RETRIES    = 3      # total attempts (1 original + 2 retries)
+RETRY_BACKOFF_BASE  = 1.0    # seconds — doubles each attempt: 1s, 2s, 4s
+
 
 def _get_client() -> Client:
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
@@ -66,6 +81,12 @@ def _paginate(
     """
     Generic offset-paginated full-table fetch.
 
+    PATCH-SDB-1: Each page request retries up to MAX_READ_RETRIES times
+    with exponential backoff before giving up and returning whatever was
+    collected so far. This prevents a single Supabase network hiccup from
+    silently returning [] and causing _portfolio_loop to broadcast an
+    empty portfolio to all SSE clients.
+
     filters — list of (method, *args) tuples applied to the query builder
     before .range().  Example:
         [("eq", "is_active", 1), ("order", "earnings_date")]
@@ -73,18 +94,39 @@ def _paginate(
     results: List[Dict] = []
     offset = 0
     while True:
-        try:
-            q = client.table(table).select(select)
-            for method, *args in (filters or []):
-                q = getattr(q, method)(*args)
-            batch = q.range(offset, offset + _PAGE - 1).execute().data or []
-            results.extend(batch)
-            if len(batch) < _PAGE:
-                break
-            offset += _PAGE
-        except Exception as e:
-            logger.error(f"_paginate {table} offset={offset}: {e}")
+        # PATCH-SDB-1: retry loop per page ────────────────────────────────────
+        page_data = None
+        for attempt in range(MAX_READ_RETRIES):
+            try:
+                q = client.table(table).select(select)
+                for method, *args in (filters or []):
+                    q = getattr(q, method)(*args)
+                page_data = q.range(offset, offset + _PAGE - 1).execute().data or []
+                break  # success — exit retry loop
+            except Exception as e:
+                wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+                if attempt < MAX_READ_RETRIES - 1:
+                    logger.warning(
+                        f"_paginate {table} offset={offset} attempt={attempt+1} "
+                        f"failed ({e}) — retrying in {wait:.0f}s"
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.error(
+                        f"_paginate {table} offset={offset} all {MAX_READ_RETRIES} "
+                        f"attempts failed: {e} — returning partial results"
+                    )
+        # ─────────────────────────────────────────────────────────────────────
+
+        if page_data is None:
+            # All retries exhausted for this page — stop pagination
             break
+
+        results.extend(page_data)
+        if len(page_data) < _PAGE:
+            break
+        offset += _PAGE
+
     return results
 
 
@@ -372,6 +414,11 @@ class SupabaseDB:
         """
         FIX #9 — portfolio has 1 039 rows; old single call returned only 1 000.
         Now fully paginated.
+
+        PATCH-SDB-1 — retries are handled inside _paginate(). If all retries
+        exhaust, _paginate returns whatever partial data it collected (could be
+        []) and logs logger.error. The caller (_portfolio_loop) checks for empty
+        result and skips broadcast rather than pushing an empty portfolio.
         """
         rows = _paginate(self.client, "portfolio", "*")
         logger.debug(f"get_portfolio: {len(rows)} rows")

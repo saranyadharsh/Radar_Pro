@@ -4,7 +4,7 @@
  * SVG DonutChart for sector allocation, KPI cards, pagination.
  * Props: { tickers, marketSession, watchlist, toggleWatchlist, T }
  */
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { SectionHeader, Chip, Shimmer, EmptyState, EmptyChart } from './primitives.jsx';
 import { fmt2, fmtK } from './utils.js';
 import { API_BASE } from '../../config.js';
@@ -67,29 +67,59 @@ function KPICard({ icon, label, value, note, color, T }) {
 }
 
 // ── Main Component ────────────────────────────────────────────────────────────
-export default function PagePortfolio({ tickers=new Map(), marketSession='market', watchlist=new Set(), toggleWatchlist=()=>{}, T }) {
+export default function PagePortfolio({ tickers=new Map(), marketSession='market', watchlist=new Set(), toggleWatchlist=()=>{}, sseRef=null, T }) {
   const [portfolioData, setPortfolioData] = useState([]);
   const [loading,       setLoading]       = useState(true);
   const [currentPage,   setCurrentPage]   = useState(1);
   const ITEMS_PER_PAGE = 50;
 
+  // PATCH-MAIN-2: track last SSE delta timestamp to guard against REST race
+  const lastSseTsRef = useRef(0);
+
   useEffect(() => {
-    const fetchPortfolio = async () => {
-      try {
-        const res  = await fetch(`${API_BASE}/api/portfolio`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
+    // ── 1. One-shot REST fetch on mount (fallback / cold start) ──────────────
+    // Only applied if it arrives BEFORE any SSE portfolio_update.
+    fetch(`${API_BASE}/api/portfolio`)
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        // PATCH-MAIN-2: read server timestamp from header
+        const serverTs = parseInt(r.headers.get('X-Data-Timestamp') || '0', 10);
+        return r.json().then(data => ({ data, serverTs }));
+      })
+      .then(({ data, serverTs }) => {
+        // Discard if a fresher SSE delta already arrived
+        if (serverTs < lastSseTsRef.current) {
+          console.debug('[Portfolio] REST response discarded — older than SSE delta');
+          return;
+        }
         setPortfolioData(data || []);
         setLoading(false);
-      } catch (err) {
+      })
+      .catch(err => {
         console.error('[Portfolio] Fetch error:', err);
         setLoading(false);
-      }
+      });
+
+    // ── 2. SSE listener — fires on every server-pushed portfolio_update ──────
+    // No polling. Data arrives the instant the backend detects a change.
+    if (!sseRef?.current) return;
+    const sse = sseRef.current;
+
+    const handleMessage = (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        if (payload.type === 'portfolio_update' && Array.isArray(payload.data)) {
+          // PATCH-MAIN-2: record SSE arrival time so REST race guard works
+          lastSseTsRef.current = payload.server_ts ?? Date.now();
+          setPortfolioData(payload.data);
+          setLoading(false);
+        }
+      } catch {}
     };
-    fetchPortfolio();
-    const interval = setInterval(fetchPortfolio, 30000);
-    return () => clearInterval(interval);
-  }, []);
+
+    sse.addEventListener('message', handleMessage);
+    return () => sse.removeEventListener('message', handleMessage);
+  }, [sseRef]);
 
   const enrichedPortfolio = useMemo(() => {
     return portfolioData.map(position => {
@@ -167,7 +197,7 @@ export default function PagePortfolio({ tickers=new Map(), marketSession='market
         {/* Holdings table */}
         <div className="card" style={{ flex:2, minWidth:300 }}>
           <SectionHeader title="Holdings">
-            <span style={{ color:T.text2, fontSize:8.5, fontFamily:T.font }}>{enrichedPortfolio.length} positions · /api/portfolio</span>
+            <span style={{ color:T.text2, fontSize:8.5, fontFamily:T.font }}>{enrichedPortfolio.length} positions · live via SSE</span>
             <button className="btn-primary">+ ADD POSITION</button>
           </SectionHeader>
           <div style={{ display:'grid', gridTemplateColumns:gridCols, background:T.bg0, borderBottom:`1px solid ${T.border}` }}>
@@ -176,7 +206,7 @@ export default function PagePortfolio({ tickers=new Map(), marketSession='market
             ))}
           </div>
           {loading ? (
-            <EmptyState icon="◆" label="LOADING PORTFOLIO..." sub="Fetching positions from /api/portfolio" h={120}/>
+            <EmptyState icon="◆" label="LOADING PORTFOLIO..." sub="Awaiting SSE portfolio_update…" h={120}/>
           ) : enrichedPortfolio.length===0 ? (
             <EmptyState icon="◆" label="NO POSITIONS" sub="Add your first position to get started" h={120} T={T}/>
           ) : (

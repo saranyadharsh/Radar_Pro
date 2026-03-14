@@ -91,5 +91,52 @@ export const getCSS = (T) => `
   .tr-hover:hover td { background: ${T.bg2} !important; }
   .live-dot { width: 8px; height: 8px; border-radius: 50%; background: ${T.green}; animation: dotblink 1.4s ease-in-out infinite; display: inline-block; flex-shrink: 0; }
   input, select, textarea { font-family: ${T.font}; font-size: 14px; }
-  input:focus, select:focus, textarea:focus { outline: none !important; border-color: ${T.cyanMid} !important; box-shadow: 0 0 0 3px ${T.cyanDim}; }
+  input:focus, select:focus, textarea:focus { outline: none !important; border-color: ${T.cyanMid} !important; box-sizing: 0 0 0 3px ${T.cyanDim}; }
+
+  /* ── LULD Halt & NOI styles ────────────────────────────────────────────── */
+  @keyframes haltPulse {
+    0%,100% { box-shadow: inset 0 0 0 1px #ff3d5a88, 0 0 0 1px #ff3d5a44; }
+    50%      { box-shadow: inset 0 0 0 2px #ff3d5acc, 0 0 0 4px #ff3d5a22; }
+  }
+  @keyframes resumeFade { from { background: #00e67612; } to { background: transparent; } }
+  .halt-row  { animation: haltPulse 1.8s ease-in-out infinite; background: #ff3d5a08 !important; }
+  .resume-row { animation: resumeFade 3s ease forwards; }
+  .halt-badge {
+    display: inline-flex; align-items: center; gap: 3px;
+    background: #ff3d5a22; border: 1px solid #ff3d5a88;
+    color: #ff3d5a; font-size: 8px; font-weight: 800;
+    letter-spacing: 0.8px; padding: 2px 5px; border-radius: 3px;
+    animation: haltPulse 1.8s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+  .noi-bar-wrap { width: 56px; height: 5px; background: #ffffff18; border-radius: 3px; position: relative; overflow: hidden; }
+  .noi-bar-fill { position: absolute; top: 0; height: 100%; border-radius: 3px; transition: width 0.4s ease, left 0.4s ease; }
+
+  /* ── Mobile responsive ─────────────────────────────────────────── */
+  @keyframes slideUp { from { transform: translateY(100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
+  @media (max-width: 767px) {
+    .nexradar-sidebar    { display: none !important; }
+    .nexradar-topbar     { padding: 0 10px !important; height: 48px !important; }
+    .nexradar-topbar-title { font-size: 12px !important; }
+    .nexradar-search     { display: none !important; }
+    .nexradar-page       { padding: 10px !important; padding-bottom: 70px !important; }
+  }
+  .mobile-tabbar {
+    display: none;
+    position: fixed; bottom: 0; left: 0; right: 0; height: 58px;
+    background: ${T.bg1}; border-top: 1px solid ${T.border}; z-index: 5000;
+    align-items: stretch; justify-content: space-around;
+  }
+  @media (max-width: 767px) { .mobile-tabbar { display: flex !important; } }
+  .mobile-tab {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 3px; padding: 0 8px; border: none; background: none;
+    cursor: pointer; flex: 1; transition: background 0.12s;
+    color: ${T.text2}; font-family: ${T.font}; min-width: 0;
+  }
+  .mobile-tab:active { background: ${T.bg2}; }
+  .mobile-tab.active { color: ${T.cyan}; }
+  .mobile-tab .mob-icon  { font-size: 17px; line-height: 1; }
+  .mobile-tab .mob-label { font-size: 9px; font-weight: 600; letter-spacing: 0.2px; text-transform: uppercase; white-space: nowrap; }
 `;

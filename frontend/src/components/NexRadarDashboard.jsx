@@ -116,32 +116,59 @@ function NexRadarDashboard({
   const { watchlist, toggleWatchlist, wsWatchlistRef }
     = useWatchlist(sseRef);
 
-  // ── Sidebar signal engine stats ───────────────────────────────────────────────
+  // ── Sidebar signal engine stats — SSE-driven, no polling ────────────────────
+  // watchlist count  → from SSE watchlist_snapshot / watchlist_update (no REST)
+  // scalp signals    → from SSE signal_snapshot / signal_alert (no REST)
   const [sideWatchlist,    setSideWatchlist]    = useState(0);
   const [sideScalpSignals, setSideScalpSignals] = useState({});
+
   useEffect(() => {
-    // FIX-2: use API_BASE from config.js, not inline import.meta.env
-    // FIX-SIDEBAR: re-fetch on watchlist.size change so WATCHING stays in sync
+    // Cold-start: one REST call for watchlist count while SSE connects
     fetch(`${API_BASE}/api/watchlist`)
       .then(r => r.ok ? r.json() : {})
       .then(d => setSideWatchlist((d.watchlist ?? []).length))
       .catch(() => {});
-  }, [watchlist.size]);
-  useEffect(() => {
-    // FIX-2: use API_BASE from config.js
-    const fetchScalp = () =>
-      fetch(`${API_BASE}/api/scalp-analysis`)
-        .then(r => r.ok ? r.json() : null)
-        .then(d => {
-          if (!d?.data) return;
+
+    // Cold-start: one REST call for scalp signals while SSE buffer fills
+    fetch(`${API_BASE}/api/scalp-analysis`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (!d?.data) return;
+        const m = {};
+        d.data.forEach(r => { if (!r.status || r.status === 'ok') m[r.ticker] = r; });
+        setSideScalpSignals(m);
+      }).catch(() => {});
+
+    // SSE listener — replaces both setInterval loops
+    // watchlist_snapshot  sent on connect, watchlist_update on add/remove
+    // signal_snapshot     sent on connect, signal_alert on threshold breach
+    const sse = sseRef?.current;
+    if (!sse) return;
+
+    const handleMessage = (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+
+        if (payload.type === 'watchlist_snapshot' && Array.isArray(payload.watchlist)) {
+          setSideWatchlist(payload.watchlist.length);
+        } else if (payload.type === 'watchlist_update' && Array.isArray(payload.watchlist)) {
+          setSideWatchlist(payload.watchlist.length);
+        } else if (payload.type === 'signal_snapshot' && Array.isArray(payload.data)) {
           const m = {};
-          d.data.forEach(r => { if (!r.status || r.status === 'ok') m[r.ticker] = r; });
+          payload.data.forEach(r => { if (!r.status || r.status === 'ok') m[r.ticker] = r; });
           setSideScalpSignals(m);
-        }).catch(() => {});
-    fetchScalp();
-    const id = setInterval(fetchScalp, 30_000);
-    return () => clearInterval(id);
-  }, []);
+        } else if (payload.type === 'signal_alert' && payload.data) {
+          const r = payload.data;
+          if (!r.status || r.status === 'ok') {
+            setSideScalpSignals(prev => ({ ...prev, [r.ticker]: r }));
+          }
+        }
+      } catch {}
+    };
+
+    sse.addEventListener('message', handleMessage);
+    return () => sse.removeEventListener('message', handleMessage);
+  }, [sseRef]);
   const sideSignalCount = useMemo(() =>
     Object.values(sideScalpSignals).filter(r => r.signal === 'BUY' || r.signal === 'SELL').length,
   [sideScalpSignals]);
@@ -196,10 +223,10 @@ function NexRadarDashboard({
       // Lazy pages — wrapped in Suspense, downloaded on first visit
       case 'screener':  return withLazy(<PageScreener tickers={tickers} watchlist={watchlist} toggleWatchlist={toggleWatchlist} techData={techData} scalpData={sideScalpSignals} T={T} />);
       case 'chart':     return withLazy(<PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />);
-      case 'signals':   return withLazy(<PageSignals tickers={tickers} selectedSectors={selectedSectors} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} T={T} />);
+      case 'signals':   return withLazy(<PageSignals tickers={tickers} selectedSectors={selectedSectors} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} sseRef={sseRef} T={T} />);
       case 'earnings':  return withLazy(<PageEarnings T={T} />);
       case 'scanner':  return withLazy(<PageScanner T={T} onNavigateToChart={(sym) => { setChartInitSymbol(sym); setPage('chart'); }} />);
-      case 'portfolio': return withLazy(<PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlist} T={T} />);
+      case 'portfolio': return withLazy(<PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlist} sseRef={sseRef} T={T} />);
       default:          return null;
     }
   };
@@ -433,7 +460,7 @@ function NexRadarDashboard({
                 // AH Close 300s  = AH_CLOSE_REFRESH_S (updated from 60s, BUG-07)
                 // Cap 6200       = LIVE_DISPLAY_CAP in supabase_db.py
                 {label:'Broadcast Throttle', key:'throttle',  value:'250ms',         note:'Tick-batch flush interval (ws_engine tick_flush_loop)'},
-                {label:'Portfolio Refresh',  key:'portfolio', value:'30s',           note:'How often portfolio/monitor reloads'},
+                {label:'Portfolio Refresh',  key:'portfolio', value:'SSE push',      note:'Event-driven via SSE portfolio_update'},
                 {label:'Display Cap',        key:'cap',       value:'6 200 tickers', note:'Max tickers in live cache (LIVE_DISPLAY_CAP)'},
                 {label:'AH Close Refresh',   key:'ah',        value:'300s',          note:'After-hours closing price refresh (watchlist-scoped)'},
               ].map(s=>(

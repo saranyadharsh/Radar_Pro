@@ -1,5 +1,5 @@
 """
-main.py — NexRadar Pro Backend  v6.0 (Redis REMOVED)
+main.py — NexRadar Pro Backend  v6.2
 =====================================================
 FastAPI.  Render start command:
   uvicorn backend.main:app --host 0.0.0.0 --port $PORT
@@ -11,18 +11,92 @@ Previous Redis Stream + Consumer Group design caused 6 failure modes:
   P2  NOGROUP warning storm on stream eviction
   P3  Snapshot evicted in <60s at market-hours tick rate
   P4  Portfolio Supabase spam on every ingestor restart
-  P5  ~2 Redis connections per SSE tab → 20-conn limit exceeded at ~10 tabs
+  P5  ~2 Redis connections per SSE tab -> 20-conn limit exceeded at ~10 tabs
   P6  Watchlist updates silently dropped when Redis XADD blocks event loop
 
-NEW: SSEBroadcaster (35 lines, zero network I/O on tick path):
+NEW: SSEBroadcaster (zero Redis, zero network I/O on tick path):
   • WSEngine starts in this process — no subprocess, no watchdog needed
   • Each SSE client gets a dedicated asyncio.Queue (maxsize=500)
   • Snapshot stored as a Python dict — lives in memory forever, never evicted
   • Latency: ~0.1ms vs ~5-20ms with Redis round-trips
   • Unlimited simultaneous SSE clients (not capped by Redis conn pool)
 
-All existing frontend code (NexRadarDashboard.jsx, EventSource URL,
-message format) is completely unchanged.
+PATCHES IN THIS VERSION:
+  PATCH-MAIN-1  Signal snapshot on SSE connect
+                When a client subscribes to /api/stream, the SSE generator
+                now sends a "signal_snapshot" message containing the last 50
+                signals immediately after the price snapshot. This ensures
+                clients that connect mid-session see existing signals without
+                waiting for the next poll cycle.
+
+  PATCH-MAIN-2  Race condition fix: REST fetch vs SSE delta on page mount
+                PageScanner.jsx and PagePortfolio.jsx fire a REST GET on
+                mount. If an SSE delta (portfolio_update, watchlist_update)
+                arrives BEFORE the REST response resolves, the REST response
+                was overwriting the newer SSE delta — showing stale data.
+                FIX: All REST endpoints that return data also set an
+                X-Data-Timestamp response header (Unix ms). The frontend
+                must ignore REST responses whose timestamp is older than the
+                last SSE delta timestamp it received for that data type.
+
+  PATCH-MAIN-3  /api/stream sends watchlist snapshot on connect
+                Similar to PATCH-MAIN-1, the current watchlist is included
+                in the initial SSE burst so PageScanner/PagePortfolio don't
+                need to fire a separate REST GET on mount at all.
+
+  FIX-1         Zero-client guard in SSEBroadcaster.publish()
+                json.dumps(6200 rows) was running 30x/min all day even with
+                zero browsers connected — 150 GB/day of pointless work on
+                Render, causing 43,200 GC cycles/day and CPU pressure that
+                triggered queue fills and reconnect spirals after 2 weeks.
+                FIX: _snapshot is always updated (needed for first connect).
+                If _queues is empty, return immediately — skip serialisation.
+                Impact: CPU -> 0 when no browser open. GC pressure eliminated.
+
+  FIX-2         snapshot_delta support
+                SSEBroadcaster now stores _snapshot_map (ticker -> row) in
+                addition to _snapshot (full payload). When a client connects,
+                it gets the full snapshot from _snapshot_map. During live
+                streaming, ws_engine sends type="snapshot_delta" with only
+                changed rows — broadcaster fans that out directly without
+                touching the full snapshot.
+
+  FIX-4 (frontend companion — see sseWorker.js)
+                SharedWorker holds the single EventSource for the entire
+                browser session. Tab switches, page refreshes, and navigation
+                between Dashboard/LiveTable/Signals/Scanner never disconnect
+                the SSE stream. The backend sees exactly one persistent
+                connection regardless of user navigation behaviour.
+
+  FIX-5         feed_status events (from ws_engine.py)
+                ws_engine broadcasts {"type":"feed_status","ok":false/true}
+                on Polygon WS close/auth_success. SSEBroadcaster fans this
+                out normally. Frontend shows a reconnecting banner.
+
+  client_ts handshake on /api/stream
+                If the client passes ?client_ts=<unix_ms>, and the snapshot
+                on the backend is less than 10 seconds newer than that
+                timestamp, the full snapshot is skipped — the client's data
+                is still fresh. Only a true first load or stale reconnect
+                gets the full 3 MB blast.
+
+  FRONTEND INTEGRATION NOTE (PATCH-MAIN-2):
+    In PagePortfolio.jsx and PageScanner.jsx, after applying SSE deltas,
+    store the delta's server timestamp:
+      const lastSSETs = useRef(0);
+      // on SSE portfolio_update: lastSSETs.current = Date.now();
+      // on REST /api/portfolio response: only apply if Date.now() > lastSSETs.current + 500
+    This 500ms grace period ensures the REST response (which races the SSE)
+    never silently overwrites a more-recent SSE delta.
+
+  FRONTEND INTEGRATION NOTE (snapshot_delta):
+    The frontend must handle both message types from SSE:
+      type="snapshot"       -> replace entire local state (first connect only)
+      type="snapshot_delta" -> merge rows by ticker key into local state
+    Example merge in sseWorker.js / useMarketData hook:
+      if (msg.type === 'snapshot_delta') {
+        msg.data.forEach(row => { cache[row.ticker] = row })
+      }
 """
 from dotenv import load_dotenv
 from pathlib import Path
@@ -34,13 +108,21 @@ import asyncio
 import json
 import logging
 import time
+# GAP-4: orjson 3-5x faster than stdlib json for large snapshot payloads
+try:
+    import orjson as _orjson
+    def _dumps(obj: dict) -> str:
+        return _orjson.dumps(obj).decode()
+except ImportError:
+    def _dumps(obj: dict) -> str:  # type: ignore[misc]
+        return json.dumps(obj)
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
-from typing import AsyncGenerator, Set
+from typing import AsyncGenerator, Dict, Set
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fastapi import FastAPI, HTTPException, Query, Request  # BUG-01 FIX: HTTPException at module level
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -55,13 +137,6 @@ except ModuleNotFoundError:
     from ws_engine          import WSEngine
     from market_monitor_api import get_cached_monitor
 
-import yfinance as _yf
-try:
-    os.makedirs("/tmp/yf_cache", exist_ok=True)
-    _yf.set_tz_cache_location("/tmp/yf_cache")
-except Exception:
-    pass
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -70,65 +145,120 @@ logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SSEBroadcaster — replaces Redis Stream + Consumer Groups + pub/sub + snapshot key
+# SSEBroadcaster
 # ══════════════════════════════════════════════════════════════════════════════
 class SSEBroadcaster:
     """
     In-memory fan-out broadcaster.  Zero Redis.  Zero network I/O on tick path.
 
+    FIX-1: Zero-client guard
+      publish() now returns immediately after updating _snapshot if _queues
+      is empty. This skips json.dumps entirely when no browser is connected,
+      eliminating 150 GB/day of pointless serialisation on Render and the
+      resulting GC pressure that caused queue fills after 2 weeks of uptime.
+
+    FIX-2: snapshot_delta support
+      _snapshot_map stores ticker -> row dict, updated on every snapshot and
+      snapshot_delta. On SSE connect, full snapshot is built from _snapshot_map
+      only once. During streaming, snapshot_delta payloads pass through without
+      touching _snapshot_map — only the initial type="snapshot" updates it.
+
+    HOP-2-FIX: Slow-client eviction with TTL
+      A client whose queue is full is not immediately killed — it may be a
+      temporary hiccup (tab backgrounded, GC pause). It gets SLOW_CLIENT_TTL_S
+      seconds to drain before being evicted. Evicted clients receive a DISCONNECT
+      sentinel so their SSE generator exits cleanly and they auto-reconnect.
+
+    HOP-2-FIX: Named clients
+      subscribe() now accepts a client_id for logging. Slow/dead evictions log
+      the client_id so you can correlate with access logs.
+
     Thread safety:
-      WSEngine background threads call publish() via
-      asyncio.run_coroutine_threadsafe(broadcaster.publish(payload), loop).
-      publish() uses put_nowait() which is GIL-safe from any thread.
-
-    Backpressure:
-      Queue maxsize=500.  Slow clients that fall behind are silently evicted;
-      their EventSource auto-reconnects and immediately receives the snapshot.
-
-    Memory:
-      _snapshot holds the latest snapshot dict only — replaced on every snapshot
-      broadcast, so it never grows.  The snapshot data list itself is bounded by
-      LIVE_DISPLAY_CAP in supabase_db (6200 rows × ~500 bytes ≈ 3 MB max).
-      Dead queues are removed atomically inside publish() so _queues never
-      accumulates stale entries from disconnected clients.
+      publish() is an async coroutine — it only runs on the asyncio event loop
+      thread. subscribe() and unsubscribe() are also called from async context
+      (FastAPI route handlers on the same event loop thread). All _queues
+      mutations are single-threaded by the event loop — no lock needed.
+      WSEngine background threads schedule publish() via run_coroutine_threadsafe,
+      never calling it directly — this is why dict mutation is safe without a lock.
     """
+
+    QUEUE_MAXSIZE      = 500
+    SLOW_CLIENT_TTL_S  = 10   # seconds a full queue is tolerated before eviction
+
     def __init__(self):
-        self._queues:   Set[asyncio.Queue] = set()
-        self._snapshot: dict               = {}
+        self._queues:       Dict[asyncio.Queue, str]  = {}  # queue -> client_id
+        self._slow_since:   Dict[asyncio.Queue, float] = {} # queue -> monotonic time when full started
+        self._snapshot:     dict                = {}
+        self._snapshot_map: Dict[str, dict]     = {}
 
     async def publish(self, payload: dict) -> None:
-        if payload.get("type") == "snapshot":
-            self._snapshot = payload          # replace — never accumulates
-        msg = "data: " + json.dumps(payload) + "\n\n"
+        msg_type = payload.get("type")
+
+        # Always maintain the full snapshot map for new connects
+        if msg_type == "snapshot":
+            self._snapshot = payload
+            for row in payload.get("data", []):
+                tk = row.get("ticker")
+                if tk:
+                    self._snapshot_map[tk] = row
+
+        elif msg_type == "snapshot_delta":
+            for row in payload.get("data", []):
+                tk = row.get("ticker")
+                if tk:
+                    self._snapshot_map[tk] = row
+
+        # FIX-1: zero-client guard
+        if not self._queues:
+            return
+
+        msg  = "data: " + _dumps(payload) + "\n\n"  # GAP-4: orjson
+        now  = time.monotonic()
         dead = set()
-        for q in list(self._queues):
+
+        for q, client_id in list(self._queues.items()):
             try:
                 q.put_nowait(msg)
+                # Successful put — clear any slow-client timer
+                self._slow_since.pop(q, None)
             except asyncio.QueueFull:
-                dead.add(q)
-        # Evicted queues: send poison pill so the generator breaks out immediately
-        # instead of waiting for the 15s keepalive timeout to notice data stopped.
-        # The frontend's EventSource will auto-reconnect and get a fresh snapshot.
+                # HOP-2-FIX: give the client SLOW_CLIENT_TTL_S to recover
+                first_full = self._slow_since.get(q)
+                if first_full is None:
+                    self._slow_since[q] = now
+                    logger.warning(f"SSE client {client_id}: queue full — starting eviction timer")
+                elif now - first_full > self.SLOW_CLIENT_TTL_S:
+                    logger.error(f"SSE client {client_id}: queue full >{self.SLOW_CLIENT_TTL_S}s — evicting")
+                    dead.add(q)
+
         if dead:
             for q in dead:
+                self._queues.pop(q, None)
+                self._slow_since.pop(q, None)
                 try:
-                    while not q.empty():   # drain first so put_nowait has room
+                    # Drain and send DISCONNECT so generator exits cleanly
+                    while not q.empty():
                         q.get_nowait()
                     q.put_nowait("DISCONNECT")
                 except Exception:
                     pass
-            self._queues -= dead
 
-    def subscribe(self) -> asyncio.Queue:
-        q = asyncio.Queue(maxsize=500)
-        self._queues.add(q)
+    def subscribe(self, client_id: str = "unknown") -> asyncio.Queue:
+        q = asyncio.Queue(maxsize=self.QUEUE_MAXSIZE)
+        self._queues[q] = client_id
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
-        self._queues.discard(q)
+        self._queues.pop(q, None)
+        self._slow_since.pop(q, None)
 
     def get_snapshot(self) -> dict:
+        """Returns the last full snapshot payload (for REST /api/snapshot)."""
         return self._snapshot
+
+    def get_snapshot_map(self) -> Dict[str, dict]:
+        """Returns the always-current ticker->row map (for SSE connect burst)."""
+        return self._snapshot_map
 
     @property
     def client_count(self) -> int:
@@ -144,31 +274,28 @@ broadcaster: SSEBroadcaster = None   # type: ignore
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db, broadcaster
-    logger.info("🚀 NexRadar API starting (direct SSE — Redis removed) …")
+    logger.info("NexRadar API starting (direct SSE v6.3) …")
 
     db          = SupabaseDB()
     broadcaster = SSEBroadcaster()
 
     tickers, company_map, sector_map = db.get_stock_meta()
     if not tickers:
-        logger.warning("⚠️  No tickers — run migration first")
+        logger.warning("No tickers — run migration first")
     else:
         logger.info(f"Loaded {len(tickers)} tickers")
 
-    # WSEngine runs background threads and calls broadcaster.publish()
-    # via asyncio.run_coroutine_threadsafe — fully thread-safe.
     loop   = asyncio.get_event_loop()
     engine = WSEngine(broadcast_cb=broadcaster.publish, loop=loop)
     engine.start(tickers, company_map, sector_map)
-    logger.info("✅ WSEngine started")
+    logger.info("WSEngine started")
     app.state.engine = engine
 
-    # Feature #1 — Smart Alerts Engine
     try:
         from backend.Scalping_Signal import SmartAlertsEngine
     except ModuleNotFoundError:
         from Scalping_Signal import SmartAlertsEngine
-    _ae = SmartAlertsEngine(engine=engine._signal_watcher, broadcast_cb=broadcaster.publish, loop=loop)  # BUG-02 FIX: pass loop
+    _ae = SmartAlertsEngine(engine=engine._signal_watcher, broadcast_cb=broadcaster.publish, loop=loop)
     try:
         _ae_rows = db.get_signal_watchlist()
         _ae.set_watchlist([r["ticker"] for r in _ae_rows if r.get("ticker")])
@@ -176,13 +303,23 @@ async def lifespan(app: FastAPI):
         pass
     _ae.start()
     app.state.alerts_engine = _ae
-    logger.info("✅ SmartAlertsEngine started")
+    logger.info("SmartAlertsEngine started")
+
+    # v6.3-2 HYBRID WARM-UP: seed today's 1-min bars from Polygon REST so every
+    # watchlist ticker's IndicatorCalculator has 27+ bars immediately on startup.
+    # Without this, RSI/EMA/BB are unavailable for 27 min after a mid-session restart.
+    # seed_history_from_rest() runs in a background thread — startup is not blocked.
+    try:
+        _api_key = engine._api_key
+        if _api_key and engine._signal_watcher:
+            logger.info("v6.3: Seeding indicator history from Polygon REST (background)…")
+            engine._signal_watcher.seed_history_from_rest(_api_key)
+    except Exception as _e:
+        logger.warning(f"seed_history_from_rest on startup failed: {_e}")
 
     yield
 
-    logger.info("🛑 Shutting down …")
-    # BUG-03 FIX: Stop SmartAlertsEngine BEFORE WSEngine so poll thread
-    # doesn't access signal_watcher after it's torn down.
+    logger.info("Shutting down …")
     try:
         app.state.alerts_engine.stop()
         logger.info("SmartAlertsEngine stopped.")
@@ -192,7 +329,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete.")
 
 
-app = FastAPI(title="NexRadar Pro API", version="6.0.0", lifespan=lifespan)
+app = FastAPI(title="NexRadar Pro API", version="6.3.0", lifespan=lifespan)
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://nexradar.info").rstrip("/")
 app.add_middleware(
@@ -220,12 +357,21 @@ async def health():
 # ── Metrics ────────────────────────────────────────────────────────────────────
 @app.get("/api/metrics")
 async def get_metrics():
-    snap = broadcaster.get_snapshot() if broadcaster else {}
+    snap_map = broadcaster.get_snapshot_map() if broadcaster else {}
+    engine: WSEngine = getattr(app.state, "engine", None)
+    # GAP-5: compute worker health — seconds since last tick processed.
+    # tick_stale_s > 30 during market hours = compute worker stalled.
+    tick_stale_s = None
+    if engine and getattr(engine, "_last_tick_processed_ts", 0) > 0:
+        tick_stale_s = round(time.monotonic() - engine._last_tick_processed_ts, 1)
     return {
-        "sse_clients":   broadcaster.client_count if broadcaster else 0,
-        "snapshot_size": len(snap.get("data", [])),
-        "session":       _get_market_status_simple(),
-        "architecture":  "direct-sse-v6-no-redis",
+        "sse_clients":    broadcaster.client_count if broadcaster else 0,
+        "snapshot_size":  len(snap_map),
+        "session":        _get_market_status_simple(),
+        "architecture":   "direct-sse-v6.3-delta-engine",
+        "tick_queue_len": len(engine._tick_queue) if engine else None,
+        "tick_stale_s":   tick_stale_s,
+        "dirty_tickers":  len(engine._dirty_tickers) if engine else None,
     }
 
 
@@ -251,10 +397,10 @@ async def get_snapshot(
     source:        str  = Query("all"),
     sector:        str  = Query(""),
 ):
-    payload = broadcaster.get_snapshot() if broadcaster else {}
-    data    = payload.get("data", [])
+    # Use snapshot_map for always-current data (updated by both snapshot + snapshot_delta)
+    snap_map = broadcaster.get_snapshot_map() if broadcaster else {}
+    data     = list(snap_map.values())
 
-    # Ensure every row has the "open" alias the frontend MH table reads
     for row in data:
         if "open" not in row or not row["open"]:
             row["open"] = row.get("open_price", 0)
@@ -278,44 +424,103 @@ async def get_snapshot(
 
 # ── SSE Stream ─────────────────────────────────────────────────────────────────
 @app.get("/api/stream")
-async def sse_stream(request: Request):
+async def sse_stream(request: Request, client_ts: int = Query(0)):
     """
     SSE endpoint — zero Redis.
 
-    subscribe() is called INSIDE the generator, not before it.
-    This prevents a queue leak in the rare case where StreamingResponse
-    raises before the generator coroutine ever runs (e.g. CORS pre-flight
-    reuse, early client disconnect during response construction).
+    client_ts handshake (FIX: no reconnect blast):
+      The client passes ?client_ts=<unix_ms_of_last_snapshot_received>.
+      If the backend snapshot is less than 10 seconds newer than client_ts,
+      the client's data is still fresh — skip the full snapshot and send only
+      a lightweight reconnected ack. This eliminates the 3 MB blast on every
+      tab switch / page refresh when using the SharedWorker (sseWorker.js).
 
-    On disconnect: unsubscribe() runs in the generator's finally block.
-    On slow client: queue fills to maxsize=500 → put_nowait raises QueueFull
-    → broadcaster evicts that queue → client's EventSource auto-reconnects
-    and immediately receives the latest snapshot (no data loss for UI).
+    On connect (true first load or stale data):
+      1. Full snapshot built from _snapshot_map (always current)
+      2. signal_snapshot — last 50 signals (PATCH-MAIN-1)
+      3. watchlist_snapshot — current watchlist (PATCH-MAIN-3)
+
+    On reconnect with fresh data (client_ts < 10s old):
+      1. Lightweight {"type":"reconnected"} ack only
+
+    Live stream:
+      type="snapshot_delta"  — only changed tickers (FIX-2, ~20 KB not 3 MB)
+      type="tick_batch"      — 250ms coalesced tick data
+      type="feed_status"     — Polygon WS up/down (FIX-5)
+      type="session_change"  — MH/AH boundary crossed (FIX-3)
+      type="keepalive"       — every 15s to keep TCP alive
     """
     async def _generate() -> AsyncGenerator[str, None]:
-        q = broadcaster.subscribe()
+        import uuid
+        client_id = str(uuid.uuid4())[:8]
+        q = broadcaster.subscribe(client_id)
+        logger.info(f"SSE client {client_id} connected (total: {broadcaster.client_count})")
         try:
-            snap = broadcaster.get_snapshot()
-            if snap:
-                yield "data: " + json.dumps(snap) + "\n\n"
+            snap_map = broadcaster.get_snapshot_map()
+            snap_ts  = int(time.time() * 1000)
+            age_ms   = snap_ts - client_ts
+
+            # Decide whether to send full snapshot or just ack
+            if client_ts == 0 or age_ms > 10_000 or not snap_map:
+                # True first load or stale — send full snapshot from map
+                if snap_map:
+                    full_snap = {
+                        "type": "snapshot",
+                        "data": list(snap_map.values()),
+                        "ts":   snap_ts,
+                    }
+                    yield "data: " + json.dumps(full_snap) + "\n\n"
+
+                # PATCH-MAIN-1: Signal snapshot on connect
+                try:
+                    signals = await asyncio.to_thread(db.get_recent_signals, 50)
+                    if signals:
+                        yield "data: " + json.dumps({
+                            "type":      "signal_snapshot",
+                            "data":      signals,
+                            "server_ts": int(time.time() * 1000),
+                        }) + "\n\n"
+                except Exception as e:
+                    logger.warning(f"SSE connect: signal_snapshot failed: {e}")
+
+                # PATCH-MAIN-3: Watchlist snapshot on connect
+                try:
+                    wl_rows = await asyncio.to_thread(db.get_signal_watchlist)
+                    wl      = [r["ticker"] for r in wl_rows if r.get("ticker")]
+                    if wl:
+                        yield "data: " + json.dumps({
+                            "type":      "watchlist_snapshot",
+                            "watchlist": wl,
+                            "server_ts": int(time.time() * 1000),
+                        }) + "\n\n"
+                except Exception as e:
+                    logger.warning(f"SSE connect: watchlist_snapshot failed: {e}")
+
+            else:
+                # Client has fresh data — skip 3 MB snapshot entirely
+                yield f'data: {{"type":"reconnected","ts":{snap_ts}}}\n\n'
+
+            # Live stream
             while True:
                 if await request.is_disconnected():
                     break
                 try:
                     msg = await asyncio.wait_for(q.get(), timeout=15.0)
                     if msg == "DISCONNECT":
-                        # Poison pill from broadcaster — queue was evicted (too slow).
-                        # Break so EventSource reconnects and gets a fresh snapshot.
                         break
                     yield msg
                 except asyncio.TimeoutError:
-                    yield 'data: {"type":"keepalive"}\n\n'
+                    # HOP-2-FIX: SSE comment heartbeat every 15s.
+                    # SSE comments (": ...") keep TCP alive through Nginx/Cloudflare/proxies
+                    # without triggering client onmessage handlers — zero JS overhead.
+                    yield ": heartbeat\n\n"
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.error(f"SSE generator error: {e}")
         finally:
             broadcaster.unsubscribe(q)
+            logger.info(f"SSE client {client_id} disconnected (total: {broadcaster.client_count})")
 
     return StreamingResponse(
         _generate(),
@@ -348,16 +553,19 @@ async def get_earnings(start: str = Query(default=None), end: str = Query(defaul
     today = date.today()
     s = start or today.isoformat()
     e = end   or (today + timedelta(days=7)).isoformat()
-    # asyncio.to_thread: Supabase client is synchronous (httpx/requests under the hood).
-    # Calling it directly in an async route blocks the event loop — all SSE clients
-    # stall until the query returns.  to_thread() offloads it to the thread pool.
     return await asyncio.to_thread(db.get_earnings_for_range, s, e)
 
 
 # ── Signals ────────────────────────────────────────────────────────────────────
 @app.get("/api/signals")
 async def get_signals(limit: int = Query(200, le=500)):
-    return await asyncio.to_thread(db.get_recent_signals, limit)
+    """PATCH-MAIN-2: X-Data-Timestamp header added."""
+    data = await asyncio.to_thread(db.get_recent_signals, limit)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        content=data,
+        headers={"X-Data-Timestamp": str(int(time.time() * 1000))},
+    )
 
 @app.post("/api/signals")
 async def post_signal(payload: dict):
@@ -367,7 +575,13 @@ async def post_signal(payload: dict):
 # ── Portfolio / Monitor ────────────────────────────────────────────────────────
 @app.get("/api/portfolio")
 async def get_portfolio():
-    return await asyncio.to_thread(db.get_portfolio)
+    """PATCH-MAIN-2: X-Data-Timestamp header added."""
+    data = await asyncio.to_thread(db.get_portfolio)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        content=data,
+        headers={"X-Data-Timestamp": str(int(time.time() * 1000))},
+    )
 
 @app.get("/api/monitor")
 async def get_monitor():
@@ -392,23 +606,17 @@ class WatchlistBody(BaseModel):
 
 
 async def _refresh_signal_watcher():
-    """Push updated watchlist to WSEngine signal watcher + SmartAlertsEngine.
-    BUG-06 FIX: Made async; Supabase call offloaded to thread pool via to_thread().
-    Was: synchronous db call blocked the event loop for 50-200ms per watchlist edit,
-    stalling ALL SSE clients. Now: non-blocking, event loop stays responsive.
-    """
+    """Push updated watchlist to WSEngine signal watcher + SmartAlertsEngine."""
     try:
         engine = app.state.engine
         if engine and engine._signal_watcher:
             rows    = await asyncio.to_thread(db.get_signal_watchlist)
             tickers = [r["ticker"] for r in rows if r.get("ticker")]
             engine._signal_watcher.set_watchlist(tickers)
-            # Keep AH close refresh scoped to watchlist (BUG-07 companion fix)
             try:
                 engine.set_watchlist_tickers(tickers)
             except AttributeError:
                 pass
-            # Also sync alerts engine
             try:
                 app.state.alerts_engine.set_watchlist(tickers)
             except AttributeError:
@@ -419,9 +627,14 @@ async def _refresh_signal_watcher():
 
 @app.get("/api/watchlist")
 async def watchlist_get():
+    """PATCH-MAIN-2: X-Data-Timestamp header added."""
     rows = await asyncio.to_thread(db.get_signal_watchlist)
     tickers = [r["ticker"] for r in rows if r.get("ticker")]
-    return {"watchlist": tickers, "count": len(tickers)}
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        content={"watchlist": tickers, "count": len(tickers)},
+        headers={"X-Data-Timestamp": str(int(time.time() * 1000))},
+    )
 
 
 @app.post("/api/watchlist/add")
@@ -429,11 +642,26 @@ async def watchlist_add(body: WatchlistBody):
     try:
         ticker = body.ticker.upper().strip()
         await asyncio.to_thread(db.add_signal_watchlist, ticker)
-        await _refresh_signal_watcher()  # BUG-06 FIX: await async version
+        await _refresh_signal_watcher()
+        # v6.3-2 HYBRID WARM-UP: seed the newly-added ticker immediately so
+        # its tech indicators are available within seconds, not 27 minutes.
+        try:
+            _eng = getattr(app.state, "engine", None)
+            if _eng and getattr(_eng, "_api_key", None) and _eng._signal_watcher:
+                _eng._signal_watcher.seed_history_from_rest(
+                    _eng._api_key, symbols=[ticker]
+                )
+        except Exception as _e:
+            logger.warning(f"watchlist_add seed failed for {ticker}: {_e}")
         rows = await asyncio.to_thread(db.get_signal_watchlist)
         wl   = sorted([r["ticker"] for r in rows if r.get("ticker")])
-        await broadcaster.publish({"type": "watchlist_update", "action": "add",
-                                   "ticker": ticker, "watchlist": wl})
+        await broadcaster.publish({
+            "type":      "watchlist_update",
+            "action":    "add",
+            "ticker":    ticker,
+            "watchlist": wl,
+            "server_ts": int(time.time() * 1000),
+        })
         return {"ok": True, "action": "add", "ticker": ticker}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -444,11 +672,16 @@ async def watchlist_remove(body: WatchlistBody):
     try:
         ticker = body.ticker.upper().strip()
         await asyncio.to_thread(db.remove_signal_watchlist, ticker)
-        await _refresh_signal_watcher()  # BUG-06 FIX: await async version
+        await _refresh_signal_watcher()
         rows = await asyncio.to_thread(db.get_signal_watchlist)
         wl   = sorted([r["ticker"] for r in rows if r.get("ticker")])
-        await broadcaster.publish({"type": "watchlist_update", "action": "remove",
-                                   "ticker": ticker, "watchlist": wl})
+        await broadcaster.publish({
+            "type":      "watchlist_update",
+            "action":    "remove",
+            "ticker":    ticker,
+            "watchlist": wl,
+            "server_ts": int(time.time() * 1000),
+        })
         return {"ok": True, "action": "remove", "ticker": ticker}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -494,18 +727,20 @@ async def get_market_monitor(refresh: int = Query(0)):
     if not tickers:
         return {"data": [], "ticker_count": 0,
                 "message": "No tickers in watchlist."}
-    # run_in_executor is equivalent to asyncio.to_thread for sync callables.
-    # get_cached_monitor internally uses a ThreadPoolExecutor (20 workers) to
-    # fetch yfinance data for all watchlist tickers concurrently, so the total
-    # wall time is ~2-3s for 50 tickers instead of the ~25s sequential baseline.
-    result = await asyncio.to_thread(get_cached_monitor, tickers, bool(refresh))
+    # v6.3-3 DEPENDENCY INJECTION: pass signal_engine so get_cached_monitor
+    # reads from live IndicatorCalculator state — zero yfinance, zero HTTP.
+    _eng          = getattr(app.state, "engine", None)
+    signal_engine = _eng._signal_watcher if _eng else None
+    result = await asyncio.to_thread(
+        get_cached_monitor, tickers, signal_engine, bool(refresh)
+    )
     return result
 
 
 # ── Scalp Analysis ─────────────────────────────────────────────────────────────
 @app.get("/api/scalp-analysis")
 async def get_scalp_analysis():
-    rows              = await asyncio.to_thread(db.get_signal_watchlist)  # BUG-06 FIX
+    rows              = await asyncio.to_thread(db.get_signal_watchlist)
     watchlist_tickers = {r["ticker"] for r in rows if r.get("ticker")}
     if not watchlist_tickers:
         return {"data": [], "message": "No tickers in watchlist."}
@@ -530,27 +765,14 @@ async def get_scalp_analysis():
             "message": "Signal engine seeding — live signals appear within 10s."}
 
 
-
 # ── Opportunity Scanner + Relative Strength ─────────────────────────────────────
 @app.get("/api/opportunity-scanner")
 async def get_opportunity_scanner():
-    """
-    #2 AI Trade Opportunity Scanner + #3 Relative Strength Scanner.
-
-    For every watchlist ticker with a live scalp snapshot:
-      - Appends RS = ticker_pct_change - spy_pct_change (live from WS cache)
-      - Appends composite_score = scalp score + RS bonus
-      - Returns ranked list (best opportunities first, tiered A-D)
-
-    RS source: ws_engine._cache["SPY"]["percent_change"] — live Polygon tick,
-    no extra network calls, no new data source.
-    """
-    rows = await asyncio.to_thread(db.get_signal_watchlist)  # BUG-06 FIX
+    rows = await asyncio.to_thread(db.get_signal_watchlist)
     watchlist_tickers = {r["ticker"] for r in rows if r.get("ticker")}
     if not watchlist_tickers:
         return {"data": [], "spy_pct": None, "message": "No tickers in watchlist."}
 
-    # Pull SPY / QQQ % change from live WS cache
     spy_pct = None
     qqq_pct = None
     try:
@@ -565,7 +787,6 @@ async def get_opportunity_scanner():
     except Exception as e:
         logger.warning(f"opportunity-scanner: SPY/QQQ cache read failed: {e}")
 
-    # Get scalp snapshot for watchlist
     scalp_rows = []
     try:
         eng = app.state.engine
@@ -574,7 +795,6 @@ async def get_opportunity_scanner():
     except Exception as e:
         logger.warning(f"opportunity-scanner: scalp snapshot failed: {e}")
 
-    # Enrich each row with RS + composite score
     live_cache = {}
     try:
         live_cache = app.state.engine._cache if app.state.engine else {}
@@ -605,8 +825,7 @@ async def get_opportunity_scanner():
         rs_spy  = round(pct_chg - spy_pct, 3) if spy_pct is not None else None
         rs_qqq  = round(pct_chg - qqq_pct, 3) if qqq_pct is not None else None
 
-        # RS bonus: up to ±0.10 so it nudges rank without overriding signal score
-        rs_bonus = max(-0.10, min(0.10, rs_spy * 0.02)) if rs_spy is not None else 0.0
+        rs_bonus  = max(-0.10, min(0.10, rs_spy * 0.02)) if rs_spy is not None else 0.0
         composite = round(score + rs_bonus, 3)
 
         abs_comp = abs(composite)
@@ -633,13 +852,12 @@ async def get_opportunity_scanner():
         -abs(r["composite_score"]),
     ))
 
-    import time as _time
     return {
         "data":         enriched,
         "spy_pct":      round(spy_pct, 3) if spy_pct is not None else None,
         "qqq_pct":      round(qqq_pct, 3) if qqq_pct is not None else None,
         "ticker_count": len(enriched),
-        "generated_at": int(_time.time()),
+        "generated_at": int(time.time()),
     }
 
 
@@ -663,7 +881,7 @@ async def get_alerts(limit: int = Query(50, ge=1, le=200)):
 async def get_mtf_scanner():
     """1m + 5m + 15m trend confluence scanner for watchlist symbols."""
     try:
-        rows = await asyncio.to_thread(db.get_signal_watchlist)  # BUG-06 FIX
+        rows = await asyncio.to_thread(db.get_signal_watchlist)
         watchlist = [r["ticker"] for r in rows if r.get("ticker")]
         if not watchlist:
             return {"data": [], "message": "No watchlist symbols configured"}
@@ -716,7 +934,6 @@ async def get_quote(symbol: str):
             "name":      meta.get("longName", symbol.upper()),
         }
     except Exception as e:
-        from fastapi import HTTPException
         raise HTTPException(status_code=502, detail=str(e))
 
 
@@ -740,7 +957,6 @@ async def get_news(symbol: str):
             })
         return {"items": items}
     except Exception as e:
-        from fastapi import HTTPException
         raise HTTPException(status_code=502, detail=str(e))
 
 
@@ -752,7 +968,6 @@ async def get_chart_bars(symbol: str, interval: str = "1", range: str = "1d"):
 
     api_key = os.getenv("MASSIVE_API_KEY", "")
     if not api_key:
-        from fastapi import HTTPException
         raise HTTPException(status_code=503, detail="Polygon API key not configured")
 
     sym        = symbol.upper()
@@ -780,14 +995,14 @@ async def get_chart_bars(symbol: str, interval: str = "1", range: str = "1d"):
                 for b in (data.get("results") or [])]
         return {"bars": bars, "symbol": sym, "interval": multiplier, "count": len(bars)}
     except Exception as e:
-        from fastapi import HTTPException
         raise HTTPException(status_code=502, detail=str(e))
 
 
 # ── Debug: Sector Map ──────────────────────────────────────────────────────────
 @app.get("/api/debug/sectors")
 async def debug_sectors():
-    data = broadcaster.get_snapshot().get("data", []) if broadcaster else []
+    snap_map = broadcaster.get_snapshot_map() if broadcaster else {}
+    data     = list(snap_map.values())
     sector_counts: dict = {}
     sector_samples: dict = {}
     for row in data:

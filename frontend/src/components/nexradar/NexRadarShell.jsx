@@ -70,31 +70,55 @@ function NexRadarDashboard({
   const { watchlist, toggleWatchlist, wsWatchlistRef }
     = useWatchlist();
 
-  // ── Sidebar signal engine stats ───────────────────────────────────────────────
+  // ── Sidebar signal engine stats — SSE-driven, no polling ────────────────────
   const [sideWatchlist,    setSideWatchlist]    = useState(0);
   const [sideScalpSignals, setSideScalpSignals] = useState({});
+
   useEffect(() => {
     const API = (typeof window !== 'undefined' && import.meta?.env?.VITE_API_BASE) || '';
+
+    // Cold-start: one REST call each while SSE connects
     fetch(`${API}/api/watchlist`)
       .then(r => r.ok ? r.json() : {})
       .then(d => setSideWatchlist((d.watchlist ?? []).length))
       .catch(() => {});
-  }, []);
-  useEffect(() => {
-    const API = (typeof window !== 'undefined' && import.meta?.env?.VITE_API_BASE) || '';
-    const fetchScalp = () =>
-      fetch(`${API}/api/scalp-analysis`)
-        .then(r => r.ok ? r.json() : null)
-        .then(d => {
-          if (!d?.data) return;
+
+    fetch(`${API}/api/scalp-analysis`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (!d?.data) return;
+        const m = {};
+        d.data.forEach(r => { if (!r.status || r.status === 'ok') m[r.ticker] = r; });
+        setSideScalpSignals(m);
+      }).catch(() => {});
+
+    // SSE listener — replaces both setInterval loops
+    const sse = sseRef?.current;
+    if (!sse) return;
+
+    const handleMessage = (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        if (payload.type === 'watchlist_snapshot' && Array.isArray(payload.watchlist)) {
+          setSideWatchlist(payload.watchlist.length);
+        } else if (payload.type === 'watchlist_update' && Array.isArray(payload.watchlist)) {
+          setSideWatchlist(payload.watchlist.length);
+        } else if (payload.type === 'signal_snapshot' && Array.isArray(payload.data)) {
           const m = {};
-          d.data.forEach(r => { if (!r.status || r.status === 'ok') m[r.ticker] = r; });
+          payload.data.forEach(r => { if (!r.status || r.status === 'ok') m[r.ticker] = r; });
           setSideScalpSignals(m);
-        }).catch(() => {});
-    fetchScalp();
-    const id = setInterval(fetchScalp, 30_000);
-    return () => clearInterval(id);
-  }, []);
+        } else if (payload.type === 'signal_alert' && payload.data) {
+          const r = payload.data;
+          if (!r.status || r.status === 'ok') {
+            setSideScalpSignals(prev => ({ ...prev, [r.ticker]: r }));
+          }
+        }
+      } catch {}
+    };
+
+    sse.addEventListener('message', handleMessage);
+    return () => sse.removeEventListener('message', handleMessage);
+  }, [sseRef]);
   const sideSignalCount = useMemo(() =>
     Object.values(sideScalpSignals).filter(r => r.signal === 'BUY' || r.signal === 'SELL').length,
   [sideScalpSignals]);
@@ -142,9 +166,9 @@ function NexRadarDashboard({
       case 'live':      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={()=>setQuickFilter(null)} wsStatus={wsStatus} onLiveCount={handleLiveCount} watchlistProp={watchlist} toggleWatchlistProp={toggleWatchlist} T={T} />;
       case 'chart':     return <PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />;
       case 'scanner':   return <PageScanner T={T} onNavigateToChart={(sym) => { setChartInitSymbol(sym); setPage('chart'); }} />;
-      case 'signals':   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} T={T} />;
+      case 'signals':   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} sseRef={sseRef} T={T} />;
       case 'earnings':  return <PageEarnings T={T} />;
-      case 'portfolio': return <PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlist} T={T} />;
+      case 'portfolio': return <PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlist} sseRef={sseRef} T={T} />;
       default:          return null;
     }
   };

@@ -435,6 +435,103 @@ function FilterBar({ filters, setFilters, T }) {
   );
 }
 
+// ── MTF Components ───────────────────────────────────────────────────────────
+
+function trendIcon(trend) {
+  return trend === 'Bullish' ? '▲' : trend === 'Bearish' ? '▼' : '◆';
+}
+function trendColor(trend, T) {
+  return trend === 'Bullish' ? T.green : trend === 'Bearish' ? T.red : T.text2;
+}
+function confBar(score, T) {
+  const pct   = Math.abs(score) * 100;
+  const color = score > 0.05 ? T.green : score < -0.05 ? T.red : T.text2;
+  return (
+    <div style={{ width:80, height:6, background:T.bg3, borderRadius:3, position:'relative', overflow:'hidden' }}>
+      <div style={{ position:'absolute', top:0, left:'50%', width:1, height:'100%', background:T.border }}/>
+      <div style={{ position:'absolute', top:0, height:'100%', borderRadius:3, background:color,
+        left: score >= 0 ? '50%' : `${50 - pct/2}%`, width: `${pct/2}%` }}/>
+    </div>
+  );
+}
+function MTFHeader({ sortKey, sortDir, onSort, T }) {
+  const col = (key, label, w, align='left') => (
+    <th key={key} onClick={() => onSort(key)}
+      style={{ padding:'8px 10px', color:sortKey===key?T.cyan:T.text2, fontSize:9, fontWeight:600,
+        letterSpacing:0.8, cursor:'pointer', userSelect:'none', textAlign:align, width:w, whiteSpace:'nowrap' }}>
+      {label}{sortKey===key?(sortDir==='asc'?' ↑':' ↓'):''}
+    </th>
+  );
+  return (
+    <div style={{ flexShrink:0 }}>
+      <table style={{ width:'100%', borderCollapse:'collapse', tableLayout:'fixed' }}>
+        <thead>
+          <tr style={{ borderBottom:`1px solid ${T.border}`, background:T.bg2 }}>
+            {col('ticker','TICKER',70)} {col('signal_1m','SIG 1M',58)}
+            {col('trend_1m','TREND 1M',82)} {col('trend_5m','TREND 5M',82)} {col('trend_15m','TREND 15M',82)}
+            {col('rsi_1m','RSI 1M',50,'right')} {col('rsi_5m','RSI 5M',50,'right')}
+            {col('confluence','CONFLUENCE','auto','center')} {col('tier','TIER',40,'center')}
+            {col('aligned','⚡',44,'center')}
+          </tr>
+        </thead>
+      </table>
+    </div>
+  );
+}
+function MTFRow({ row, onClickTicker, T }) {
+  const ts = tierStyle(row.tier, T);
+  const dirColor = row.direction === 'BULL' ? T.green : row.direction === 'BEAR' ? T.red : T.text2;
+  return (
+    <table style={{ width:'100%', borderCollapse:'collapse', tableLayout:'fixed' }}>
+      <tbody>
+        <tr className="tr-hover" onClick={() => onClickTicker && onClickTicker(row.ticker)}
+          style={{ borderBottom:`1px solid ${T.border}30` }}>
+          <td style={{ padding:'7px 10px', width:70 }}>
+            <span style={{ color:T.cyan, fontSize:12, fontWeight:700, fontFamily:'monospace' }}>{row.ticker}</span>
+          </td>
+          <td style={{ padding:'7px 10px', width:58 }}>
+            <span style={{ color:row.signal_1m==='BUY'?T.green:row.signal_1m==='SELL'?T.red:T.text2, fontSize:10, fontWeight:700 }}>{row.signal_1m}</span>
+          </td>
+          <td style={{ padding:'7px 10px', width:82 }}>
+            <span style={{ color:trendColor(row.trend_1m,T), fontSize:11 }}>{trendIcon(row.trend_1m)} {row.trend_1m}</span>
+          </td>
+          <td style={{ padding:'7px 10px', width:82 }}>
+            <span style={{ color:trendColor(row.trend_5m,T), fontSize:11 }}>{row.trend_5m!=='—'?trendIcon(row.trend_5m):''} {row.trend_5m||'—'}</span>
+          </td>
+          <td style={{ padding:'7px 10px', width:82 }}>
+            <span style={{ color:trendColor(row.trend_15m,T), fontSize:11 }}>{row.trend_15m!=='—'?trendIcon(row.trend_15m):''} {row.trend_15m||'—'}</span>
+          </td>
+          <td style={{ padding:'7px 10px', width:50, textAlign:'right' }}>
+            <span style={{ color:row.rsi_1m>70?T.red:row.rsi_1m<30?T.green:T.text1, fontSize:11, fontFamily:'monospace' }}>
+              {row.rsi_1m?.toFixed(0)??'—'}
+            </span>
+          </td>
+          <td style={{ padding:'7px 10px', width:50, textAlign:'right' }}>
+            <span style={{ color:row.rsi_5m>70?T.red:row.rsi_5m<30?T.green:T.text1, fontSize:11, fontFamily:'monospace' }}>
+              {row.rsi_5m?.toFixed(0)??'—'}
+            </span>
+          </td>
+          <td style={{ padding:'7px 10px', textAlign:'center' }}>
+            <div style={{ display:'flex', alignItems:'center', gap:6, justifyContent:'center' }}>
+              {confBar(row.confluence, T)}
+              <span style={{ color:dirColor, fontSize:9, fontWeight:700, minWidth:32 }}>
+                {row.confluence>=0?'+':''}{row.confluence?.toFixed(2)}
+              </span>
+            </div>
+          </td>
+          <td style={{ padding:'7px 10px', width:40, textAlign:'center' }}>
+            <span style={{ background:ts.bg, border:`1px solid ${ts.border}`, color:ts.color,
+              borderRadius:4, padding:'2px 5px', fontSize:9, fontWeight:700 }}>{row.tier}</span>
+          </td>
+          <td style={{ padding:'7px 10px', width:44, textAlign:'center' }}>
+            {row.aligned ? <span style={{ color:T.green }}>⚡</span> : <span style={{ color:T.border }}>—</span>}
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  );
+}
+
 // ── Main Page ─────────────────────────────────────────────────────────────────
 export default function PageScanner({ T, onNavigateToChart }) {
   const [tab,       setTab]       = useState('opportunities'); // 'opportunities' | 'rs'
@@ -449,7 +546,14 @@ export default function PageScanner({ T, onNavigateToChart }) {
   const [sortDir,   setSortDir]   = useState('desc');
   const [rsSortKey, setRsSortKey] = useState('rs_spy');
   const [rsSortDir, setRsSortDir] = useState('desc');
+  const [mtfData,    setMtfData]    = useState([]);
+  const [mtfLoading, setMtfLoading] = useState(false);
+  const [mtfError,   setMtfError]   = useState(null);
+  const [mtfSortKey, setMtfSortKey] = useState('confluence');
+  const [mtfSortDir, setMtfSortDir] = useState('desc');
+  const [mtfFilter,  setMtfFilter]  = useState('ALL');
   const timerRef = useRef(null);
+  const mtfTimerRef = useRef(null);
 
   const fetchData = useCallback(async (showLoad = false) => {
     if (showLoad) setLoading(true);
@@ -469,11 +573,30 @@ export default function PageScanner({ T, onNavigateToChart }) {
     }
   }, []);
 
+  const fetchMtf = useCallback(async () => {
+    setMtfLoading(true);
+    try {
+      const r = await fetch(`${API_BASE}/api/mtf-scanner`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      setMtfData(j.data || []);
+      setMtfError(null);
+    } catch (e) { setMtfError(e.message); }
+    finally { setMtfLoading(false); }
+  }, []);
+
   useEffect(() => {
     fetchData(true);
     timerRef.current = setInterval(() => fetchData(false), REFRESH_MS);
     return () => clearInterval(timerRef.current);
   }, [fetchData]);
+
+  useEffect(() => {
+    if (tab !== 'mtf') { clearInterval(mtfTimerRef.current); return; }
+    fetchMtf();
+    mtfTimerRef.current = setInterval(fetchMtf, REFRESH_MS);
+    return () => clearInterval(mtfTimerRef.current);
+  }, [tab, fetchMtf]);
 
   // ── Sorting ────────────────────────────────────────────────────────────────
   const handleOppSort = (key) => {
@@ -501,6 +624,25 @@ export default function PageScanner({ T, onNavigateToChart }) {
     if (bv == null) bv = sortDir === 'asc' ? Infinity : -Infinity;
     if (typeof av === 'string') return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
     return sortDir === 'asc' ? av - bv : bv - av;
+  });
+
+  const handleMtfSort = (key) => {
+    if (mtfSortKey === key) setMtfSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setMtfSortKey(key); setMtfSortDir('desc'); }
+  };
+
+  const mtfFiltered = mtfData.filter(r => {
+    if (mtfFilter === 'BULL')    return r.direction === 'BULL';
+    if (mtfFilter === 'BEAR')    return r.direction === 'BEAR';
+    if (mtfFilter === 'ALIGNED') return r.aligned === true;
+    return true;
+  });
+  const mtfRows = [...mtfFiltered].sort((a, b) => {
+    let av = a[mtfSortKey], bv = b[mtfSortKey];
+    if (av == null) av = mtfSortDir === 'asc' ? Infinity : -Infinity;
+    if (bv == null) bv = mtfSortDir === 'asc' ? Infinity : -Infinity;
+    if (typeof av === 'string') return mtfSortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+    return mtfSortDir === 'asc' ? av - bv : bv - av;
   });
 
   // ── Sorting: RS tab — sort by rs_spy descending by default ─────────────────
@@ -541,8 +683,9 @@ export default function PageScanner({ T, onNavigateToChart }) {
       {/* Sub-tab bar */}
       <div style={{ display: 'flex', gap: 4 }}>
         {[
-          { id: 'opportunities', label: '◈ OPPORTUNITIES', hint: 'Ranked by composite score' },
-          { id: 'rs',            label: '⇅ REL. STRENGTH', hint: 'Ranked by RS vs SPY'       },
+          { id: 'opportunities', label: '◈ OPPORTUNITIES', hint: 'Ranked by composite score'      },
+          { id: 'rs',            label: '⇅ REL. STRENGTH', hint: 'Ranked by RS vs SPY'            },
+          { id: 'mtf',           label: '⧖ MULTI-TF',      hint: '1m + 5m + 15m confluence scan'  },
         ].map(t => (
           <button key={t.id} className="btn-ghost"
             onClick={() => setTab(t.id)}
@@ -599,6 +742,50 @@ export default function PageScanner({ T, onNavigateToChart }) {
                   onClickTicker={onNavigateToChart} T={T} />
               ))}
             </div>
+          </>
+        )}
+
+        {tab === 'mtf' && (
+          <>
+            {mtfLoading && mtfData.length === 0 && (
+              <div style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:12, padding:48 }}>
+                <div style={{ color:T.cyan, fontSize:22 }}>⧖</div>
+                <div style={{ color:T.text1, fontSize:13, fontWeight:600 }}>Loading MTF scanner…</div>
+                <div style={{ color:T.text2, fontSize:11 }}>Aggregating 1m → 5m → 15m bars</div>
+              </div>
+            )}
+            {mtfError && (
+              <div style={{ background:T.redDim, border:`1px solid ${T.red}`, borderRadius:8, padding:'10px 16px', color:T.red, fontSize:12, margin:12 }}>⚠ {mtfError}</div>
+            )}
+            {!mtfLoading && mtfData.length === 0 && !mtfError && (
+              <div style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:14, padding:48 }}>
+                <div style={{ fontSize:32 }}>⧖</div>
+                <div style={{ color:T.text1, fontSize:14, fontWeight:700 }}>No MTF data yet</div>
+                <div style={{ color:T.text2, fontSize:11, textAlign:'center', maxWidth:360, lineHeight:1.7 }}>
+                  Needs <strong style={{ color:T.cyan }}>≥ 75 bars</strong> per symbol (~75 min after market open)
+                </div>
+              </div>
+            )}
+            {mtfRows.length > 0 && (
+              <>
+                <div style={{ display:'flex', gap:6, padding:'8px 12px', borderBottom:`1px solid ${T.border}`, flexShrink:0 }}>
+                  {['ALL','BULL','BEAR','ALIGNED'].map(f => (
+                    <button key={f} className="btn-ghost" onClick={() => setMtfFilter(f)}
+                      style={{ fontSize:9, padding:'4px 10px', fontWeight:700, letterSpacing:0.5,
+                        background:mtfFilter===f?T.cyanDim:undefined, color:mtfFilter===f?T.cyan:undefined,
+                        borderColor:mtfFilter===f?T.cyanMid:undefined }}>
+                      {f === 'ALIGNED' ? '⚡ ALIGNED' : f}
+                    </button>
+                  ))}
+                  <div style={{ flex:1 }}/>
+                  <span style={{ color:T.text2, fontSize:9, alignSelf:'center' }}>{mtfRows.length} tickers</span>
+                </div>
+                <MTFHeader sortKey={mtfSortKey} sortDir={mtfSortDir} onSort={handleMtfSort} T={T} />
+                <div style={{ flex:1, overflowY:'auto' }}>
+                  {mtfRows.map(row => <MTFRow key={row.ticker} row={row} onClickTicker={onNavigateToChart} T={T} />)}
+                </div>
+              </>
+            )}
           </>
         )}
 
