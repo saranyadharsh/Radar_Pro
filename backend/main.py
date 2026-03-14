@@ -494,6 +494,119 @@ async def get_scalp_analysis():
             "message": "Signal engine seeding — live signals appear within 10s."}
 
 
+
+# ── Opportunity Scanner + Relative Strength ─────────────────────────────────────
+@app.get("/api/opportunity-scanner")
+async def get_opportunity_scanner():
+    """
+    #2 AI Trade Opportunity Scanner + #3 Relative Strength Scanner.
+
+    For every watchlist ticker with a live scalp snapshot:
+      - Appends RS = ticker_pct_change - spy_pct_change (live from WS cache)
+      - Appends composite_score = scalp score + RS bonus
+      - Returns ranked list (best opportunities first, tiered A-D)
+
+    RS source: ws_engine._cache["SPY"]["percent_change"] — live Polygon tick,
+    no extra network calls, no new data source.
+    """
+    rows = db.get_signal_watchlist()
+    watchlist_tickers = {r["ticker"] for r in rows if r.get("ticker")}
+    if not watchlist_tickers:
+        return {"data": [], "spy_pct": None, "message": "No tickers in watchlist."}
+
+    # Pull SPY / QQQ % change from live WS cache
+    spy_pct = None
+    qqq_pct = None
+    try:
+        eng   = app.state.engine
+        cache = eng._cache if eng else {}
+        spy_e = cache.get("SPY") or cache.get("spy")
+        qqq_e = cache.get("QQQ") or cache.get("qqq")
+        if spy_e:
+            spy_pct = spy_e.get("percent_change") or spy_e.get("change_pct")
+        if qqq_e:
+            qqq_pct = qqq_e.get("percent_change") or qqq_e.get("change_pct")
+    except Exception as e:
+        logger.warning(f"opportunity-scanner: SPY/QQQ cache read failed: {e}")
+
+    # Get scalp snapshot for watchlist
+    scalp_rows = []
+    try:
+        eng = app.state.engine
+        if eng and eng._signal_watcher:
+            scalp_rows = eng._signal_watcher.get_scalp_snapshot(list(watchlist_tickers))
+    except Exception as e:
+        logger.warning(f"opportunity-scanner: scalp snapshot failed: {e}")
+
+    # Enrich each row with RS + composite score
+    live_cache = {}
+    try:
+        live_cache = app.state.engine._cache if app.state.engine else {}
+    except Exception:
+        pass
+
+    def rs_label(rs):
+        if rs is None:    return "—"
+        if rs >=  2.0:    return "VERY STRONG"
+        if rs >=  0.75:   return "STRONG"
+        if rs >=  0.25:   return "MODERATE"
+        if rs >= -0.25:   return "NEUTRAL"
+        if rs >= -0.75:   return "WEAK"
+        return "VERY WEAK"
+
+    enriched = []
+    for row in scalp_rows:
+        if row.get("status") == "warming_up":
+            continue
+        ticker  = row["ticker"]
+        score   = row.get("score", 0.0)
+        live    = live_cache.get(ticker, {})
+        pct_chg = live.get("percent_change") or live.get("change_pct") or 0.0
+        rvol    = live.get("rvol", row.get("volume", 1.0))
+        sector  = live.get("sector", "")
+        price   = live.get("live_price") or live.get("price") or row.get("price", 0)
+
+        rs_spy  = round(pct_chg - spy_pct, 3) if spy_pct is not None else None
+        rs_qqq  = round(pct_chg - qqq_pct, 3) if qqq_pct is not None else None
+
+        # RS bonus: up to ±0.10 so it nudges rank without overriding signal score
+        rs_bonus = max(-0.10, min(0.10, rs_spy * 0.02)) if rs_spy is not None else 0.0
+        composite = round(score + rs_bonus, 3)
+
+        abs_comp = abs(composite)
+        tier = "A" if abs_comp >= 0.75 else "B" if abs_comp >= 0.55 else "C" if abs_comp >= 0.40 else "D"
+
+        enriched.append({
+            **row,
+            "price":           round(float(price), 2) if price else row.get("price", 0),
+            "pct_change":      round(float(pct_chg), 3),
+            "rvol":            round(float(rvol), 2),
+            "sector":          sector,
+            "rs_spy":          rs_spy,
+            "rs_qqq":          rs_qqq,
+            "rs_label":        rs_label(rs_spy),
+            "composite_score": composite,
+            "tier":            tier,
+        })
+
+    tier_ord   = {"A": 0, "B": 1, "C": 2, "D": 3}
+    signal_ord = {"BUY": 0, "SELL": 1, "HOLD": 2}
+    enriched.sort(key=lambda r: (
+        tier_ord.get(r["tier"], 9),
+        signal_ord.get(r.get("signal", "HOLD"), 9),
+        -abs(r["composite_score"]),
+    ))
+
+    import time as _time
+    return {
+        "data":         enriched,
+        "spy_pct":      round(spy_pct, 3) if spy_pct is not None else None,
+        "qqq_pct":      round(qqq_pct, 3) if qqq_pct is not None else None,
+        "ticker_count": len(enriched),
+        "generated_at": int(_time.time()),
+    }
+
+
 # ── Yahoo Finance Proxy — Quote ────────────────────────────────────────────────
 _YF_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",

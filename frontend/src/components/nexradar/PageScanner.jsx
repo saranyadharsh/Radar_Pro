@@ -569,38 +569,12 @@ export default function PageScanner({ T, onNavigateToChart }) {
       )}
 
       {/* Table */}
-      <div className="card" style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 320 }}>
+      <div className="card" style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
 
-        {/* Loading spinner */}
-        {loading && data.length === 0 && (
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 12, padding: 48 }}>
-            <div style={{ color: T.cyan, fontSize: 22 }}>◈</div>
-            <div style={{ color: T.text1, fontSize: 13, fontWeight: 600 }}>Loading scanner…</div>
-            <div style={{ color: T.text2, fontSize: 11 }}>Fetching opportunity data from signal engine</div>
-          </div>
-        )}
-
-        {/* Empty state — after hours / warming up */}
+        {/* Warming-up note if signal engine is still seeding */}
         {!loading && data.length === 0 && !error && (
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 14, padding: 48 }}>
-            <div style={{ fontSize: 32 }}>🌙</div>
-            <div style={{ color: T.text1, fontSize: 14, fontWeight: 700 }}>No scanner data available</div>
-            <div style={{ color: T.text2, fontSize: 11, textAlign: 'center', maxWidth: 380, lineHeight: 1.7 }}>
-              The signal engine requires live 1-min bars from Polygon WebSocket.<br/>
-              Data populates within <strong style={{ color: T.cyan }}>~30 seconds of market open</strong> (9:30 AM ET).<br/>
-              After hours, the engine has no bars to compute — this is expected.
-            </div>
-            <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-              <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '8px 16px', fontSize: 10, color: T.text2 }}>
-                Pre-market: limited data
-              </div>
-              <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '8px 16px', fontSize: 10, color: T.text2 }}>
-                Market hours: full scanner
-              </div>
-              <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 8, padding: '8px 16px', fontSize: 10, color: T.text2 }}>
-                After hours: no data
-              </div>
-            </div>
+          <div style={{ padding: 32, textAlign: 'center', color: T.text2, fontSize: 12 }}>
+            Signal engine warming up — data appears within ~30s of market open.
           </div>
         )}
 
@@ -629,13 +603,8 @@ export default function PageScanner({ T, onNavigateToChart }) {
         )}
 
         {!loading && filtered.length === 0 && data.length > 0 && (
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10, padding: 48 }}>
-            <div style={{ fontSize: 24 }}>⌖</div>
-            <div style={{ color: T.text1, fontSize: 13, fontWeight: 600 }}>No tickers match the current filters</div>
-            <button className="btn-ghost" style={{ fontSize: 10, marginTop: 4 }}
-              onClick={() => setFilters({ tier: 'ALL', signal: 'ALL', rs: 'ALL' })}>
-              Clear filters
-            </button>
+          <div style={{ padding: 32, textAlign: 'center', color: T.text2, fontSize: 12 }}>
+            No tickers match the current filters.
           </div>
         )}
 

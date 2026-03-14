@@ -20,6 +20,7 @@ export const NAV = [
   { id: "screener",  label: "Screener",   icon: "⌖" },
   { id: "live",      label: "Live Table", icon: "◈" },
   { id: "chart",     label: "Chart",      icon: "◇" },
+  { id: "scanner",   label: "Scanner",    icon: "◈" },
   { id: "signals",   label: "Signals",    icon: "◉" },
   { id: "earnings",  label: "Earnings",   icon: "◎" },
   { id: "portfolio", label: "Portfolio",  icon: "◆" },
