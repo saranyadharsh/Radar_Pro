@@ -139,6 +139,9 @@ class WSEngine:
         self._tick_batch: Dict[str, dict] = {}
         self._batch_lock  = threading.Lock()
 
+        # Portfolio change-detection hash (PATCH-WSE-2)
+        self._last_portfolio_hash: str = ""
+
         # Background threads
         self._threads: List[threading.Thread] = []
 

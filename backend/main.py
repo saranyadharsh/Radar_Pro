@@ -172,13 +172,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="NexRadar Pro API", version="6.0.0", lifespan=lifespan)
 
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://nexradar.info")
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://nexradar.info").rstrip("/")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         FRONTEND_ORIGIN,
         "https://nexradar.info",
-        "https://radar-pro-frontend-bxtq.onrender.com",
+        "https://www.nexradar.info",
+        "https://radar-pro-frontend-zgy9.onrender.com",
         "http://localhost:5173",
         "http://localhost:3000",
     ],
