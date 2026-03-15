@@ -26,7 +26,7 @@ const DEFAULT_WATCHLIST = [
   { symbol:"JPM",   companyName:"JPMorgan Chase",         sector:"Financial",  tags:["DIVIDEND"] },
 ];
 
-function RangeBar({ price, high, low }) {
+function RangeBar({ price, high, low, T }) {
   if (!price||!high||!low||high===low) return <span style={{color:T.text2,fontSize:9}}>—</span>;
   const pct = Math.round(((price-low)/(high-low))*100);
   const color = pct>70?T.green:pct>40?T.gold:T.red;
@@ -38,7 +38,7 @@ function RangeBar({ price, high, low }) {
   </div>;
 }
 
-function EdgarBadge({ alert }) {
+function EdgarBadge({ alert, T }) {
   if (!alert) return null;
   const color = ["VERY_POSITIVE","POSITIVE"].includes(alert.impact)?T.green
     :["VERY_NEGATIVE","NEGATIVE"].includes(alert.impact)?T.red:T.orange;
@@ -49,7 +49,7 @@ function EdgarBadge({ alert }) {
 }
 
 // News push badge — appears on row when new headline arrives
-function NewsBadge({ alert }) {
+function NewsBadge({ alert, T }) {
   if (!alert) return null;
   const color = alert.sentiment==="positive"?T.green
     :alert.sentiment==="negative"?T.red:T.gold;
@@ -64,7 +64,7 @@ function NewsBadge({ alert }) {
 }
 
 // Floating toast for breaking news
-function NewsToast({ toast, onDismiss }) {
+function NewsToast({ toast, onDismiss, T }) {
   if (!toast) return null;
   const color = toast.sentiment==="positive"?T.green
     :toast.sentiment==="negative"?T.red:T.gold;
@@ -363,8 +363,8 @@ export default function PageWatchlist({ onNavigateToSettings, T }) {
                   <div style={{padding:"9px 4px"}}>
                     <div style={{color:T.cyan,fontSize:11,fontFamily:T.font,
                       fontWeight:800}}>{w.symbol}</div>
-                    <EdgarBadge alert={alert}/>
-                    <NewsBadge alert={newsAlert}/>
+                    <EdgarBadge alert={alert} T={T}/>
+                    <NewsBadge alert={newsAlert} T={T}/>
                     <div style={{display:"flex",gap:2,flexWrap:"wrap",marginTop:2}}>
                       {w.tags?.slice(0,2).map(tag=>(
                         <span key={tag} style={{background:T.bg4,color:T.text2,
@@ -407,7 +407,7 @@ export default function PageWatchlist({ onNavigateToSettings, T }) {
 
                   <div style={{padding:"9px 4px",display:"flex",alignItems:"center"}}>
                     <RangeBar price={live?.price}
-                      high={live?.high} low={live?.low}/>
+                      high={live?.high} low={live?.low} T={T}/>
                   </div>
 
                   <div style={{padding:"9px 4px",display:"flex",alignItems:"center"}}>
@@ -450,7 +450,7 @@ export default function PageWatchlist({ onNavigateToSettings, T }) {
       </div>
 
       {/* Floating news toast — auto push */}
-      <NewsToast toast={toast} onDismiss={()=>setToast(null)}/>
+      <NewsToast toast={toast} onDismiss={()=>setToast(null)} T={T}/>
     </div>
   );
 }
