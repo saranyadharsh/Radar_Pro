@@ -238,7 +238,7 @@ function NexRadarDashboard({
     switch (page) {
       // Eager pages — no Suspense needed
       case 'dashboard': return <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange} onNavigate={setPage} sectorPerformance={sectorPerformance} tickers={tickers} techData={techData} techLoading={techLoading} T={T} />;
-      case 'live':      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={()=>setQuickFilter(null)} wsStatus={wsStatus} onLiveCount={handleLiveCount} watchlistProp={watchlist} toggleWatchlistProp={toggleWatchlist} T={T} />;
+      case 'live':      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={()=>setQuickFilter(null)} wsStatus={wsStatus} onLiveCount={handleLiveCount} watchlistProp={watchlist} toggleWatchlistProp={toggleWatchlist} isActive={page === 'live'} T={T} />;
       // Lazy pages — wrapped in Suspense, downloaded on first visit
       case 'screener':  return withLazy(<PageScreener tickers={tickers} watchlist={watchlist} toggleWatchlist={toggleWatchlist} techData={techData} scalpData={sideScalpSignals} T={T} />);
       case 'chart':     return withLazy(<PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />);

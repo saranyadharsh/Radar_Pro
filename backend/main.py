@@ -185,11 +185,22 @@ class SSEBroadcaster:
     QUEUE_MAXSIZE      = 500
     SLOW_CLIENT_TTL_S  = 10   # seconds a full queue is tolerated before eviction
 
+    REPLAY_BUFFER_SIZE = 300   # keep last 300 batches (~5 min at 1/sec)
+
     def __init__(self):
         self._queues:       Dict[asyncio.Queue, str]  = {}  # queue -> client_id
         self._slow_since:   Dict[asyncio.Queue, float] = {} # queue -> monotonic time when full started
         self._snapshot:     dict                = {}
         self._snapshot_map: Dict[str, dict]     = {}
+        # SEQ-FIX: sequence counter + replay buffer for gap recovery
+        self._seq:          int                 = 0
+        self._replay_buf:   list                = []   # list of (seq, ts, serialized_payload)
+        # TICKER-MAP: int ID map distributed to clients on connect
+        self._ticker_map:   Dict[str, int]      = {}   # symbol -> int id
+        self._ticker_map_rev: Dict[int, str]    = {}   # int id -> symbol
+        # TIERED-RECONNECT: per-ticker last-update timestamp (ms)
+        # Used to build a "changed since client_ts" delta instead of full snapshot
+        self._ticker_ts:    Dict[str, int]      = {}   # symbol -> last update ms
 
     async def publish(self, payload: dict) -> None:
         msg_type = payload.get("type")
@@ -197,22 +208,42 @@ class SSEBroadcaster:
         # Always maintain the full snapshot map for new connects
         if msg_type == "snapshot":
             self._snapshot = payload
+            _now_ms = payload.get("ts") or int(time.time() * 1000)
             for row in payload.get("data", []):
                 tk = row.get("ticker")
                 if tk:
                     self._snapshot_map[tk] = row
+                    self._ticker_ts[tk]    = _now_ms
 
         elif msg_type == "snapshot_delta":
+            _now_ms = payload.get("ts") or int(time.time() * 1000)
             for row in payload.get("data", []):
                 tk = row.get("ticker")
                 if tk:
                     self._snapshot_map[tk] = row
+                    self._ticker_ts[tk]    = _now_ms
+
+        elif msg_type == "tick_batch":
+            _now_ms = int(time.time() * 1000)
+            for row in payload.get("data", []):
+                tk = row.get("ticker")
+                if tk:
+                    self._ticker_ts[tk] = _now_ms
+
+        # SEQ-FIX: stamp sequence number on every outgoing message
+        self._seq += 1
+        payload["seq"] = self._seq
 
         # FIX-1: zero-client guard
         if not self._queues:
             return
 
         msg  = "data: " + _dumps(payload) + "\n\n"  # GAP-4: orjson
+
+        # SEQ-FIX: store in replay buffer (capped at REPLAY_BUFFER_SIZE)
+        self._replay_buf.append((self._seq, time.monotonic(), msg))
+        if len(self._replay_buf) > self.REPLAY_BUFFER_SIZE:
+            self._replay_buf.pop(0)
         now  = time.monotonic()
         dead = set()
 
@@ -255,6 +286,43 @@ class SSEBroadcaster:
     def get_snapshot(self) -> dict:
         """Returns the last full snapshot payload (for REST /api/snapshot)."""
         return self._snapshot
+
+    def get_changed_since(self, since_ms: int) -> list:
+        """
+        TIERED-RECONNECT: return only rows that changed after since_ms.
+        Used for medium-gap reconnects (10s-30s) to avoid sending all 6027 rows.
+        Returns full snapshot rows (not slim deltas) so client gets complete state.
+        """
+        return [
+            row for tk, row in self._snapshot_map.items()
+            if self._ticker_ts.get(tk, 0) >= since_ms
+        ]
+
+    def build_ticker_map(self, tickers: list) -> dict:
+        """
+        Build or return cached {symbol: int_id} map.
+        IDs are stable for the server lifetime — assigned in the order
+        tickers were loaded from stock_list at startup.
+        """
+        if not self._ticker_map and tickers:
+            for i, sym in enumerate(sorted(tickers), start=1):
+                self._ticker_map[sym]    = i
+                self._ticker_map_rev[i]  = sym
+        return self._ticker_map
+
+    def get_replay(self, from_seq: int, to_seq: int) -> list:
+        """
+        Return serialized messages for seq range [from_seq, to_seq].
+        Used by /api/replay for gap recovery.
+        Returns empty list if range not in buffer (client should request snapshot).
+        """
+        return [
+            msg for (seq, ts, msg) in self._replay_buf
+            if from_seq <= seq <= to_seq
+        ]
+
+    def get_current_seq(self) -> int:
+        return self._seq
 
     def get_snapshot_map(self) -> Dict[str, dict]:
         """Returns the always-current ticker->row map (for SSE connect burst)."""
@@ -390,6 +458,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="NexRadar Pro API", version="6.5.0", lifespan=lifespan)
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://nexradar.info").rstrip("/")
+# GZip REST compression — applies to all non-SSE endpoints automatically.
+# StreamingResponse (SSE /api/stream) is excluded by FastAPI because
+# GZipMiddleware checks Content-Type and skips text/event-stream.
+# Saves 70-80% on /api/snapshot, /api/market-monitor, /api/stock-data etc.
+from fastapi.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=500)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -518,16 +593,37 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
             snap_ts  = int(time.time() * 1000)
             age_ms   = snap_ts - client_ts
 
-            # Decide whether to send full snapshot or just ack
-            if client_ts == 0 or age_ms > 10_000 or not snap_map:
-                # True first load or stale — send full snapshot from map
+            # ── TIERED RECONNECT ──────────────────────────────────────────────
+            # Tier 1  client_ts == 0 (no prior data)  → full snapshot only
+            # Tier 2  client_ts > 0, age > 10s        → delta of changed rows only
+            # Tier 3  age <= 10s                       → lightweight ack only
+            #
+            # Full snapshot is ONLY sent on true first load (client_ts==0).
+            # Every reconnect after that uses get_changed_since(client_ts) which
+            # returns only rows updated while the client was away — works for any
+            # gap length. A 10min gap returns ~2000 rows (~1MB) not all 6027 (~3MB).
+            # After-hours / weekends: near zero rows, near zero bytes.
+
+            FRESH_THRESHOLD_MS = 10_000   # <= 10s → ack only, data still current
+            is_first_load      = client_ts == 0 or not snap_map
+
+            if is_first_load:
+                # Tier 1: First ever load — client has nothing, send everything
+                ticker_map = broadcaster.build_ticker_map(
+                    list(snap_map.keys()) if snap_map else []
+                )
+                if ticker_map:
+                    yield "data: " + json.dumps({
+                        "type": "ticker_map",
+                        "map":  ticker_map,
+                        "seq":  broadcaster.get_current_seq(),
+                    }) + "\n\n"
                 if snap_map:
-                    full_snap = {
+                    yield "data: " + json.dumps({
                         "type": "snapshot",
                         "data": list(snap_map.values()),
                         "ts":   snap_ts,
-                    }
-                    yield "data: " + json.dumps(full_snap) + "\n\n"
+                    }) + "\n\n"
 
                 # PATCH-MAIN-1: Signal snapshot on connect
                 try:
@@ -558,10 +654,29 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
                 except Exception as e:
                     logger.warning(f"SSE connect: watchlist_snapshot failed: {e}")
 
-            else:
-                # Client has fresh data — skip 3 MB snapshot entirely
-                yield f'data: {{"type":"reconnected","ts":{snap_ts}}}\n\n'
+            elif age_ms > FRESH_THRESHOLD_MS:
+                # Tier 2: Any reconnect with a known prior state.
+                # Send only rows that changed since client_ts — any gap length.
+                # Peak market hours + 10min away → ~2000 rows, not 6027.
+                # After-hours or quiet market → often 0 rows → pure ack.
+                changed = broadcaster.get_changed_since(client_ts)
+                if changed:
+                    yield "data: " + json.dumps({
+                        "type":    "snapshot_delta",
+                        "data":    changed,
+                        "ts":      snap_ts,
+                        "partial": True,
+                    }) + "\n\n"
+                    logger.info(
+                        f"SSE {client_id}: tier-2 reconnect "
+                        f"gap={age_ms//1000}s {len(changed)}/{len(snap_map)} rows"
+                    )
+                else:
+                    yield f'data: {{"type":"reconnected","ts":{snap_ts}}}\n\n'
 
+            else:
+                # Tier 3: age <= 10s — data still current, ack only
+                yield f'data: {{"type":"reconnected","ts":{snap_ts}}}\n\n'
             # Live stream
             while True:
                 if await request.is_disconnected():
@@ -836,10 +951,9 @@ async def get_market_monitor(refresh: int = Query(0)):
     _eng          = getattr(app.state, "engine", None)
     signal_engine = _eng._signal_watcher if _eng else None
 
-    # PRICE-FILL FIX: pass ws_engine._cache so warming_up/seeding rows get
-    # a live Polygon price instead of price=0.
-    # ws_engine._cache is always populated from the bulk Polygon REST snapshot
-    # at startup, so every ticker has a price even before 27 bars accumulate.
+    # PRICE-FILL: pass ws_engine._cache so warming_up/seeding rows get a live
+    # Polygon price instead of price=0. ws_engine._cache is always populated
+    # from the bulk Polygon REST snapshot at startup.
     _price_cache = None
     try:
         if _eng and hasattr(_eng, "_cache"):
@@ -1356,6 +1470,26 @@ async def edgar_proxy(symbol: str):
     except Exception as e:
         logger.debug(f"EDGAR proxy {sym}: {e}")
         return {"hits": {"hits": [], "total": {"value": 0}}}
+
+
+# ── Sequence Gap Recovery ──────────────────────────────────────────────────────
+# Client calls this when it detects a seq gap < 30s old.
+# Returns the missed batches from the in-memory replay buffer.
+# If gap > 30s or buffer doesn't cover the range, client should reconnect
+# (sseWorker handles this automatically via client_ts handshake).
+@app.get("/api/replay")
+async def get_replay(from_seq: int = Query(...), to_seq: int = Query(...)):
+    if not broadcaster:
+        raise HTTPException(status_code=503, detail="Broadcaster not ready")
+    gap = to_seq - from_seq
+    if gap > 300:
+        # Too large — cheaper to send fresh snapshot via reconnect
+        return {"ok": False, "reason": "gap_too_large", "gap": gap}
+    messages = broadcaster.get_replay(from_seq, to_seq)
+    if not messages:
+        return {"ok": False, "reason": "not_in_buffer"}
+    return {"ok": True, "from_seq": from_seq, "to_seq": to_seq,
+            "count": len(messages), "messages": messages}
 
 # ── Debug: Sector Map ──────────────────────────────────────────────────────────
 @app.get("/api/debug/sectors")

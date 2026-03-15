@@ -45,6 +45,8 @@ export function useTickerData() {
   // Mutable ref store — avoids Map copy on every tick
   const tickerCacheRef      = useRef(new Map());
   const tickerCacheDirtyRef = useRef(false);
+  // TICKER-MAP: {symbol: intId} — stored for future flat-array decoding
+  const tickerMapRef        = useRef({});
   const lastSessionRef      = useRef(getMarketSession());
   const sseRef              = useRef(null);
   const midnightTimerRef    = useRef(null);
@@ -259,6 +261,12 @@ export function useTickerData() {
           _pushNotif({ type:'ah',   icon:'🌙', color:'#b388ff', ticker:row.ticker, title:`${row.ticker} AH MOMENTUM`, sub:`${(row.percent_change||0).toFixed(2)}% AH` })
         if (row?.is_gap_play)
           _pushNotif({ type:'gap',  icon:'📊', color:'#ffc400', ticker:row.ticker, title:`${row.ticker} GAP PLAY`,    sub:`${(row.gap_percent||0).toFixed(1)}% gap` })
+        return
+      }
+
+      if (msg.type === 'ticker_map') {
+        // Store int↔symbol map for future flat-array decoding (optimization #2)
+        tickerMapRef.current = msg.map ?? {}
         return
       }
 

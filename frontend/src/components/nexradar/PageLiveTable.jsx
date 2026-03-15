@@ -119,7 +119,7 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
   (prev.noiBySym?.[prev.ticker.ticker]?.imbalance_side) === (next.noiBySym?.[next.ticker.ticker]?.imbalance_side)
 ));
 
-export default function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", wsWatchlistRef = null, quickFilter = null, onClearQuickFilter = null, wsStatus = 'connected', onLiveCount = null, watchlistProp = null, toggleWatchlistProp = null, T }) {
+export default function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", wsWatchlistRef = null, quickFilter = null, onClearQuickFilter = null, wsStatus = 'connected', onLiveCount = null, watchlistProp = null, toggleWatchlistProp = null, isActive = true, T }) {
   const [viewMode,     setViewMode]     = useState("TABLE");
   const [source,       setSource]       = useState("ALL");
   const [minDelta,     setMinDelta]     = useState(0);
@@ -181,13 +181,17 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
     }
   }, [viewMode]);
 
-  // Scalp signals
+  // POLL-FIX: only poll /api/scalp-analysis when Live Table tab is active.
+  // Old: polled every 30s unconditionally = 120 Render HTTP requests/hr even
+  // when user is on Portfolio/Signals/Scanner tab.
+  // New: stops polling on tab switch, resumes + immediate fetch on return.
   useEffect(() => {
+    if (!isActive) return;  // don't poll when tab is not visible
     const poll = () => fetch(`${API_BASE}/api/scalp-analysis`).then(r=>r.ok?r.json():null).then(d=>{ if(!d?.data)return; const m={}; d.data.forEach(r=>{if(!r.status||r.status==="ok")m[r.ticker]=r;}); setScalpSignals(m); }).catch(()=>{});
-    poll();
+    poll();  // immediate fetch on tab activation
     const id = setInterval(poll, 30_000);
     return () => clearInterval(id);
-  }, []);
+  }, [isActive]);
 
   // LULD halt tracking
   useEffect(() => {
@@ -262,9 +266,18 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
     setCurrentPage(1);
   };
 
-  // Two-tier sort throttle
+  // SORT-FIX: drive sort from tickers Map size + ts instead of 1s setInterval.
+  // Old: setInterval 1000ms = 3600 forced re-renders/hr regardless of data changes.
+  // New: only increments when tickers actually update — zero renders during idle.
   const [sortTrigger, setSortTrigger] = useState(0);
-  useEffect(() => { const id=setInterval(()=>setSortTrigger(t=>t+1),1000); return ()=>clearInterval(id); }, []);
+  const prevTickersSizeRef = useRef(0);
+  useEffect(() => {
+    const size = tickers.size;
+    if (size !== prevTickersSizeRef.current) {
+      prevTickersSizeRef.current = size;
+      setSortTrigger(t => t + 1);
+    }
+  }, [tickers]);
 
   const [userFilterVersion, setUserFilterVersion] = useState(0);
   useEffect(() => { setUserFilterVersion(v=>v+1); }, [selectedSectors, source, watchlist, earningsTickers, quickFilter]);

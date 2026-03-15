@@ -53,14 +53,22 @@
 'use strict'
 
 const state = {
-  es:      null,       // EventSource instance — one for the whole browser session
-  cache:   {},         // ticker → latest row (always current, all msg types merged)
-  snapTs:  0,          // ts of last snapshot/delta — used for client_ts handshake
-  ports:   new Set(),  // one MessagePort per connected tab
-  feedOk:  null,       // last known feed_status.ok — replayed to new tab ports
-  attempt: 0,          // reconnect backoff counter
-  apiBase: '',         // set once by the first tab — absolute URL e.g. https://api.nexradar.info
+  es:        null,     // EventSource instance — one for the whole browser session
+  cache:     {},       // ticker → latest row (always current, all msg types merged)
+  snapTs:    0,        // ts of last snapshot/delta — used for client_ts handshake
+  ports:     new Set(),// one MessagePort per connected tab
+  feedOk:    null,     // last known feed_status.ok — replayed to new tab ports
+  attempt:   0,        // reconnect backoff counter
+  apiBase:   '',       // set once by the first tab
+  // SEQ-FIX: gap detection
+  lastSeq:   0,        // last received sequence number
+  tickerMap: {},       // {symbol: intId} — sent by server on connect
+  tickerMapRev: {},    // {intId: symbol} — reverse lookup
 }
+
+// SEQ-FIX: gap recovery thresholds
+const GAP_REPLAY_MAX_S  = 30   // gaps < 30s → replay missed batches
+const GAP_REPLAY_MAX_N  = 300  // gaps > 300 seq → skip replay, use snapshot
 
 // HOP-2: explicit backoff table — no surprise long waits from 2**n formulas
 const BACKOFF_MS  = [1000, 2000, 4000, 8000, 30_000]
@@ -123,9 +131,66 @@ function connect() {
 
     resetWatchdog()  // any message resets the dead-connection watchdog
 
+    // SEQ-FIX: detect and recover from sequence gaps
+    if (msg.seq !== undefined) {
+      const expected = state.lastSeq + 1
+      const received = msg.seq
+      if (state.lastSeq > 0 && received > expected) {
+        const gap        = received - expected
+        const gapAgeMs   = Date.now() - state.snapTs
+        const gapAgeSec  = gapAgeMs / 1000
+        if (gap <= GAP_REPLAY_MAX_N && gapAgeSec <= GAP_REPLAY_MAX_S) {
+          // Short gap — fetch missed batches from replay buffer
+          console.info(`[sseWorker] Seq gap ${expected}→${received} (${gap} missed) — replaying`)
+          fetch(`${state.apiBase}/api/replay?from_seq=${expected}&to_seq=${received - 1}`)
+            .then(r => r.json())
+            .then(data => {
+              if (data.ok && data.messages) {
+                data.messages.forEach(rawMsg => {
+                  // rawMsg is "data: {...}
+
+" — extract JSON
+                  const json = rawMsg.replace(/^data: /, '').trim()
+                  try {
+                    const m = JSON.parse(json)
+                    // Apply to cache (replay, don't broadcast to tabs — they'll get live update)
+                    if (m.type === 'snapshot_delta' || m.type === 'tick_batch') {
+                      ;(m.data ?? []).forEach(row => { if (row?.ticker) state.cache[row.ticker] = row })
+                    }
+                  } catch {}
+                })
+              } else {
+                // Buffer miss — reconnect will send fresh snapshot via client_ts
+                console.info(`[sseWorker] Replay unavailable (${data.reason}) — next reconnect will resync`)
+              }
+            })
+            .catch(() => {})
+        } else if (gapAgeSec > GAP_REPLAY_MAX_S) {
+          // Long gap > 30s — sseWorker passes snapTs as client_ts on reconnect.
+          // Backend tiers the response:
+          //   10-30s gap → snapshot_delta (only changed rows, not all 6027)
+          //   > 30s gap  → full snapshot (unavoidable after long absence)
+          // No action needed here — the connect() function handles it automatically.
+          console.info(`[sseWorker] Gap ${gapAgeSec.toFixed(0)}s — tier-${gapAgeSec > 30 ? 1 : 2} recovery on next reconnect`)
+        }
+      }
+      state.lastSeq = received
+    }
+
     // ── Update worker-side cache ──────────────────────────────────────────
     // Cache is kept current so new/refreshed tabs get instant data via get_snapshot
     // without any network round-trip.
+
+    // TICKER-MAP: store int↔symbol map sent on connect
+    if (msg.type === 'ticker_map') {
+      state.tickerMap    = msg.map ?? {}
+      state.tickerMapRev = {}
+      Object.entries(state.tickerMap).forEach(([sym, id]) => {
+        state.tickerMapRev[id] = sym
+      })
+      broadcast(msg)  // forward to tabs so they can decode flat-array messages
+      return
+    }
 
     if (msg.type === 'snapshot') {
       // Full state replace — sent only on true first connect or stale reconnect
@@ -211,10 +276,15 @@ self.onconnect = (e) => {
        * so the existing snapshot handler in useTickerData applies unchanged.
        */
       port.postMessage({
-        type: 'snapshot',
-        data: Object.values(state.cache),
-        ts:   state.snapTs,
+        type:    'snapshot',
+        data:    Object.values(state.cache),
+        ts:      state.snapTs,
+        lastSeq: state.lastSeq,
       })
+      // Also send ticker_map so the new tab can decode flat-array messages
+      if (Object.keys(state.tickerMap).length > 0) {
+        port.postMessage({ type: 'ticker_map', map: state.tickerMap })
+      }
 
       // Replay last known feed status so the tab's wsStatus indicator is correct
       if (state.feedOk !== null) {

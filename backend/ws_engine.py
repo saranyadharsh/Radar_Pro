@@ -57,7 +57,7 @@ ET = ZoneInfo("America/New_York")
 
 POLYGON_WS_URL   = "wss://socket.polygon.io/stocks"
 POLYGON_REST_URL = "https://api.polygon.io/v2"
-SNAPSHOT_INTERVAL_S  = 300    # DELTA-FIX: full resync every 5min, tick_batch handles live updates
+SNAPSHOT_INTERVAL_S  = 15     # check for dirty tickers every 15s
 PORTFOLIO_REFRESH_S  = 60   # PORTFIX-1: safety-net poll only; instant updates via /api/portfolio/sync
 AH_CLOSE_REFRESH_S   = 60   # 1 min  -  refresh AH closes during extended hours
 DB_WRITE_INTERVAL_S  = 300
@@ -451,11 +451,24 @@ class WSEngine:
         # GAP-5: track queue depth for /api/metrics health monitoring
         self._tick_queue.append(ticker)
 
-        # Accumulate into batch — flushed every 250ms by _tick_flush_loop
-        # This reduces SSE message volume from ~1000/s to ~4/s, preventing
-        # queue eviction and zombie connections on the frontend.
-        with self._batch_lock:
-            self._tick_batch[ticker] = updated
+        # THRESHOLD-FIX: only push to SSE batch if price moved >= 0.05%
+        # OR >= 5s have passed since last send for this ticker.
+        # Eliminates ~60% of micro-movement ticks invisible to the human eye.
+        # Signal watcher + DB write still receive every tick above (unchanged).
+        last_sent_price = entry.get("_last_sent_price", 0)
+        last_sent_ts    = entry.get("_last_sent_ts", 0)
+        now_ms          = updated["ts"]
+        price_moved_pct = (abs(price - last_sent_price) / last_sent_price * 100
+                           if last_sent_price > 0 else 100)
+        secs_since_sent = (now_ms - last_sent_ts) / 1000 if last_sent_ts > 0 else 99
+
+        if price_moved_pct >= 0.05 or secs_since_sent >= 5:
+            updated["_last_sent_price"] = price
+            updated["_last_sent_ts"]    = now_ms
+            self._cache[ticker]["_last_sent_price"] = price
+            self._cache[ticker]["_last_sent_ts"]    = now_ms
+            with self._batch_lock:
+                self._tick_batch[ticker] = updated
 
     # ── Tick flush loop ────────────────────────────────────────────────────────
 
@@ -485,33 +498,36 @@ class WSEngine:
 
     def _snapshot_loop(self) -> None:
         """
-        Broadcasts full cache snapshot every SNAPSHOT_INTERVAL_S seconds (300s).
+        Broadcasts snapshot_delta every 15s — only tickers that changed
+        since the last flush (_dirty_tickers). Zero bytes when nothing changed.
 
-        DELTA-FIX strategy: tick_batch handles live per-ticker updates every 250ms
-        with slim 7-field deltas. This loop provides a full resync every 5 minutes
-        so any client that missed deltas gets a complete state refresh.
+        Full snapshot is NOT sent periodically because every data path is
+        already covered without it:
+          • tick_batch (250ms)     — live price/volume for active tickers
+          • snapshot_delta (15s)   — all fields for any ticker that ticked
+          • SSE connect burst      — full snapshot from broadcaster._snapshot_map
+                                     sent to every new/reconnected client
+          • client_ts handshake    — skips connect burst if client data is fresh
 
-        The _connected gate was removed intentionally.
-        Reason: after a disconnect, _fetch_polygon_snapshot_bulk() immediately
-        repopulates the cache with fresh Polygon REST prices before the WS
-        reconnects. Blocking broadcast during that window means:
-          • broadcaster._snapshot stays stale
-          • GET /api/snapshot returns stale/empty data
-          • frontend shows "Connected  -  waiting for snapshot" indefinitely
-
-        The cache is always safe to broadcast:
-          • On startup: populated by _fetch_history() from Polygon REST.
-          • After disconnect: repopulated by post-reconnect REST fetch.
-          • During live trading: updated by WS ticks.
-        If cache is empty (very first startup before REST finishes) we simply
-        skip  -  the `if data:` guard handles that case.
+        The old 5-min full snapshot was 3MB × 12/hr = 36 MB/hr wasted.
+        Now: ~300 dirty rows × 500B / 15s = ~10 MB/hr. Zero during quiet markets.
         """
         while not self._shutdown.is_set():
             time.sleep(SNAPSHOT_INTERVAL_S)
+
+            # Atomically drain dirty set
             with self._cache_lock:
-                data = list(self._cache.values())
-            if data:
-                self._broadcast({"type": "snapshot", "data": data,
+                if not self._dirty_tickers:
+                    continue  # nothing changed — zero bytes sent
+                dirty = list(self._dirty_tickers)
+                self._dirty_tickers.clear()
+
+            # Read rows outside the lock — individual dict reads are safe
+            with self._cache_lock:
+                delta_rows = [self._cache[t] for t in dirty if t in self._cache]
+
+            if delta_rows:
+                self._broadcast({"type": "snapshot_delta", "data": delta_rows,
                                  "ts": int(time.time() * 1000)})
 
     # ── Historical / snapshot fetch from Polygon REST ─────────────────────────
