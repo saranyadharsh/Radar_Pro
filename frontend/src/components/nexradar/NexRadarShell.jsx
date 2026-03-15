@@ -14,6 +14,8 @@ import { NexRadarErrorBoundary, Chip, AppearanceModal }       from './nexradar/p
 import { useTickerData }                                      from './nexradar/useTickerData.js';
 import { useTechData }                                        from './nexradar/useTechData.js';
 import { useWatchlist }                                       from './nexradar/useWatchlist.js';
+import AIEngine                                              from './engines/AIEngine.js';
+import { API_BASE }                                          from '../config.js';
 
 import PageDashboard  from './nexradar/PageDashboard.jsx';
 import PageLiveTable  from './nexradar/PageLiveTable.jsx';
@@ -22,6 +24,7 @@ import PageSignals    from './nexradar/PageSignals.jsx';
 import PageScanner    from './nexradar/PageScanner.jsx';
 import PageEarnings   from './nexradar/PageEarnings.jsx';
 import PagePortfolio  from './nexradar/PagePortfolio.jsx';
+import PageWatchlist  from './nexradar/PageWatchlist.jsx';
 
 // ── Shell ─────────────────────────────────────────────────────────────────────
 function NexRadarDashboard({
@@ -68,22 +71,21 @@ function NexRadarDashboard({
   const { techData, techLoading, techError, techLastFetch, techCached, techDataAge, fetchTechData }
     = useTechData();
   const { watchlist, toggleWatchlist, wsWatchlistRef }
-    = useWatchlist();
+    = useWatchlist(sseRef);
 
   // ── Sidebar signal engine stats — SSE-driven, no polling ────────────────────
   const [sideWatchlist,    setSideWatchlist]    = useState(0);
   const [sideScalpSignals, setSideScalpSignals] = useState({});
+  const [aiEnabled,        setAiEnabledState]   = useState(false);
 
   useEffect(() => {
-    const API = (typeof window !== 'undefined' && import.meta?.env?.VITE_API_BASE) || '';
-
     // Cold-start: one REST call each while SSE connects
-    fetch(`${API}/api/watchlist`)
+    fetch(`${API_BASE}/api/watchlist`)
       .then(r => r.ok ? r.json() : {})
       .then(d => setSideWatchlist((d.watchlist ?? []).length))
       .catch(() => {});
 
-    fetch(`${API}/api/scalp-analysis`)
+    fetch(`${API_BASE}/api/scalp-analysis`)
       .then(r => r.ok ? r.json() : null)
       .then(d => {
         if (!d?.data) return;
@@ -92,32 +94,42 @@ function NexRadarDashboard({
         setSideScalpSignals(m);
       }).catch(() => {});
 
-    // SSE listener — replaces both setInterval loops
+    // SSE listener — SharedWorker-aware, replaces both setInterval loops.
+    // SharedWorker path: sseRef.current is a SharedWorker — messages arrive as
+    //   pre-parsed objects on port.onmessage (not via addEventListener).
+    // Direct EventSource fallback: messages arrive as raw strings via addEventListener.
     const sse = sseRef?.current;
     if (!sse) return;
 
-    const handleMessage = (e) => {
-      try {
-        const payload = JSON.parse(e.data);
-        if (payload.type === 'watchlist_snapshot' && Array.isArray(payload.watchlist)) {
-          setSideWatchlist(payload.watchlist.length);
-        } else if (payload.type === 'watchlist_update' && Array.isArray(payload.watchlist)) {
-          setSideWatchlist(payload.watchlist.length);
-        } else if (payload.type === 'signal_snapshot' && Array.isArray(payload.data)) {
-          const m = {};
-          payload.data.forEach(r => { if (!r.status || r.status === 'ok') m[r.ticker] = r; });
-          setSideScalpSignals(m);
-        } else if (payload.type === 'signal_alert' && payload.data) {
-          const r = payload.data;
-          if (!r.status || r.status === 'ok') {
-            setSideScalpSignals(prev => ({ ...prev, [r.ticker]: r }));
-          }
+    const handlePayload = (payload) => {
+      if (!payload || typeof payload !== 'object') return;
+      if (payload.type === 'watchlist_snapshot' && Array.isArray(payload.watchlist)) {
+        setSideWatchlist(payload.watchlist.length);
+      } else if (payload.type === 'watchlist_update' && Array.isArray(payload.watchlist)) {
+        setSideWatchlist(payload.watchlist.length);
+      } else if (payload.type === 'signal_snapshot' && Array.isArray(payload.data)) {
+        const m = {};
+        payload.data.forEach(r => { if (!r.status || r.status === 'ok') m[r.ticker] = r; });
+        setSideScalpSignals(m);
+      } else if (payload.type === 'signal_alert' && payload.data) {
+        const r = payload.data;
+        if (!r.status || r.status === 'ok') {
+          setSideScalpSignals(prev => ({ ...prev, [r.ticker]: r }));
         }
-      } catch {}
+      }
     };
 
-    sse.addEventListener('message', handleMessage);
-    return () => sse.removeEventListener('message', handleMessage);
+    let cleanup = () => {};
+    if (sse instanceof SharedWorker) {
+      const prevHandler = sse.port.onmessage;
+      sse.port.onmessage = (e) => { if (prevHandler) prevHandler(e); handlePayload(e.data); };
+      cleanup = () => { if (sse.port) sse.port.onmessage = prevHandler; };
+    } else if (typeof sse.addEventListener === 'function') {
+      const handleMessage = (e) => { try { handlePayload(JSON.parse(e.data)); } catch {} };
+      sse.addEventListener('message', handleMessage);
+      cleanup = () => sse.removeEventListener('message', handleMessage);
+    }
+    return cleanup;
   }, [sseRef]);
   const sideSignalCount = useMemo(() =>
     Object.values(sideScalpSignals).filter(r => r.signal === 'BUY' || r.signal === 'SELL').length,
@@ -169,6 +181,7 @@ function NexRadarDashboard({
       case 'signals':   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} sseRef={sseRef} T={T} />;
       case 'earnings':  return <PageEarnings T={T} />;
       case 'portfolio': return <PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlist} sseRef={sseRef} T={T} />;
+      case 'watchlist': return <PageWatchlist T={T} onNavigateToSettings={() => setHeaderPanel('settings')} />;
       default:          return null;
     }
   };
@@ -410,6 +423,21 @@ function NexRadarDashboard({
                   <div style={{ color:T.text2, fontFamily:T.font, fontSize:10, marginTop:3 }}>{s.note}</div>
                 </div>
               ))}
+              {/* AI Engine toggle */}
+              <div style={{ padding:'11px 16px', borderBottom:`1px solid ${T.border}`, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                <div>
+                  <div style={{ color:T.text0, fontFamily:T.font, fontSize:12, fontWeight:600 }}>⚡ AI Engine</div>
+                  <div style={{ color:T.text2, fontFamily:T.font, fontSize:10, marginTop:2 }}>
+                    Morning Brief · Tech Analysis · Verdict · Chat (~$0.026/click)
+                  </div>
+                </div>
+                <button onClick={()=>{const next=!aiEnabled;setAiEnabledState(next);AIEngine.setAIEnabled(next);}}
+                  style={{ background:aiEnabled?T.cyanDim:T.bg3, border:`1px solid ${aiEnabled?T.cyanMid:T.border}`,
+                    color:aiEnabled?T.cyan:T.text2, borderRadius:5, padding:'5px 12px', cursor:'pointer',
+                    fontFamily:T.font, fontSize:9, fontWeight:700, transition:'all 0.15s' }}>
+                  {aiEnabled ? '● ON' : '○ OFF'}
+                </button>
+              </div>
               <div style={{ padding:'12px 16px', display:'flex', gap:8 }}>
                 <button onClick={()=>setHeaderPanel(null)} style={{ flex:1, padding:'8px 0', borderRadius:6, border:`1px solid ${T.border}`, background:T.bg2, color:T.text1, fontFamily:T.font, fontSize:12, cursor:'pointer' }}>Close</button>
                 <button onClick={()=>{setPage('dashboard');setHeaderPanel(null);}} style={{ flex:1, padding:'8px 0', borderRadius:6, border:'none', background:T.cyan, color:'#000', fontFamily:T.font, fontSize:12, fontWeight:700, cursor:'pointer' }}>Dashboard</button>

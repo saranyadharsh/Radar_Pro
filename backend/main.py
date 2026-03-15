@@ -274,7 +274,7 @@ broadcaster: SSEBroadcaster = None   # type: ignore
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db, broadcaster
-    logger.info("NexRadar API starting (direct SSE v6.3) …")
+    logger.info("NexRadar API starting (direct SSE v6.5 + AI proxy + stock-data) …")
 
     db          = SupabaseDB()
     broadcaster = SSEBroadcaster()
@@ -387,7 +387,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete.")
 
 
-app = FastAPI(title="NexRadar Pro API", version="6.3.0", lifespan=lifespan)
+app = FastAPI(title="NexRadar Pro API", version="6.5.0", lifespan=lifespan)
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://nexradar.info").rstrip("/")
 app.add_middleware(
@@ -426,7 +426,7 @@ async def get_metrics():
         "sse_clients":    broadcaster.client_count if broadcaster else 0,
         "snapshot_size":  len(snap_map),
         "session":        _get_market_status_simple(),
-        "architecture":   "direct-sse-v6.3-delta-engine",
+        "architecture":   "direct-sse-v6.5-ai-proxy-stock-data",
         "tick_queue_len": len(engine._tick_queue) if engine else None,
         "tick_stale_s":   tick_stale_s,
         "dirty_tickers":  len(engine._dirty_tickers) if engine else None,
@@ -837,6 +837,45 @@ async def get_market_monitor(refresh: int = Query(0)):
     return result
 
 
+
+# ── AI Proxy ─────────────────────────────────────────────────────────────────
+# Routes Claude API calls from the frontend through the backend so the
+# Anthropic API key is never exposed in the browser network tab.
+# Requires env var: ANTHROPIC_API_KEY on the Render backend service.
+@app.post("/api/ai/chat")
+async def ai_chat_proxy(payload: dict):
+    """
+    Proxies Claude API requests from AgenticPanel / AIEngine.js.
+    The frontend sends the full messages/system/model payload here.
+    This endpoint injects the real Anthropic API key server-side.
+    Rate-limiting note: each full analysis fires ~3 requests (brief + tech + verdict).
+    AI toggle is OFF by default — user must explicitly enable in Dashboard Settings.
+    """
+    import httpx
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="AI not configured on this server.")
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key":         api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type":      "application/json",
+                },
+                json=payload,
+            )
+        if not resp.is_success:
+            logger.warning(f"/api/ai/chat upstream error {resp.status_code}: {resp.text[:200]}")
+            raise HTTPException(status_code=resp.status_code, detail="Claude API error")
+        return resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Claude API timeout")
+    except Exception as e:
+        logger.error(f"/api/ai/chat error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ── Scalp Analysis ─────────────────────────────────────────────────────────────
 @app.get("/api/scalp-analysis")
 async def get_scalp_analysis():
@@ -852,18 +891,6 @@ async def get_scalp_analysis():
             )
             ok_rows = [r for r in scalp_rows
                        if not r.get("status") or r.get("status") == "ok"]
-
-            # If engine has no bars yet (weekend / just started / pre-market),
-            # get_scalp_snapshot returns [] because _calcs is empty.
-            # Return warming_up rows so the frontend shows ENGINE WARMING UP
-            # instead of the misleading NO WATCHLIST TICKERS empty state.
-            if not scalp_rows:
-                warming_rows = [{"ticker": t, "status": "warming_up", "bars_count": 0}
-                                for t in sorted(watchlist_tickers)]
-                return {"data": warming_rows, "ticker_count": len(warming_rows),
-                        "ok_count": 0, "warming_count": len(warming_rows),
-                        "message": "Signal engine seeding — bars accumulating."}
-
             return {"data": scalp_rows, "ticker_count": len(scalp_rows),
                     "ok_count": len(ok_rows),
                     "warming_count": max(0, len(watchlist_tickers) - len(scalp_rows))}
@@ -1109,6 +1136,189 @@ async def get_chart_bars(symbol: str, interval: str = "1", range: str = "1d"):
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
+
+
+# ── AgenticPanel: Full Stock Data ─────────────────────────────────────────────
+# Proxies all Polygon REST calls for DataEngine.getFullStockData() server-side.
+# Eliminates need for VITE_POLYGON_API_KEY on the frontend — the backend's
+# MASSIVE_API_KEY is used instead. Results cached in stock_data_cache table
+# (5min TTL) so repeat clicks are instant with zero Polygon API calls.
+@app.get("/api/stock-data/{symbol}")
+async def get_stock_data(symbol: str, force: bool = False):
+    """
+    Full stock data for AgenticPanel: price, technicals, support/resistance,
+    options IV, news, earnings estimates, fundamentals.
+    Cached 5min in stock_data_cache. Used by DataEngine.getFullStockData().
+    """
+    sym     = symbol.upper().strip()
+    api_key = os.getenv("MASSIVE_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Polygon API key not configured")
+
+    # ── Cache read ─────────────────────────────────────────────────────────────
+    if not force:
+        try:
+            cached = await asyncio.to_thread(db.get_stock_data_cache, sym)
+            if cached:
+                return {**cached, "cached": True}
+        except Exception:
+            pass
+
+    # ── Parallel Polygon REST fetch ────────────────────────────────────────────
+    base = "https://api.polygon.io"
+    from datetime import datetime, timedelta
+
+    async def _get(path, params=None):
+        params = params or {}
+        params["apiKey"] = api_key
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.get(f"{base}{path}", params=params)
+                if r.is_success:
+                    return r.json()
+        except Exception:
+            pass
+        return {}
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    ago90 = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
+
+    snap, rsi, macd, sma20, sma50, sma200, ema9, bars90, options, news, earnings, details = (
+        await asyncio.gather(
+            _get(f"/v2/snapshot/locale/us/markets/stocks/tickers/{sym}"),
+            _get(f"/v1/indicators/rsi/{sym}",  {"timespan":"day","window":14,"series_type":"close","limit":1}),
+            _get(f"/v1/indicators/macd/{sym}", {"timespan":"day","short_window":12,"long_window":26,"signal_window":9,"series_type":"close","limit":1}),
+            _get(f"/v1/indicators/sma/{sym}",  {"timespan":"day","window":20,"series_type":"close","limit":1}),
+            _get(f"/v1/indicators/sma/{sym}",  {"timespan":"day","window":50,"series_type":"close","limit":1}),
+            _get(f"/v1/indicators/sma/{sym}",  {"timespan":"day","window":200,"series_type":"close","limit":1}),
+            _get(f"/v1/indicators/ema/{sym}",  {"timespan":"day","window":9,"series_type":"close","limit":1}),
+            _get(f"/v2/aggs/ticker/{sym}/range/1/day/{ago90}/{today}", {"adjusted":"true","sort":"asc","limit":90}),
+            _get(f"/v3/snapshot/options/{sym}", {"limit":50}),
+            _get(f"/v2/reference/news", {"ticker":sym,"limit":5,"order":"desc","sort":"published_utc"}),
+            _get(f"/v1/meta/symbols/{sym}/earnings", {"limit":8}),
+            _get(f"/v3/reference/tickers/{sym}"),
+        )
+    )
+
+    # ── Parse snapshot ─────────────────────────────────────────────────────────
+    t         = snap.get("ticker") or {}
+    day       = t.get("day") or {}
+    prev_day  = t.get("prevDay") or {}
+    last_tr   = t.get("lastTrade") or {}
+    price     = float(last_tr.get("p") or day.get("c") or 0)
+    prev_cl   = float(prev_day.get("c") or 0)
+    change    = round(price - prev_cl, 4) if prev_cl > 0 else 0
+    chg_pct   = round(change / prev_cl * 100, 4) if prev_cl > 0 else 0
+
+    # ── Parse technicals ──────────────────────────────────────────────────────
+    rsi_val   = (rsi.get("results") or {}).get("values", [{}])[0].get("value")
+    macd_v    = ((macd.get("results") or {}).get("values") or [{}])[0]
+    sma20_v   = ((sma20.get("results") or {}).get("values") or [{}])[0].get("value")
+    sma50_v   = ((sma50.get("results") or {}).get("values") or [{}])[0].get("value")
+    sma200_v  = ((sma200.get("results") or {}).get("values") or [{}])[0].get("value")
+    ema9_v    = ((ema9.get("results") or {}).get("values") or [{}])[0].get("value")
+
+    # ── Support / Resistance from 90-day bars ─────────────────────────────────
+    bars      = bars90.get("results") or []
+    highs     = sorted([b.get("h",0) for b in bars], reverse=True)
+    lows      = sorted([b.get("l",0) for b in bars])
+    resistance= round(sum(highs[:5])/5, 2) if len(highs) >= 5 else None
+    support   = round(sum(lows[:5])/5, 2) if len(lows) >= 5 else None
+    atrs = []
+    for i in range(max(0, len(bars)-14), len(bars)):
+        b = bars[i]
+        if i == 0:
+            atrs.append(b.get("h",0) - b.get("l",0))
+        else:
+            pc = bars[i-1].get("c", 0)
+            atrs.append(max(b.get("h",0)-b.get("l",0),
+                           abs(b.get("h",0)-pc), abs(b.get("l",0)-pc)))
+    atr = round(sum(atrs)/len(atrs), 2) if atrs else None
+
+    # ── Options IV ────────────────────────────────────────────────────────────
+    opts      = options.get("results") or []
+    atm_opts  = [o for o in opts if abs((o.get("details",{}).get("strike_price",0) or 0) - price) / max(price,1) < 0.05]
+    avg_iv    = sum(o.get("greeks",{}).get("implied_volatility",0) or 0 for o in atm_opts) / max(len(atm_opts),1) if atm_opts else 0
+    impl_move = round(avg_iv * (1/365)**0.5 * price, 2) if avg_iv > 0 else None
+    impl_pct  = round(impl_move / price * 100, 2) if impl_move and price > 0 else None
+
+    # ── News ──────────────────────────────────────────────────────────────────
+    news_items = [{"headline": n.get("title"), "source": (n.get("publisher") or {}).get("name"),
+                   "url": n.get("article_url"), "published": n.get("published_utc"),
+                   "sentiment": (n.get("insights") or [{}])[0].get("sentiment","neutral"),
+                   "summary": n.get("description")} for n in (news.get("results") or [])]
+
+    # ── Earnings ──────────────────────────────────────────────────────────────
+    earn_items = [{"quarter": e.get("quarter"), "year": e.get("year"),
+                   "epsEst": e.get("eps",{}).get("estimate"),
+                   "epsActual": e.get("eps",{}).get("actual"),
+                   "surprisePct": e.get("eps",{}).get("surprisePercent")}
+                  for e in (earnings.get("results") or [])]
+
+    # ── Fundamentals ──────────────────────────────────────────────────────────
+    d  = details.get("results") or {}
+    fin_url = f"/vX/reference/financials"
+    fin = await _get(fin_url, {"ticker": sym, "limit":1, "sort":"period_of_report_date", "order":"desc"})
+    fin_r = (fin.get("results") or [{}])[0].get("financials") or {}
+    inc   = fin_r.get("income_statement") or {}
+    bs    = fin_r.get("balance_sheet") or {}
+
+    result = {
+        "symbol":        sym,
+        "price":         price,
+        "change":        change,
+        "changePct":     chg_pct,
+        "open":          float(day.get("o") or 0),
+        "high":          float(day.get("h") or 0),
+        "low":           float(day.get("l") or 0),
+        "close":         float(day.get("c") or 0),
+        "volume":        float(day.get("v") or 0),
+        "vwap":          float(day.get("vw") or 0),
+        "prevClose":     prev_cl,
+        "avgVolume":     float((prev_day.get("v") or 0)),
+        # Technicals
+        "rsi14":         rsi_val,
+        "macd":          macd_v.get("value"),
+        "macdSignal":    macd_v.get("signal"),
+        "macdHist":      macd_v.get("histogram"),
+        "sma20":         sma20_v,
+        "sma50":         sma50_v,
+        "sma200":        sma200_v,
+        "ema9":          ema9_v,
+        # Levels
+        "support":       support,
+        "resistance":    resistance,
+        "atr":           atr,
+        # Options
+        "impliedMovePct":   impl_pct,
+        "impliedMoveDollar": impl_move,
+        "avgIV":            round(avg_iv * 100, 2) if avg_iv else None,
+        # News
+        "news":          news_items,
+        # Earnings
+        "earningsHistory": earn_items,
+        # Fundamentals
+        "companyName":   d.get("name"),
+        "description":   d.get("description"),
+        "sector":        d.get("sic_description"),
+        "marketCap":     d.get("market_cap"),
+        "employees":     d.get("total_employees"),
+        "homepage":      d.get("homepage_url"),
+        "revenue":       (inc.get("revenues") or {}).get("value"),
+        "netIncome":     (inc.get("net_income_loss") or {}).get("value"),
+        "eps":           (inc.get("basic_earnings_per_share") or {}).get("value"),
+        "totalAssets":   (bs.get("assets") or {}).get("value"),
+        "totalLiabilities": (bs.get("liabilities") or {}).get("value"),
+        "cached":        False,
+    }
+
+    # ── Cache result for 5 minutes ─────────────────────────────────────────────
+    try:
+        await asyncio.to_thread(db.save_stock_data_cache, sym, result, 300)
+    except Exception:
+        pass
+
+    return result
 
 # ── Debug: Sector Map ──────────────────────────────────────────────────────────
 @app.get("/api/debug/sectors")

@@ -24,6 +24,7 @@ export const NAV = [
   { id: "signals",   label: "Signals",    icon: "◉" },
   { id: "earnings",  label: "Earnings",   icon: "◎" },
   { id: "portfolio", label: "Portfolio",  icon: "◆" },
+  { id: "watchlist", label: "Watchlist",  icon: "★" },
 ];
 
 // TradingView interval map: NexRadar TF keys → TradingView interval strings

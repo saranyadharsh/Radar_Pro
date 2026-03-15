@@ -101,24 +101,33 @@ export default function PagePortfolio({ tickers=new Map(), marketSession='market
       });
 
     // ── 2. SSE listener — fires on every server-pushed portfolio_update ──────
-    // No polling. Data arrives the instant the backend detects a change.
+    // SharedWorker-aware: sseRef.current may be a SharedWorker (pre-parsed
+    // objects on port.onmessage) or a direct EventSource (raw strings via
+    // addEventListener). Both paths handled.
     if (!sseRef?.current) return;
     const sse = sseRef.current;
 
-    const handleMessage = (e) => {
-      try {
-        const payload = JSON.parse(e.data);
-        if (payload.type === 'portfolio_update' && Array.isArray(payload.data)) {
-          // PATCH-MAIN-2: record SSE arrival time so REST race guard works
-          lastSseTsRef.current = payload.server_ts ?? Date.now();
-          setPortfolioData(payload.data);
-          setLoading(false);
-        }
-      } catch {}
+    const handlePayload = (payload) => {
+      if (!payload || typeof payload !== 'object') return;
+      if (payload.type === 'portfolio_update' && Array.isArray(payload.data)) {
+        // PATCH-MAIN-2: record SSE arrival time so REST race guard works
+        lastSseTsRef.current = payload.server_ts ?? Date.now();
+        setPortfolioData(payload.data);
+        setLoading(false);
+      }
     };
 
-    sse.addEventListener('message', handleMessage);
-    return () => sse.removeEventListener('message', handleMessage);
+    let cleanup = () => {};
+    if (sse instanceof SharedWorker) {
+      const prevHandler = sse.port.onmessage;
+      sse.port.onmessage = (e) => { if (prevHandler) prevHandler(e); handlePayload(e.data); };
+      cleanup = () => { if (sse.port) sse.port.onmessage = prevHandler; };
+    } else if (typeof sse.addEventListener === 'function') {
+      const handleMessage = (e) => { try { handlePayload(JSON.parse(e.data)); } catch {} };
+      sse.addEventListener('message', handleMessage);
+      cleanup = () => sse.removeEventListener('message', handleMessage);
+    }
+    return cleanup;
   }, [sseRef]);
 
   const enrichedPortfolio = useMemo(() => {

@@ -42,33 +42,39 @@ export function useWatchlist(sseRef) {
   useEffect(() => {
     if (!sseRef) return;
 
-    const handler = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type !== 'watchlist_update') return;
-        if (Array.isArray(msg.watchlist)) {
-          setWatchlist(new Set(msg.watchlist));
-        }
-      } catch { /* ignore parse errors */ }
+    // SharedWorker-aware listener.
+    // SharedWorker path: sseRef.current is a SharedWorker — messages arrive as
+    //   pre-parsed objects on port.onmessage. addEventListener does not work.
+    // Direct EventSource fallback: messages arrive as raw strings via addEventListener.
+
+    const handlePayload = (payload) => {
+      if (!payload || typeof payload !== 'object') return;
+      if (payload.type !== 'watchlist_update') return;
+      if (Array.isArray(payload.watchlist)) {
+        setWatchlist(new Set(payload.watchlist));
+      }
     };
 
-    // Poll until sseRef.current is populated (SSE connects asynchronously)
     let pollId = null;
+    let cleanup = () => { clearTimeout(pollId); };
+
     const attach = () => {
-      if (sseRef.current) {
-        sseRef.current.addEventListener('message', handler);
-      } else {
-        pollId = setTimeout(attach, 500);
+      const sse = sseRef.current;
+      if (!sse) { pollId = setTimeout(attach, 500); return; }
+
+      if (sse instanceof SharedWorker) {
+        const prevHandler = sse.port.onmessage;
+        sse.port.onmessage = (e) => { if (prevHandler) prevHandler(e); handlePayload(e.data); };
+        cleanup = () => { clearTimeout(pollId); if (sse.port) sse.port.onmessage = prevHandler; };
+      } else if (typeof sse.addEventListener === 'function') {
+        const handler = (e) => { try { handlePayload(JSON.parse(e.data)); } catch {} };
+        sse.addEventListener('message', handler);
+        cleanup = () => { clearTimeout(pollId); sse.removeEventListener('message', handler); };
       }
     };
     attach();
 
-    return () => {
-      clearTimeout(pollId);
-      if (sseRef.current) {
-        sseRef.current.removeEventListener('message', handler);
-      }
-    };
+    return () => cleanup();
   }, [sseRef]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleWatchlist = useCallback(async (symbol) => {

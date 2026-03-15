@@ -38,7 +38,7 @@ FIXES applied in this version:
 import os
 import time
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import os as _os
 _os.environ.pop("SSL_CERT_FILE", None)
@@ -464,6 +464,83 @@ class SupabaseDB:
             ).execute()
         except Exception as e:
             logger.error(f"remove_signal_watchlist({ticker}): {e}")
+
+
+    # ── Stock Data Cache — AgenticPanel persistence ────────────────────────────
+    # Caches DataEngine.getFullStockData() results so AgenticPanel loads
+    # instantly on repeat clicks without re-fetching all Polygon endpoints.
+    #
+    # Table DDL (run once in Supabase SQL editor):
+    #   CREATE TABLE IF NOT EXISTS stock_data_cache (
+    #     ticker      TEXT PRIMARY KEY,
+    #     data        JSONB      NOT NULL,
+    #     fetched_at  TIMESTAMPTZ DEFAULT now(),
+    #     expires_at  TIMESTAMPTZ DEFAULT (now() + interval '5 minutes')
+    #   );
+    #   CREATE INDEX idx_stock_cache_expires ON stock_data_cache (expires_at);
+
+    def get_stock_data_cache(self, ticker: str) -> Optional[Dict]:
+        """
+        Returns cached DataEngine stock data for ticker if not expired.
+        Returns None if cache miss or expired.
+        Used by AgenticPanel to serve instant data on repeat clicks.
+        """
+        try:
+            now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            res = (
+                self.client.table("stock_data_cache")
+                .select("data")
+                .eq("ticker", ticker.upper())
+                .gt("expires_at", now_iso)
+                .limit(1)
+                .execute()
+            )
+            if res.data:
+                return res.data[0].get("data")
+            return None
+        except Exception as e:
+            logger.debug(f"get_stock_data_cache({ticker}): {e}")
+            return None
+
+    def save_stock_data_cache(self, ticker: str, data: Dict, ttl_seconds: int = 300) -> None:
+        """
+        Saves DataEngine stock data to cache with TTL.
+        Default TTL: 5 minutes — fresh enough for agentic analysis.
+        """
+        import json
+        try:
+            now_ts = time.time()
+            fetched_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts))
+            expires_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts + ttl_seconds))
+            self.client.table("stock_data_cache").upsert({
+                "ticker":     ticker.upper(),
+                "data":       data,
+                "fetched_at": fetched_iso,
+                "expires_at": expires_iso,
+            }, on_conflict="ticker").execute()
+        except Exception as e:
+            logger.debug(f"save_stock_data_cache({ticker}): {e}")
+
+    def get_cached_stock_data_bulk(self, tickers: List[str]) -> Dict[str, Dict]:
+        """
+        Bulk cache read for multiple tickers. Returns {ticker: data} for hits only.
+        Used by AgenticPanel batch pre-warm on watchlist load.
+        """
+        if not tickers:
+            return {}
+        try:
+            now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            res = (
+                self.client.table("stock_data_cache")
+                .select("ticker, data")
+                .in_("ticker", [t.upper() for t in tickers])
+                .gt("expires_at", now_iso)
+                .execute()
+            )
+            return {row["ticker"]: row["data"] for row in (res.data or [])}
+        except Exception as e:
+            logger.debug(f"get_cached_stock_data_bulk: {e}")
+            return {}
 
     # ── Error log ─────────────────────────────────────────────────────────────
 

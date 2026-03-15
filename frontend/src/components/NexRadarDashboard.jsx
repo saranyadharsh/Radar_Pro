@@ -27,6 +27,7 @@ import { useTechData }                                        from './nexradar/u
 import { useWatchlist }                                       from './nexradar/useWatchlist.js';
 // FIX-2: single canonical base-URL source
 import { API_BASE }                                           from '../config.js';
+import AIEngine                                              from './engines/AIEngine.js';
 
 // Critical path: eager-loaded (always needed on first render)
 import PageDashboard from './nexradar/PageDashboard.jsx';
@@ -41,6 +42,7 @@ const PageEarnings  = lazy(() => import('./nexradar/PageEarnings.jsx'));
 const PagePortfolio = lazy(() => import('./nexradar/PagePortfolio.jsx'));
 const PageScreener  = lazy(() => import('./nexradar/PageScreener.jsx'));
 const PageScanner   = lazy(() => import('./nexradar/PageScanner.jsx'));
+const PageWatchlist = lazy(() => import('./nexradar/PageWatchlist.jsx'));
 import AlertToast from './nexradar/AlertToast.jsx';
 
 // Inline suspense fallback — dark NexRadar skeleton aesthetic
@@ -121,6 +123,7 @@ function NexRadarDashboard({
   // scalp signals    → from SSE signal_snapshot / signal_alert (no REST)
   const [sideWatchlist,    setSideWatchlist]    = useState(0);
   const [sideScalpSignals, setSideScalpSignals] = useState({});
+  const [aiEnabled,        setAiEnabledState]   = useState(false);
 
   useEffect(() => {
     // Cold-start: one REST call for watchlist count while SSE connects
@@ -242,6 +245,7 @@ function NexRadarDashboard({
       case 'earnings':  return withLazy(<PageEarnings T={T} />);
       case 'scanner':  return withLazy(<PageScanner T={T} onNavigateToChart={(sym) => { setChartInitSymbol(sym); setPage('chart'); }} />);
       case 'portfolio': return withLazy(<PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlist} sseRef={sseRef} T={T} />);
+      case 'watchlist': return withLazy(<PageWatchlist T={T} onNavigateToSettings={() => setHeaderPanel('settings')} />);
       default:          return null;
     }
   };
@@ -487,6 +491,19 @@ function NexRadarDashboard({
                   <div style={{ color:T.text2, fontFamily:T.font, fontSize:10, marginTop:3 }}>{s.note}</div>
                 </div>
               ))}
+              {/* AI Engine toggle */}
+              <div style={{ padding:'11px 16px', borderBottom:`1px solid ${T.border}`, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                <div>
+                  <div style={{ color:T.text0, fontFamily:T.font, fontSize:12, fontWeight:600 }}>⚡ AI Engine</div>
+                  <div style={{ color:T.text2, fontFamily:T.font, fontSize:10, marginTop:2 }}>Morning Brief · Tech Analysis · Verdict · Chat (~$0.026/click)</div>
+                </div>
+                <button onClick={()=>{const next=!aiEnabled;setAiEnabledState(next);AIEngine.setAIEnabled(next);}}
+                  style={{ background:aiEnabled?T.cyanDim:T.bg3, border:`1px solid ${aiEnabled?T.cyanMid:T.border}`,
+                    color:aiEnabled?T.cyan:T.text2, borderRadius:5, padding:'5px 12px', cursor:'pointer',
+                    fontFamily:T.font, fontSize:9, fontWeight:700, transition:'all 0.15s' }}>
+                  {aiEnabled ? '● ON' : '○ OFF'}
+                </button>
+              </div>
               <div style={{ padding:'12px 16px', display:'flex', gap:8 }}>
                 <button onClick={()=>setHeaderPanel(null)} style={{ flex:1, padding:'8px 0', borderRadius:6, border:`1px solid ${T.border}`, background:T.bg2, color:T.text1, fontFamily:T.font, fontSize:12, cursor:'pointer' }}>Close</button>
                 <button onClick={()=>{setPage('dashboard');setHeaderPanel(null);}} style={{ flex:1, padding:'8px 0', borderRadius:6, border:'none', background:T.cyan, color:'#000', fontFamily:T.font, fontSize:12, fontWeight:700, cursor:'pointer' }}>Dashboard</button>

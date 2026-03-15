@@ -57,8 +57,8 @@ ET = ZoneInfo("America/New_York")
 
 POLYGON_WS_URL   = "wss://socket.polygon.io/stocks"
 POLYGON_REST_URL = "https://api.polygon.io/v2"
-SNAPSHOT_INTERVAL_S  = 2      # seconds between snapshot broadcasts
-PORTFOLIO_REFRESH_S  = 30
+SNAPSHOT_INTERVAL_S  = 300    # DELTA-FIX: full resync every 5min, tick_batch handles live updates
+PORTFOLIO_REFRESH_S  = 60   # PORTFIX-1: safety-net poll only; instant updates via /api/portfolio/sync
 AH_CLOSE_REFRESH_S   = 60   # 1 min  -  refresh AH closes during extended hours
 DB_WRITE_INTERVAL_S  = 300
 HIST_FETCH_WORKERS   = 8
@@ -150,6 +150,18 @@ class WSEngine:
         self._company_map: Dict[str, str]  = {}
         self._sector_map:  Dict[str, str]  = {}
 
+        # ── GAP-5 / main.py compatibility ─────────────────────────────────────
+        # main.py /api/metrics reads these to surface compute worker health.
+        # _tick_queue: deque of pending ticks (replaces _tick_batch for metrics)
+        # _dirty_tickers: set of tickers changed since last snapshot broadcast
+        # _last_tick_processed_ts: monotonic ts of last processed tick
+        self._tick_queue: deque = deque(maxlen=2000)
+        self._dirty_tickers: set = set()
+        self._last_tick_processed_ts: float = 0.0
+
+        # _watchlist_tickers: subset of all tickers — signal + AH scope
+        self._watchlist_tickers: List[str] = []
+
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def start(
@@ -227,6 +239,10 @@ class WSEngine:
         for t in self._threads:
             t.join(timeout=5)
         logger.info("WSEngine stopped.")
+
+    def set_watchlist_tickers(self, tickers: List[str]) -> None:
+        """Called from main.py _refresh_signal_watcher to keep AH scope in sync."""
+        self._watchlist_tickers = list(tickers)
 
     # ── Broadcast helper ───────────────────────────────────────────────────────
 
@@ -417,6 +433,9 @@ class WSEngine:
                 "ts":            msg.get("t") or int(time.time() * 1000),
             }
             self._cache[ticker] = updated
+            # GAP-5: mark ticker dirty for snapshot_delta + metrics
+            self._dirty_tickers.add(ticker)
+            self._last_tick_processed_ts = time.monotonic()
 
         # Feed to signal watcher
         if self._signal_watcher:
@@ -429,6 +448,9 @@ class WSEngine:
             if len(self._pending_ticks) > 5000:
                 self._pending_ticks = self._pending_ticks[-5000:]
 
+        # GAP-5: track queue depth for /api/metrics health monitoring
+        self._tick_queue.append(ticker)
+
         # Accumulate into batch — flushed every 250ms by _tick_flush_loop
         # This reduces SSE message volume from ~1000/s to ~4/s, preventing
         # queue eviction and zombie connections on the frontend.
@@ -437,24 +459,25 @@ class WSEngine:
 
     # ── Tick flush loop ────────────────────────────────────────────────────────
 
+    # DELTA-FIX: 7-field slim delta per tick_batch (~100B vs ~500B full entry)
+    _DELTA_FIELDS = ("ticker", "price", "change_pct", "percent_change", "volume", "rvol", "ts")
+
+    def _make_delta(self, entry: dict) -> dict:
+        return {f: entry[f] for f in self._DELTA_FIELDS if f in entry}
+
     def _tick_flush_loop(self) -> None:
         """
-        Coalesces individual ticks into a single tick_batch broadcast every 250ms.
-
-        Without batching, 1000+ ticks/sec each get their own SSE message.
-        The SSEBroadcaster queue (maxsize=500) fills in <1s, evicting the client
-        silently. The frontend stays 'connected' (keepalives keep it alive) but
-        receives no live data — the dashboard freezes.
-
-        With batching: at most 4 broadcasts/sec regardless of tick volume.
-        Latest price per ticker wins when multiple ticks arrive in the window.
+        DELTA-FIX: batch_data now sends slim 7-field delta instead of full entry.
+        Reduces tick_batch from ~1.3 GB/hr to ~0.27 GB/hr per client.
+        Frontend must merge delta via Object.assign(priceMap[t], delta).
+        Full row available from snapshot (every 5min) or on SSE connect.
         """
         while not self._shutdown.is_set():
             time.sleep(0.25)
             with self._batch_lock:
                 if not self._tick_batch:
                     continue
-                batch_data = list(self._tick_batch.values())
+                batch_data = [self._make_delta(v) for v in self._tick_batch.values()]
                 self._tick_batch.clear()
             self._broadcast({"type": "tick_batch", "data": batch_data})
 
@@ -462,7 +485,11 @@ class WSEngine:
 
     def _snapshot_loop(self) -> None:
         """
-        Broadcasts full cache snapshot every SNAPSHOT_INTERVAL_S seconds.
+        Broadcasts full cache snapshot every SNAPSHOT_INTERVAL_S seconds (300s).
+
+        DELTA-FIX strategy: tick_batch handles live per-ticker updates every 250ms
+        with slim 7-field deltas. This loop provides a full resync every 5 minutes
+        so any client that missed deltas gets a complete state refresh.
 
         The _connected gate was removed intentionally.
         Reason: after a disconnect, _fetch_polygon_snapshot_bulk() immediately
@@ -484,7 +511,8 @@ class WSEngine:
             with self._cache_lock:
                 data = list(self._cache.values())
             if data:
-                self._broadcast({"type": "snapshot", "data": data})
+                self._broadcast({"type": "snapshot", "data": data,
+                                 "ts": int(time.time() * 1000)})
 
     # ── Historical / snapshot fetch from Polygon REST ─────────────────────────
 

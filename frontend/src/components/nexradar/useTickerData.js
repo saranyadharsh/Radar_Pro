@@ -150,7 +150,14 @@ export function useTickerData() {
     const SSE_URL      = API_BASE + '/api/stream'
     const SNAPSHOT_URL = API_BASE + '/api/snapshot'
 
-    const supportsSharedWorker = typeof SharedWorker !== 'undefined'
+    // SharedWorker detection — typeof alone is insufficient on some mobile
+    // browsers (iOS Chrome, some Android WebViews) where the global exists
+    // in typeof but the constructor throws ReferenceError when called.
+    // Test by actually referencing the constructor inside try/catch.
+    const supportsSharedWorker = (() => {
+      try { return typeof SharedWorker !== 'undefined' && !!SharedWorker; }
+      catch { return false; }
+    })()
 
     let cancelled     = false
     let worker        = null   // SharedWorker instance
@@ -315,7 +322,17 @@ export function useTickerData() {
 
     // ── SharedWorker path ──────────────────────────────────────────────────
     const connectWorker = () => {
-      worker = new SharedWorker('/sseWorker.js', { name: 'nexradar-sse' })
+      // Wrap constructor in try/catch — on some mobile browsers (iOS Chrome,
+      // Android WebView, Firefox private) SharedWorker passes the typeof check
+      // but throws ReferenceError or SecurityError on construction.
+      // worker.onerror only catches async errors, not constructor throws.
+      try {
+        worker = new SharedWorker('/sseWorker.js', { name: 'nexradar-sse' })
+      } catch (constructErr) {
+        console.warn('[NexRadar] SharedWorker() constructor threw — falling back to direct SSE:', constructErr)
+        connectDirect()
+        return
+      }
 
       // sseRef exposed so useWatchlist / PageSignals / PagePortfolio can
       // attach their own port.onmessage listeners to the same worker
