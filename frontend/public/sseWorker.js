@@ -121,6 +121,20 @@ function connect() {
     resetWatchdog()
   }
 
+  // TIER1-1.5: Cache size guard — evict oldest entries when cache > 10,000
+  // sseWorker runs indefinitely in the browser — without a cap, 8hr trading
+  // session accumulates stale rows that never get cleaned up.
+  function _evictStaleCache () {
+    const MAX = 10_000
+    const keys = Object.keys(state.cache)
+    if (keys.length <= MAX) return
+    // Sort by ts ascending — evict oldest first
+    keys.sort((a, b) => (state.cache[a]?.ts ?? 0) - (state.cache[b]?.ts ?? 0))
+    const evict = keys.slice(0, keys.length - MAX)
+    evict.forEach(k => delete state.cache[k])
+    console.info(`[sseWorker] Cache eviction: removed ${evict.length} stale entries`)
+  }
+
   state.es.onmessage = (e) => {
     // HOP-1b: JSON.parse here in worker thread — tabs receive pre-parsed objects.
     // This is the single biggest win for main-thread responsiveness: parsing
@@ -147,9 +161,7 @@ function connect() {
             .then(data => {
               if (data.ok && data.messages) {
                 data.messages.forEach(rawMsg => {
-                  // rawMsg is "data: {...}
-
-" — extract JSON
+                  // rawMsg format: "data: {...}\n\n" — extract the JSON part
                   const json = rawMsg.replace(/^data: /, '').trim()
                   try {
                     const m = JSON.parse(json)
@@ -203,6 +215,7 @@ function connect() {
       // At market-hours peak: 200-400 rows every 2s instead of 6200
       ;(msg.data ?? []).forEach(row => { if (row?.ticker) state.cache[row.ticker] = row })
       state.snapTs = msg.ts ?? Date.now()
+      _evictStaleCache()  // TIER1-1.5: keep cache bounded
     }
     else if (msg.type === 'tick_batch') {
       // 250ms coalesced ticks — merge into cache
