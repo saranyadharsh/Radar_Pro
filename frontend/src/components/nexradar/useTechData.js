@@ -49,7 +49,13 @@ export function useTechData() {
       const l = techLastFetchRef.current;
       fetchTechData(!l || (Date.now() - l.getTime()) > FORCE_STALE_MS);
     }, STALE_MS);
-    return () => clearInterval(id);
+    // Refresh on window focus — ensures prices update after tab switch or browser wake
+    const onFocus = () => {
+      const l = techLastFetchRef.current;
+      if (!l || (Date.now() - l.getTime()) > STALE_MS) fetchTechData(false);
+    };
+    window.addEventListener('focus', onFocus);
+    return () => { clearInterval(id); window.removeEventListener('focus', onFocus); };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return { techData, techLoading, techError, techLastFetch, techCached, techDataAge, fetchTechData };

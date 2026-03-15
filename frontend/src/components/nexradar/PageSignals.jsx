@@ -16,6 +16,7 @@ import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { SectionHeader, Shimmer, EmptyState } from './primitives.jsx';
 import { fmt2, getWeekDates } from './utils.js';
 import { API_BASE } from '../../config.js';
+import { isSharedWorker } from './sseConnection.js';
 
 function EarningsSubPanel({ T }) {
   const [weekOffset,   setWeekOffset]   = useState(0);
@@ -150,6 +151,7 @@ const TECH_COLS = [
 
 export default function PageSignals({
   tickers=new Map(), selectedSectors=['ALL'],
+  watchlist=new Set(),
   techData=[], techLoading=false, techError=null,
   techLastFetch=null, techCached=false, techDataAge=0,
   onForceFetch=()=>{}, sseRef=null, T,
@@ -158,6 +160,7 @@ export default function PageSignals({
   const [proData,    setProData]    = useState([]);
   const [proLoading, setProLoading] = useState(false);
   const [proError,   setProError]   = useState(null);
+  const restFetchedRef = useRef(false); // true after first REST /api/scalp-analysis completes
   const [proFilter,  setProFilter]  = useState('ALL');
   const [proSort,    setProSort]    = useState('confidence');
   const [proSortAsc, setProSortAsc] = useState(false);
@@ -167,10 +170,27 @@ export default function PageSignals({
     setProLoading(true); setProError(null);
     fetch(`${API_BASE}/api/scalp-analysis`)
       .then(r=>{ if(!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .then(d=>{ setProData(d.data||[]); })
-      .catch(e=>setProError(e.message))
+      .then(d=>{
+        const seen = new Map();
+        (d.data||[]).forEach(r => seen.set(r.ticker || r.symbol, r));
+        restFetchedRef.current = true;
+        setProData([...seen.values()]);
+      })
+      .catch(e=>{ restFetchedRef.current = true; setProError(e.message); })
       .finally(()=>setProLoading(false));
   },[]);
+
+  // Immediately seed proData with watchlist placeholders so user sees their
+  // tickers the instant the Signals tab is clicked — before REST completes.
+  useEffect(()=>{
+    if(signalView!=='SIGNALS') return;
+    if(watchlist.size > 0 && proData.length === 0) {
+      setProData([...watchlist].map(sym => ({
+        ticker: sym, status: 'warming_up', bars_count: 0,
+        price: tickers.get(sym)?.price || tickers.get(sym)?.live_price || 0,
+      })));
+    }
+  },[signalView, watchlist]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(()=>{
     if(signalView!=='SIGNALS') return;
@@ -188,22 +208,33 @@ export default function PageSignals({
     const handlePayload = (payload) => {
       if(!payload || typeof payload !== 'object') return;
       if(payload.type === 'signal_snapshot' && Array.isArray(payload.data)){
-        setProData(payload.data);
+        // Dedup by ticker — keep last entry per ticker (latest signal wins)
+        const seen = new Map();
+        payload.data.forEach(r => seen.set(r.ticker || r.symbol, r));
+        const incoming = [...seen.values()];
+        // Only apply SSE signal_snapshot if it looks like live engine data.
+        // DB historical signals (from get_recent_signals) have price=0 and no
+        // status field — they must never overwrite live /api/scalp-analysis data.
+        // Live engine rows have: price > 0, or status='warming_up'/'ok'.
+        const looksLive = incoming.some(r => (r.price > 0) || r.status === 'ok' || r.status === 'warming_up');
+        if(looksLive) {
+          setProData(incoming);
+        }
         setProLoading(false);
       } else if(payload.type === 'signal_alert' && payload.data){
         setProData(prev => {
           const alert = payload.data;
-          const deduped = prev.filter(r =>
-            !(r.ticker === alert.ticker && r.created_at === alert.created_at)
-          );
-          return [alert, ...deduped].slice(0, 200);
+          const key = alert.ticker || alert.symbol;
+          // Replace existing entry for this ticker, or prepend
+          const filtered = prev.filter(r => (r.ticker || r.symbol) !== key);
+          return [alert, ...filtered].slice(0, 200);
         });
       }
     };
 
     let cleanup = () => {};
 
-    if(sse instanceof SharedWorker) {
+    if(isSharedWorker(sse)) {
       // SharedWorker path — messages arrive as pre-parsed objects on port
       const prevHandler = sse.port.onmessage;
       sse.port.onmessage = (e) => {
@@ -248,7 +279,7 @@ export default function PageSignals({
     buy:    proData.filter(r=>r.signal==='BUY').length,
     sell:   proData.filter(r=>r.signal==='SELL').length,
     strong: proData.filter(r=>r.strength==='STRONG').length,
-    total:  proData.filter(r=>!r.status||r.status==='ok').length,
+    total:  proData.length,
   }),[proData]);
   const handleProSort=key=>{
     if(proSort===key)setProSortAsc(!proSortAsc);
@@ -256,7 +287,21 @@ export default function PageSignals({
   };
 
   const techRows=useMemo(()=>{
-    let rows=[...techData];
+    // Enrich price from SSE tickers map for warming_up/seeding rows.
+    // market_monitor_api v3 returns price=0 for tickers still seeding bars.
+    // The SSE tickers map always has a live price from the Polygon snapshot.
+    let rows=techData.map(r=>{
+      if((r.price??0) > 0) return r;
+      const live = tickers.get(r.ticker);
+      if(!live) return r;
+      return {
+        ...r,
+        price:     live.price || live.live_price || 0,
+        change:    live.change_value || 0,
+        changePct: live.percent_change || live.change_pct || 0,
+        rvol:      r.rvol || live.rvol || 0,
+      };
+    });
     if(techFilter==='BULLISH') rows=rows.filter(r=>r.score>0);
     else if(techFilter==='BEARISH') rows=rows.filter(r=>r.score<0);
     else if(techFilter==='ALERTS')  rows=rows.filter(r=>r.alerts?.length>0);
@@ -267,7 +312,7 @@ export default function PageSignals({
       return techSortAsc?va-vb:vb-va;
     });
     return rows;
-  },[techData,techFilter,techSortKey,techSortAsc]);
+  },[techData,tickers,techFilter,techSortKey,techSortAsc]);
 
   const techStats=useMemo(()=>{
     if(!techData.length) return null;
@@ -414,7 +459,7 @@ export default function PageSignals({
               <div style={{ color:T.red, fontFamily:T.font, fontSize:13 }}>{proError}</div>
             </div>
           )}
-          {!proLoading&&!proError&&proData.length===0&&(
+          {!proLoading&&!proError&&proData.length===0&&restFetchedRef.current&&(
             <EmptyState icon="📊" label="NO WATCHLIST TICKERS"
               sub="Star (★) some tickers in the Live Table. Signals run real-time indicator analysis on your ★ watchlist." h={240} T={T}/>
           )}
@@ -433,7 +478,7 @@ export default function PageSignals({
                   const clr=pct>=75?T.green:pct>=40?T.gold:T.text2;
                   return(
                     <div key={r.ticker} style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:6, padding:'8px 12px', display:'flex', flexDirection:'column', alignItems:'center', gap:5, minWidth:90 }}>
-                      <span style={{ color:T.cyan, fontFamily:T.font, fontSize:12, fontWeight:700 }}>{r.ticker}</span>
+                      <span style={{ color:T.cyan, fontFamily:T.font, fontSize:12, fontWeight:700 }}>{r.ticker || r.symbol || "—"}</span>
                       <div style={{ width:70, height:4, background:T.bg3, borderRadius:2, overflow:'hidden' }}>
                         <div style={{ width:`${pct}%`, height:'100%', background:clr, borderRadius:2, transition:'width 1s ease' }}/>
                       </div>
@@ -465,9 +510,9 @@ export default function PageSignals({
                 ))}
               </div>
               <div style={{ maxHeight:'calc(100vh - 420px)', overflowY:'auto', overflowX:'auto' }}>
-                {proRows.map(row=>(
-                  <div key={row.ticker} className="tr-hover" style={{ display:'grid', gridTemplateColumns:proGridCols, borderBottom:`1px solid ${T.border}` }}>
-                    <div style={{ padding:'10px 8px' }}><span style={{ color:T.cyan, fontSize:12, fontWeight:700, fontFamily:T.font }}>{row.ticker}</span></div>
+                {proRows.map((row,_i)=>(
+                  <div key={`${row.ticker||row.symbol}-${row.created_at||row.ts||_i}`} className="tr-hover" style={{ display:'grid', gridTemplateColumns:proGridCols, borderBottom:`1px solid ${T.border}` }}>
+                    <div style={{ padding:'10px 8px' }}><span style={{ color:T.cyan, fontSize:12, fontWeight:700, fontFamily:T.font }}>{row.ticker || row.symbol || "—"}</span></div>
                     <div style={{ padding:'10px 8px', color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:600, display:'flex', alignItems:'center' }}>${fmt2(row.price)}</div>
                     <div style={{ padding:'10px 8px', display:'flex', alignItems:'center' }}>
                       <span style={{ color:_sigClr(row.signal), fontSize:11, fontWeight:800, fontFamily:T.font, padding:'2px 8px', borderRadius:4, background:_sigBg(row.signal), letterSpacing:0.5 }}>

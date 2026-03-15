@@ -360,6 +360,23 @@ class SupabaseDB:
 
         return results
 
+
+    def get_snapshot_cache(self) -> List[Dict]:
+        """
+        DEPLOY-FIX: Load the full live_tickers table at startup to pre-populate
+        WSEngine._cache without calling Polygon REST at all.
+
+        Unlike get_live_tickers(), this has NO staleness filter, NO cap, and
+        returns ALL rows — we want every ticker's last known price so ws_engine
+        can skip the 25-batch Polygon REST bulk fetch on redeploy.
+
+        Caller (ws_engine._fetch_history) decides which rows are stale enough
+        to need a Polygon refresh (> STALE_THRESHOLD_S seconds old).
+        """
+        rows = _paginate(self.client, "live_tickers", "*")
+        logger.info(f"get_snapshot_cache: loaded {len(rows)} rows from live_tickers")
+        return rows
+
     # ── Signals ───────────────────────────────────────────────────────────────
 
     def insert_signal(self, signal: Dict) -> bool:

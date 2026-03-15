@@ -257,6 +257,7 @@ def get_cached_monitor(
     watchlist_tickers: List[str],
     signal_engine:     "ScalpingSignalEngine",
     force_refresh:     bool = False,
+    price_cache:       Optional[Dict] = None,
 ) -> Dict:
     """
     Returns tech indicator data for watchlist tickers from the live in-memory
@@ -272,6 +273,9 @@ def get_cached_monitor(
         watchlist_tickers : list of ticker symbols to analyse
         signal_engine     : app.state.engine._signal_watcher (ScalpingSignalEngine)
         force_refresh     : bypass cache — useful after watchlist change
+        price_cache       : optional dict {ticker: row} from ws_engine._cache —
+                            used to fill price=0 for warming_up/seeding rows
+                            so the frontend always shows a live price
     """
     now = time.time()
 
@@ -332,6 +336,14 @@ def get_cached_monitor(
                     "de_ratio": None, "score": 0, "alerts": [],
                     "status": "seeding", "bars_count": 0,
                 })
+
+        # Enrich price=0 rows (warming_up/seeding) from ws_engine live cache
+        if price_cache:
+            for row in data:
+                if not row.get("price"):
+                    live = price_cache.get(row["ticker"])
+                    if live:
+                        row["price"] = float(live.get("price") or live.get("live_price") or 0)
 
         data.sort(key=lambda r: r.get("score", 0), reverse=True)
 

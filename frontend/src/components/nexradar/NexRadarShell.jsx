@@ -25,6 +25,7 @@ import PageScanner    from './nexradar/PageScanner.jsx';
 import PageEarnings   from './nexradar/PageEarnings.jsx';
 import PagePortfolio  from './nexradar/PagePortfolio.jsx';
 import PageWatchlist  from './nexradar/PageWatchlist.jsx';
+import { isSharedWorker } from './nexradar/sseConnection.js';
 
 // ── Shell ─────────────────────────────────────────────────────────────────────
 function NexRadarDashboard({
@@ -120,7 +121,7 @@ function NexRadarDashboard({
     };
 
     let cleanup = () => {};
-    if (sse instanceof SharedWorker) {
+    if (isSharedWorker(sse)) {
       const prevHandler = sse.port.onmessage;
       sse.port.onmessage = (e) => { if (prevHandler) prevHandler(e); handlePayload(e.data); };
       cleanup = () => { if (sse.port) sse.port.onmessage = prevHandler; };
@@ -178,10 +179,10 @@ function NexRadarDashboard({
       case 'live':      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={()=>setQuickFilter(null)} wsStatus={wsStatus} onLiveCount={handleLiveCount} watchlistProp={watchlist} toggleWatchlistProp={toggleWatchlist} T={T} />;
       case 'chart':     return <PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />;
       case 'scanner':   return <PageScanner T={T} onNavigateToChart={(sym) => { setChartInitSymbol(sym); setPage('chart'); }} />;
-      case 'signals':   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} sseRef={sseRef} T={T} />;
+      case 'signals':   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} watchlist={watchlist} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} sseRef={sseRef} T={T} />;
       case 'earnings':  return <PageEarnings T={T} />;
       case 'portfolio': return <PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlist} sseRef={sseRef} T={T} />;
-      case 'watchlist': return <PageWatchlist T={T} onNavigateToSettings={() => setHeaderPanel('settings')} />;
+      case 'watchlist': return <PageWatchlist T={T} onNavigateToSettings={() => setHeaderPanel('settings')} watchlistSet={watchlist} toggleWatchlist={toggleWatchlist} tickers={tickers} />;
       default:          return null;
     }
   };

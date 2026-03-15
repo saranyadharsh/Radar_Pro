@@ -14,7 +14,7 @@ const POLYGON_KEY = import.meta.env.VITE_POLYGON_API_KEY || "";
 // Backend API base — used for stock-data proxy (no frontend Polygon key needed)
 const API_BASE = import.meta.env.VITE_API_BASE || "";
 const POLYGON_BASE = "https://api.polygon.io";
-const EDGAR_BASE   = "https://efts.sec.gov/LATEST/search-index";
+// EDGAR routed through backend proxy — efts.sec.gov blocks browser CORS
 
 async function polyGet(path, params = {}) {
   const url = new URL(POLYGON_BASE + path);
@@ -28,11 +28,9 @@ async function polyGet(path, params = {}) {
 const edgarCache = {};
 
 async function edgarGet(symbol) {
-  const today = new Date().toISOString().slice(0, 10);
-  const url = `${EDGAR_BASE}?q=%22${symbol}%22&forms=8-K&dateRange=custom&startdt=${today}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`EDGAR ${res.status}`);
-  return res.json();
+  // Proxy through backend — efts.sec.gov blocks direct browser requests (CORS)
+  return fetch(`${API_BASE}/api/edgar/${symbol.toUpperCase()}`)
+    .then(r => { if (!r.ok) throw new Error(`EDGAR proxy ${r.status}`); return r.json(); });
 }
 
 export async function getSnapshot(symbol) {

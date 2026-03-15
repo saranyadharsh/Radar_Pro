@@ -44,6 +44,7 @@ const PageScreener  = lazy(() => import('./nexradar/PageScreener.jsx'));
 const PageScanner   = lazy(() => import('./nexradar/PageScanner.jsx'));
 const PageWatchlist = lazy(() => import('./nexradar/PageWatchlist.jsx'));
 import AlertToast from './nexradar/AlertToast.jsx';
+import { isSharedWorker }  from './nexradar/sseConnection.js';
 
 // Inline suspense fallback — dark NexRadar skeleton aesthetic
 const PageLoader = ({ T }) => (
@@ -168,7 +169,7 @@ function NexRadarDashboard({
 
     let cleanup = () => {};
 
-    if (sse instanceof SharedWorker) {
+    if (isSharedWorker(sse)) {
       // SharedWorker: messages arrive as pre-parsed objects on port.onmessage
       const prevHandler = sse.port.onmessage;
       sse.port.onmessage = (e) => {
@@ -241,11 +242,11 @@ function NexRadarDashboard({
       // Lazy pages — wrapped in Suspense, downloaded on first visit
       case 'screener':  return withLazy(<PageScreener tickers={tickers} watchlist={watchlist} toggleWatchlist={toggleWatchlist} techData={techData} scalpData={sideScalpSignals} T={T} />);
       case 'chart':     return withLazy(<PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />);
-      case 'signals':   return withLazy(<PageSignals tickers={tickers} selectedSectors={selectedSectors} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} sseRef={sseRef} T={T} />);
+      case 'signals':   return withLazy(<PageSignals tickers={tickers} selectedSectors={selectedSectors} watchlist={watchlist} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} sseRef={sseRef} T={T} />);
       case 'earnings':  return withLazy(<PageEarnings T={T} />);
       case 'scanner':  return withLazy(<PageScanner T={T} onNavigateToChart={(sym) => { setChartInitSymbol(sym); setPage('chart'); }} />);
       case 'portfolio': return withLazy(<PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlist} sseRef={sseRef} T={T} />);
-      case 'watchlist': return withLazy(<PageWatchlist T={T} onNavigateToSettings={() => setHeaderPanel('settings')} />);
+      case 'watchlist': return withLazy(<PageWatchlist T={T} onNavigateToSettings={() => setHeaderPanel('settings')} watchlistSet={watchlist} toggleWatchlist={toggleWatchlist} tickers={tickers} />);
       default:          return null;
     }
   };

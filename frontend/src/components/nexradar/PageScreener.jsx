@@ -214,7 +214,9 @@ export default function PageScreener({ tickers, watchlist, toggleWatchlist, tech
       const live  = tickers.get(sym)               ?? {};
       const tech  = techData?.find(td => td.ticker === sym) ?? {};
       const scalp = scalpData[sym]                 ?? {};
-      return { ...live, ...tech, ...scalp, ticker: sym };
+      // Spread order: tech metadata first, then live (live.price overrides tech.price=0
+      // for warming_up/seeding rows), then scalp (most real-time wins for rsi/trend/signal)
+      return { ...tech, ...live, ...scalp, ticker: sym };
     });
 
     // FIX-SCR-2 & FIX-SCR-3: Apply filters with corrected numVal and exclusive logic

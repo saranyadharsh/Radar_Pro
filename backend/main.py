@@ -533,6 +533,10 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
                 try:
                     signals = await asyncio.to_thread(db.get_recent_signals, 50)
                     if signals:
+                        # Normalize ticker field — signals table may store as 'symbol'
+                        for s in signals:
+                            if not s.get("ticker") and s.get("symbol"):
+                                s["ticker"] = s["symbol"]
                         yield "data: " + json.dumps({
                             "type":      "signal_snapshot",
                             "data":      signals,
@@ -831,8 +835,20 @@ async def get_market_monitor(refresh: int = Query(0)):
     # reads from live IndicatorCalculator state — zero yfinance, zero HTTP.
     _eng          = getattr(app.state, "engine", None)
     signal_engine = _eng._signal_watcher if _eng else None
+
+    # PRICE-FILL FIX: pass ws_engine._cache so warming_up/seeding rows get
+    # a live Polygon price instead of price=0.
+    # ws_engine._cache is always populated from the bulk Polygon REST snapshot
+    # at startup, so every ticker has a price even before 27 bars accumulate.
+    _price_cache = None
+    try:
+        if _eng and hasattr(_eng, "_cache"):
+            _price_cache = dict(_eng._cache)  # shallow copy — safe across threads
+    except Exception:
+        pass
+
     result = await asyncio.to_thread(
-        get_cached_monitor, tickers, signal_engine, bool(refresh)
+        get_cached_monitor, tickers, signal_engine, bool(refresh), _price_cache
     )
     return result
 
@@ -1076,21 +1092,25 @@ async def get_quote(symbol: str):
         raise HTTPException(status_code=502, detail=str(e))
 
 
-# ── Polygon Proxy — News ──────────────────────────────────────────────────────
-# DataEngine.getNews() calls this — MASSIVE_API_KEY stays server-side.
-# Returns Polygon format: {results: [{title, publisher, article_url, published_utc, insights}]}
+# ── Yahoo Finance Proxy — News ─────────────────────────────────────────────────
 @app.get("/api/news/{symbol}")
 async def get_news(symbol: str):
-    api_key = os.getenv("MASSIVE_API_KEY", "")
-    if not api_key:
-        raise HTTPException(status_code=503, detail="Polygon API key not configured")
-    sym = symbol.upper().strip()
-    params = {"ticker": sym, "limit": 5, "order": "desc", "sort": "published_utc", "apiKey": api_key}
+    url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol.upper()}&region=US&lang=en-US"
     try:
         async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get("https://api.polygon.io/v2/reference/news", params=params)
+            r = await client.get(url, headers=_YF_HEADERS)
             r.raise_for_status()
-            return r.json()
+        import xml.etree.ElementTree as ET
+        root  = ET.fromstring(r.text)
+        items = []
+        for item in root.findall(".//item")[:8]:
+            items.append({
+                "title":   (item.findtext("title")   or "").strip(),
+                "link":    (item.findtext("link")    or "#").strip(),
+                "pubDate": (item.findtext("pubDate") or "").strip(),
+                "source":  (item.findtext("source")  or "Yahoo Finance").strip(),
+            })
+        return {"items": items}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -1316,6 +1336,26 @@ async def get_stock_data(symbol: str, force: bool = False):
 
     return result
 
+
+# ── EDGAR Proxy ────────────────────────────────────────────────────────────────
+# DataEngine.checkEdgarFilings() calls this — efts.sec.gov blocks browser CORS.
+@app.get("/api/edgar/{symbol}")
+async def edgar_proxy(symbol: str):
+    import datetime
+    sym   = symbol.upper().strip()
+    today = datetime.date.today().isoformat()
+    url   = f"https://efts.sec.gov/LATEST/search-index?q=%22{sym}%22&forms=8-K&dateRange=custom&startdt={today}"
+    try:
+        async with httpx.AsyncClient(
+            timeout=8,
+            headers={"User-Agent": "NexRadar/1.0 contact@nexradar.info"}
+        ) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        logger.debug(f"EDGAR proxy {sym}: {e}")
+        return {"hits": {"hits": [], "total": {"value": 0}}}
 
 # ── Debug: Sector Map ──────────────────────────────────────────────────────────
 @app.get("/api/debug/sectors")

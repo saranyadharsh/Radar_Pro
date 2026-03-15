@@ -12,7 +12,7 @@
 // Engine paths are relative to src/components/engines/
 // ═══════════════════════════════════════════════════════════════
 import { useState, useEffect, useCallback, useRef } from "react";
-import { fmt2, fmtB, fmtVol } from "./utils.js";
+import { fmt2, fmtVol } from "./utils.js";
 import DataEngine from "../engines/DataEngine.js";
 import AIEngine   from "../engines/AIEngine.js";
 
@@ -34,14 +34,14 @@ export function ShimmerBlock({ lines=4 }) {
   </div>;
 }
 
-export function AgentDot({ done, loading }) {
+export function AgentDot({ done, loading, T }) {
   return <div style={{ width:6, height:6, borderRadius:"50%", flexShrink:0,
     background: done?T.green:loading?T.gold:T.bg4,
     boxShadow: loading?`0 0 6px ${T.gold}`:done?`0 0 4px ${T.green}`:"none",
     animation: loading?"pulse 1s infinite":"none" }}/>;
 }
 
-export function ScoreBar({ label, score, max=10 }) {
+export function ScoreBar({ label, score, max=10, T }) {
   const pct   = Math.min(100, Math.max(0,(score/max)*100));
   const color = pct>65?T.green:pct>40?T.gold:T.red;
   return <div style={{ marginBottom:10 }}>
@@ -58,7 +58,7 @@ export function ScoreBar({ label, score, max=10 }) {
   </div>;
 }
 
-export function VerdictBadge({ verdict }) {
+export function VerdictBadge({ verdict, T }) {
   const v   = (verdict||"").toUpperCase();
   const cfg = {
     "STRONG BUY":  { color:T.green,  bg:T.greenDim,  border:T.green+"50",  icon:"⚡" },
@@ -82,7 +82,7 @@ export function VerdictBadge({ verdict }) {
 }
 
 // ─── EDGAR Alert Banner ───────────────────────────────────────
-function EdgarBanner({ result, symbol, onDismiss }) {
+function EdgarBanner({ result, symbol, onDismiss, T }) {
   if(!result) return null;
   const pos = ["VERY_POSITIVE","POSITIVE"].includes(result.impact);
   const color = pos?T.green:T.red;
@@ -125,7 +125,7 @@ function EdgarBanner({ result, symbol, onDismiss }) {
 }
 
 // ─── AI Disabled Prompt ───────────────────────────────────────
-function AIDisabledPrompt({ onEnable }) {
+function AIDisabledPrompt({ onEnable, T }) {
   return <div style={{ background:T.bg2, border:`1px solid ${T.border}`,
     borderRadius:8, padding:"14px 13px", marginTop:8 }}>
     <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
@@ -450,7 +450,7 @@ export default function AgenticPanel({ ticker, rowHint={}, context="watchlist", 
             ]),
           ].map(a => (
             <div key={a.label} style={{ display:"flex", alignItems:"center", gap:3 }}>
-              <AgentDot done={a.done} loading={a.loading}/>
+              <AgentDot done={a.done} loading={a.loading} T={T}/>
               <span style={{ color:a.done?T.text1:a.loading?T.gold:T.text2,
                 fontFamily:T.font, fontSize:7.5, letterSpacing:0.3 }}>
                 {a.label}
@@ -485,7 +485,7 @@ export default function AgenticPanel({ ticker, rowHint={}, context="watchlist", 
         {/* EDGAR banner — always on top regardless of tab */}
         {edgarResult && (
           <EdgarBanner result={edgarResult} symbol={ticker}
-            onDismiss={() => setEdgarResult(null)}/>
+            onDismiss={() => setEdgarResult(null)} T={T}/>
         )}
 
         {/* ── DATA TAB (FREE · AUTO) ─────────────────────── */}
@@ -597,7 +597,7 @@ export default function AgenticPanel({ ticker, rowHint={}, context="watchlist", 
 
               {/* AI disabled notice */}
               {!aiEnabled && (
-                <AIDisabledPrompt onEnable={onNavigateToSettings}/>
+                <AIDisabledPrompt onEnable={onNavigateToSettings} T={T}/>
               )}
             </>}
           </div>
@@ -790,7 +790,7 @@ export default function AgenticPanel({ ticker, rowHint={}, context="watchlist", 
         {tab==="verdict" && (
           <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
             {ld.verdict && !verdict ? <ShimmerBlock lines={8}/> : verdict && <>
-              <VerdictBadge verdict={verdict.verdict}/>
+              <VerdictBadge verdict={verdict.verdict} T={T}/>
 
               {/* Meta grid */}
               <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:6 }}>
@@ -821,10 +821,10 @@ export default function AgenticPanel({ ticker, rowHint={}, context="watchlist", 
                 borderRadius:8, padding:"10px 12px" }}>
                 <p style={{ color:T.text2, fontFamily:T.font, fontSize:8,
                   letterSpacing:1, marginBottom:10 }}>SCORE BREAKDOWN</p>
-                <ScoreBar label="Fundamental" score={verdict.fundamentalScore}/>
-                <ScoreBar label="Technical"   score={verdict.technicalScore}/>
-                <ScoreBar label="Sentiment"   score={verdict.sentimentScore}/>
-                <ScoreBar label="Momentum"    score={verdict.momentumScore}/>
+                <ScoreBar label="Fundamental" score={verdict.fundamentalScore} T={T}/>
+                <ScoreBar label="Technical"   score={verdict.technicalScore} T={T}/>
+                <ScoreBar label="Sentiment"   score={verdict.sentimentScore} T={T}/>
+                <ScoreBar label="Momentum"    score={verdict.momentumScore} T={T}/>
               </div>
 
               {/* Right time */}

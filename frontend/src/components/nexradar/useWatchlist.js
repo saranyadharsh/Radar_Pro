@@ -16,6 +16,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { API_BASE } from "../../config.js";
+import { isSharedWorker } from './sseConnection.js';
 
 export function useWatchlist(sseRef) {
   const [watchlist, setWatchlist] = useState(new Set());
@@ -62,7 +63,7 @@ export function useWatchlist(sseRef) {
       const sse = sseRef.current;
       if (!sse) { pollId = setTimeout(attach, 500); return; }
 
-      if (sse instanceof SharedWorker) {
+      if (isSharedWorker(sse)) {
         const prevHandler = sse.port.onmessage;
         sse.port.onmessage = (e) => { if (prevHandler) prevHandler(e); handlePayload(e.data); };
         cleanup = () => { clearTimeout(pollId); if (sse.port) sse.port.onmessage = prevHandler; };

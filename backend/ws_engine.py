@@ -516,20 +516,107 @@ class WSEngine:
 
     # ── Historical / snapshot fetch from Polygon REST ─────────────────────────
 
+    # DEPLOY-FIX: rows older than this are considered stale and need Polygon refresh.
+    # 8 hours covers overnight + weekend gaps cleanly.
+    _STALE_THRESHOLD_S = 8 * 3600
+
     def _fetch_history(self) -> None:
         """
-        On startup, populate the cache with Polygon snapshot data so the
-        dashboard has prices before any WebSocket ticks arrive.
-        """
-        logger.info("Fetching Polygon bulk snapshot …")
-        try:
-            self._fetch_polygon_snapshot_bulk()
-        except Exception as e:
-            logger.error(f"Polygon bulk snapshot failed: {e}")
+        DEPLOY-FIX: On startup, populate the cache from live_tickers (Supabase)
+        first, then only call Polygon REST for tickers that are genuinely missing
+        or stale (> _STALE_THRESHOLD_S seconds old).
 
-    def _fetch_polygon_snapshot_bulk(self) -> None:
+        Before this fix: every deploy triggered 25 Polygon REST batch calls
+        (6027 tickers ÷ 250 per batch) regardless of how fresh the data was.
+
+        After this fix:
+          - Mid-day redeploy   → 0 Polygon REST calls (all rows fresh)
+          - Overnight/weekend  → 25 Polygon REST calls (all rows stale)
+          - First-ever deploy  → 25 Polygon REST calls (no rows exist yet)
+        """
+        logger.info("DEPLOY-FIX: Loading snapshot from live_tickers (Supabase) …")
+        stale: list[str] = []
+        now_ts = int(time.time())
+
+        try:
+            cached_rows = self._db.get_snapshot_cache()
+        except Exception as e:
+            logger.error(f"get_snapshot_cache failed: {e} — falling back to Polygon")
+            cached_rows = []
+
+        if cached_rows:
+            loaded = 0
+            for row in cached_rows:
+                ticker = row.get("ticker")
+                if not ticker or ticker not in self._tickers:
+                    continue
+
+                last_update = int(row.get("last_update") or 0)
+                age_s = now_ts - last_update
+
+                # Re-map DB column names back to cache field names
+                cache_row = {
+                    **row,
+                    # DB stores open_price; cache and frontend expect both
+                    "open":       row.get("open_price", 0),
+                    "open_price": row.get("open_price", 0),
+                    # Ensure aliases expected by _handle_tick and the frontend exist
+                    "live_price":     row.get("price", 0),
+                    "percent_change": row.get("change_pct", 0),
+                    "change_value":   row.get("change_value", 0),
+                    "company_name":   row.get("company_name") or self._company_map.get(ticker, ""),
+                    "company":        row.get("company_name") or self._company_map.get(ticker, ""),
+                    "sector":         row.get("sector") or self._sector_map.get(ticker, "Unknown"),
+                    "ts":             int(row.get("ts") or (last_update * 1000)),
+                }
+
+                with self._cache_lock:
+                    self._cache[ticker] = cache_row
+                loaded += 1
+
+                if age_s > self._STALE_THRESHOLD_S:
+                    stale.append(ticker)
+
+            logger.info(
+                f"DEPLOY-FIX: Seeded {loaded} tickers from Supabase "
+                f"({len(stale)} stale > {self._STALE_THRESHOLD_S//3600}h — will refresh from Polygon)"
+            )
+        else:
+            # No cached rows at all (first-ever deploy) — need full Polygon fetch
+            stale = list(self._tickers)
+            logger.info("DEPLOY-FIX: No Supabase cache found — full Polygon fetch required")
+
+        # Also add any tickers completely absent from live_tickers
+        with self._cache_lock:
+            cached_set = set(self._cache.keys())
+        missing = [t for t in self._tickers if t not in cached_set]
+        if missing:
+            logger.info(f"DEPLOY-FIX: {len(missing)} tickers absent from live_tickers — adding to refresh list")
+            stale = list(set(stale) | set(missing))
+
+        if not stale:
+            logger.info("DEPLOY-FIX: All tickers fresh — skipping Polygon REST bulk fetch ✓")
+            # Still broadcast the loaded snapshot immediately so SSE clients get data
+            with self._cache_lock:
+                data = list(self._cache.values())
+            if data:
+                self._broadcast({"type": "snapshot", "data": data,
+                                 "ts": int(time.time() * 1000)})
+            return
+
+        logger.info(f"DEPLOY-FIX: Refreshing {len(stale)} stale/missing tickers from Polygon …")
+        try:
+            self._fetch_polygon_snapshot_bulk(tickers_override=stale)
+        except Exception as e:
+            logger.error(f"Polygon partial refresh failed: {e}")
+
+    def _fetch_polygon_snapshot_bulk(self, tickers_override: List[str] = None) -> None:
         """
         Fetches Polygon /v2/snapshot/locale/us/markets/stocks/tickers bulk API.
+
+        DEPLOY-FIX: tickers_override — when provided, only fetch these tickers
+        instead of all self._tickers. Used by _fetch_history to refresh only
+        the stale/missing subset, skipping Polygon calls for fresh rows.
 
         FIX-WS-5: The fallback chain after Fix-20a is completely rewritten to
         prevent the yfinance rate-limit bomb. See module docstring for details.
@@ -538,12 +625,13 @@ class WSEngine:
             logger.warning("No MASSIVE_API_KEY  -  skipping Polygon snapshot fetch")
             return
 
+        target_tickers = tickers_override if tickers_override is not None else self._tickers
         session_now = _get_session()
         batch_size  = 250
         failed: List[str] = []
 
-        for i in range(0, len(self._tickers), batch_size):
-            batch   = self._tickers[i:i + batch_size]
+        for i in range(0, len(target_tickers), batch_size):
+            batch   = target_tickers[i:i + batch_size]
             params  = {"tickers": ",".join(batch), "apiKey": self._api_key}
             try:
                 resp = requests.get(

@@ -1,30 +1,14 @@
 // ═══════════════════════════════════════════════════════════════
-// NexRadarWatchlist.jsx — REBUILT
-// Engine 1: DataEngine (FREE · AUTO)
-//   Polygon WebSocket → live prices every 15ms
-//   Polygon REST      → snapshot on click 300ms
-//   EDGAR Watcher     → 8-K polling every 60s
-// Engine 2: AIEngine (COST · MANUAL)
-//   Toggle OFF → data only, $0 per click
-//   Toggle ON  → 3 agents fire on click, ~$0.026
+// PageWatchlist.jsx — NexRadar Pro
+// SSE-driven: live prices from tickers Map (useTickerData)
+// Watchlist state managed by useWatchlist (shared with LiveTable)
+// Star in LiveTable → adds here. ✕ button → removes from both.
+// No DataEngine WebSocket. No hardcoded DEFAULT_WATCHLIST.
 // ═══════════════════════════════════════════════════════════════
 
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useCallback, useMemo } from "react";
 import { fmt2, fmtVol } from "./utils.js";
 import AgenticPanel, { Shimmer } from "./AgenticPanel.jsx";
-import DataEngine from "../engines/DataEngine.js";
-import AIEngine   from "../engines/AIEngine.js";
-
-const DEFAULT_WATCHLIST = [
-  { symbol:"AAPL",  companyName:"Apple Inc",              sector:"Technology", tags:["MEGA_CAP","EARNINGS_SOON"] },
-  { symbol:"NVDA",  companyName:"NVIDIA Corporation",     sector:"Technology", tags:["MOMENTUM","AI"] },
-  { symbol:"CHTR",  companyName:"Charter Communications", sector:"Telecom",    tags:["DEAL","COX_ACQ"] },
-  { symbol:"MSFT",  companyName:"Microsoft Corporation",  sector:"Technology", tags:["MEGA_CAP"] },
-  { symbol:"TSLA",  companyName:"Tesla Inc",              sector:"Consumer",   tags:["VOLATILE"] },
-  { symbol:"META",  companyName:"Meta Platforms",         sector:"Technology", tags:["AI","MOMENTUM"] },
-  { symbol:"AMZN",  companyName:"Amazon.com Inc",         sector:"Consumer",   tags:["MEGA_CAP"] },
-  { symbol:"JPM",   companyName:"JPMorgan Chase",         sector:"Financial",  tags:["DIVIDEND"] },
-];
 
 function RangeBar({ price, high, low, T }) {
   if (!price||!high||!low||high===low) return <span style={{color:T.text2,fontSize:9}}>—</span>;
@@ -104,111 +88,69 @@ function NewsToast({ toast, onDismiss, T }) {
   );
 }
 
-export default function PageWatchlist({ onNavigateToSettings, T }) {
-  const [watchlist,    setWatchlist]    = useState(DEFAULT_WATCHLIST);
+export default function PageWatchlist({
+  onNavigateToSettings,
+  // SSE-driven props from NexRadarDashboard — no DataEngine needed
+  watchlistSet = new Set(),       // Set<string> of starred symbols
+  toggleWatchlist = ()=>{},       // (symbol) => void — calls backend + optimistic update
+  tickers = new Map(),            // Map<ticker, liveRow> from useTickerData SSE
+  T,
+}) {
+  // Derive flat watchlist array from the Set + tickers map for metadata
+  const watchlist = useMemo(() => {
+    return [...watchlistSet].map(sym => {
+      const live = tickers.get(sym) || {};
+      return {
+        symbol:      sym,
+        companyName: live.company_name || live.company || sym,
+        sector:      live.sector || "—",
+        tags:        [],
+      };
+    });
+  }, [watchlistSet, tickers]);
+
   const [selectedTick, setSelectedTick] = useState(null);
   const [selectedRow,  setSelectedRow]  = useState(null);
-  const [livePrices,   setLivePrices]   = useState({});
-  const [edgarAlerts,  setEdgarAlerts]  = useState({});
   const [search,       setSearch]       = useState("");
   const [addSymbol,    setAddSymbol]    = useState("");
   const [filterTag,    setFilterTag]    = useState("ALL");
-  const [isSyncing,    setIsSyncing]    = useState(false);
-  const [newsAlerts,   setNewsAlerts]   = useState({});  // symbol → latest news alert
-  const [toast,        setToast]        = useState(null); // floating news toast
-  const edgarRef  = useRef(null);
-  const newsRef   = useRef(null);
+  const [newsAlerts,   setNewsAlerts]   = useState({});
+  const [toast,        setToast]        = useState(null);
 
-  // DataEngine — WebSocket live prices (AUTO · PUSH · 15ms)
-  useEffect(() => {
-    const symbols = watchlist.map(w=>w.symbol);
-    DataEngine.connectWebSocket(symbols, (update) => {
-      setLivePrices(prev => ({
-        ...prev,
-        [update.symbol]: {
-          ...prev[update.symbol],
-          price:     update.price,
-          open:      update.open,
-          high:      update.high,
-          low:       update.low,
-          volume:    update.volume,
-          vwap:      update.vwap,
-          change:    update.price-(prev[update.symbol]?.prevClose||update.price),
-          changePct: prev[update.symbol]?.prevClose
-            ? ((update.price-prev[update.symbol].prevClose)/prev[update.symbol].prevClose*100):0,
-        },
-      }));
-    });
-    return () => DataEngine.disconnectWebSocket();
-  }, [watchlist]);
+  // Live prices come directly from the SSE tickers map — no DataEngine WebSocket
+  // tickers is a Map<symbol, {price, change, changePct, volume, high, low, vwap, ...}>
+  const getLive = (sym) => {
+    const row = tickers.get(sym);
+    if (!row) return null;
+    return {
+      price:     row.price      || row.live_price   || 0,
+      change:    row.change_value || 0,
+      changePct: row.percent_change || row.change_pct || 0,
+      volume:    row.volume     || 0,
+      high:      row.high       || 0,
+      low:       row.low        || 0,
+      vwap:      row.vwap       || 0,
+      prevClose: row.prev_close || 0,
+    };
+  };
 
-  // DataEngine — REST initial load (AUTO · 300ms)
-  const loadPrices = useCallback(async () => {
-    setIsSyncing(true);
-    await Promise.all(watchlist.map(async w => {
-      const snap = await DataEngine.getSnapshot(w.symbol);
-      if (snap) setLivePrices(prev => ({ ...prev, [w.symbol]: snap }));
-    }));
-    setIsSyncing(false);
-  }, [watchlist]);
-  useEffect(() => { loadPrices(); }, [watchlist]);
-
-  // DataEngine — EDGAR polling (AUTO · 60s)
-  const pollEdgar = useCallback(async () => {
-    const symbols = watchlist.map(w=>w.symbol);
-    const results = await DataEngine.pollEdgarForWatchlist(symbols);
-    for (const [sym, result] of Object.entries(results)) {
-      if (!result.newFiling) continue;
-      const stockData = livePrices[sym]||{};
-      if (AIEngine.isAIEnabled()) {
-        const classified = await AIEngine.classifyEdgarFiling(sym, result, stockData);
-        setEdgarAlerts(prev => ({...prev,[sym]:classified}));
-      } else {
-        setEdgarAlerts(prev => ({...prev,[sym]:{
-          eventType: result.formType||"8-K",
-          eventTitle:`New ${result.formType||"8-K"} filed`,
-          impact:"NEUTRAL", impactScore:5,
-          summary:`Filed: ${result.filedAt}. Enable AI for analysis.`,
-          priceImpact:"Unknown", action:"WATCH", urgency:"MEDIUM",
-        }}));
-      }
-    }
-  }, [watchlist, livePrices]);
-
-  useEffect(() => {
-    edgarRef.current = setInterval(pollEdgar, 60000);
-    return () => clearInterval(edgarRef.current);
-  }, [pollEdgar]);
-
-  // DataEngine — News push poll (AUTO · 120s)
-  // Fires when a NEW headline appears for any watchlist stock
-  useEffect(() => {
-    const symbols = watchlist.map(w => w.symbol);
-    newsRef.current = DataEngine.startNewsPoll(
-      symbols,
-      (alert) => {
-        // Badge on the row
-        setNewsAlerts(prev => ({ ...prev, [alert.symbol]: alert }));
-        // Toast notification — auto-dismiss after 6s
-        setToast(alert);
-        setTimeout(() => setToast(t => t?.symbol===alert.symbol ? null : t), 6000);
-      },
-      120000 // every 2 minutes
-    );
-    return () => DataEngine.stopNewsPoll(newsRef.current);
-  }, [watchlist]);
-
+  // Add to watchlist (calls backend via toggleWatchlist prop)
   const addToWatchlist = useCallback(() => {
     const sym = addSymbol.trim().toUpperCase();
-    if (!sym||watchlist.find(w=>w.symbol===sym)) return;
-    setWatchlist(prev=>[...prev,{symbol:sym,companyName:sym,sector:"—",tags:[]}]);
+    if (!sym || watchlistSet.has(sym)) return;
+    toggleWatchlist(sym);
     setAddSymbol("");
-  }, [addSymbol, watchlist]);
+  }, [addSymbol, watchlistSet, toggleWatchlist]);
 
+  // Remove from watchlist
   const removeFromWatchlist = useCallback((sym) => {
-    setWatchlist(prev=>prev.filter(w=>w.symbol!==sym));
-    if (selectedTick===sym) { setSelectedTick(null); setSelectedRow(null); }
-  }, [selectedTick]);
+    toggleWatchlist(sym);
+    if (selectedTick === sym) { setSelectedTick(null); setSelectedRow(null); }
+  }, [toggleWatchlist, selectedTick]);
+
+  // Dummy for backward-compat with refresh button
+  const loadPrices = useCallback(() => {}, []);
+  const isSyncing  = false;
 
   const allTags = useMemo(() => {
     const tags = new Set(["ALL"]);
@@ -227,15 +169,15 @@ export default function PageWatchlist({ onNavigateToSettings, T }) {
   }, [watchlist,search,filterTag]);
 
   const stats = useMemo(() => {
-    const prices = Object.values(livePrices);
+    const prices = watchlist.map(w => getLive(w.symbol)).filter(Boolean);
     return {
       total:   watchlist.length,
       gainers: prices.filter(p=>p.change>0).length,
       losers:  prices.filter(p=>p.change<0).length,
-      alerts:  Object.keys(edgarAlerts).length,
+      alerts:  0,
       news:    Object.keys(newsAlerts).length,
     };
-  }, [watchlist,livePrices,edgarAlerts,newsAlerts]);
+  }, [watchlist, tickers, newsAlerts]);
 
   const COL = "82px 120px 78px 82px 78px 70px 38px";
 
@@ -253,6 +195,13 @@ export default function PageWatchlist({ onNavigateToSettings, T }) {
             boxShadow:`0 0 6px ${T.green}`,animation:"pulse 2s infinite"}}/>
           <span style={{color:T.text0,fontSize:11,fontFamily:T.font,
             fontWeight:700,letterSpacing:1.2}}>★ WATCHLIST</span>
+          {watchlist.length > 0 && (
+            <span style={{color:T.green,fontFamily:T.font,fontSize:9,
+              background:T.green+"18",border:`1px solid ${T.green}30`,
+              borderRadius:4,padding:"2px 7px",fontWeight:700}}>
+              ⚡ {watchlist.length} SIGNALS ACTIVE
+            </span>
+          )}
         </div>
         <div style={{display:"flex",gap:6}}>
           <input value={addSymbol}
@@ -289,13 +238,7 @@ export default function PageWatchlist({ onNavigateToSettings, T }) {
               <span style={{color:s.c,fontSize:12,fontFamily:T.font,fontWeight:800}}>{s.v}</span>
             </div>
           ))}
-          <button onClick={loadPrices} disabled={isSyncing}
-            style={{background:T.bg2,border:`1px solid ${T.border}`,
-              color:isSyncing?T.text2:T.text1,borderRadius:6,padding:"5px 12px",
-              cursor:"pointer",fontFamily:T.font,fontSize:9,fontWeight:600,
-              animation:isSyncing?"pulse 1s infinite":"none"}}>
-            {isSyncing?"⟳ SYNCING…":"⟳ REFRESH"}
-          </button>
+
         </div>
       </div>
 
@@ -336,15 +279,29 @@ export default function PageWatchlist({ onNavigateToSettings, T }) {
           <div style={{flex:1,overflowY:"auto"}}>
             {filtered.length===0 ? (
               <div style={{display:"flex",flexDirection:"column",alignItems:"center",
-                justifyContent:"center",height:200,gap:8}}>
-                <div style={{color:T.text2,fontSize:24,opacity:0.2}}>★</div>
-                <span style={{color:T.text2,fontFamily:T.font,fontSize:11}}>
-                  {search?"No matches":"Add tickers to watchlist"}
+                justifyContent:"center",height:240,gap:10}}>
+                <div style={{color:T.text2,fontSize:32,opacity:0.15}}>★</div>
+                <span style={{color:T.text0,fontFamily:T.font,fontSize:13,fontWeight:700}}>
+                  {search ? "No matches" : "Your watchlist is empty"}
                 </span>
+                {!search && (
+                  <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6,
+                    background:T.bg2,border:`1px solid ${T.border}`,borderRadius:8,
+                    padding:"12px 20px",maxWidth:320,textAlign:"center"}}>
+                    <span style={{color:T.text2,fontFamily:T.font,fontSize:10,lineHeight:1.6}}>
+                      Type a ticker above and click <span style={{color:T.cyan,fontWeight:700}}>+ ADD</span>
+                      <br/>— or —<br/>
+                      Click <span style={{color:T.gold,fontWeight:700}}>★</span> on any row in the Live Table
+                    </span>
+                    <span style={{color:T.green,fontFamily:T.font,fontSize:9,marginTop:2}}>
+                      ⚡ Adding a ticker starts signal engine calculations immediately
+                    </span>
+                  </div>
+                )}
               </div>
             ) : filtered.map((w,i)=>{
-              const live      = livePrices[w.symbol];
-              const alert     = edgarAlerts[w.symbol];
+              const live      = getLive(w.symbol);
+              const alert     = null; // Edgar alerts removed — no longer tracked
               const newsAlert = newsAlerts[w.symbol];
               const isSel     = selectedTick===w.symbol;
               const chg       = live?.change||0;
@@ -361,8 +318,11 @@ export default function PageWatchlist({ onNavigateToSettings, T }) {
                     animation:`fadeIn 0.12s ${Math.min(i*0.015,0.3)}s both`}}>
 
                   <div style={{padding:"9px 4px"}}>
-                    <div style={{color:T.cyan,fontSize:11,fontFamily:T.font,
-                      fontWeight:800}}>{w.symbol}</div>
+                    <div style={{display:"flex",alignItems:"center",gap:4}}>
+                      <span style={{color:T.cyan,fontSize:11,fontFamily:T.font,
+                        fontWeight:800}}>{w.symbol}</span>
+                      <span style={{color:T.green,fontSize:7,opacity:0.7}}>⚡</span>
+                    </div>
                     <EdgarBadge alert={alert} T={T}/>
                     <NewsBadge alert={newsAlert} T={T}/>
                     <div style={{display:"flex",gap:2,flexWrap:"wrap",marginTop:2}}>
@@ -428,10 +388,10 @@ export default function PageWatchlist({ onNavigateToSettings, T }) {
             display:"flex",justifyContent:"space-between",
             background:T.bg0,flexShrink:0}}>
             <span style={{color:T.text2,fontSize:8.5,fontFamily:T.font}}>
-              {filtered.length} stocks · EDGAR 60s · News 120s
+              {filtered.length} stocks · SSE live feed
             </span>
             <span style={{color:T.text2,fontSize:8,fontFamily:T.font}}>
-              Polygon WebSocket · {isSyncing?"Syncing…":"Live ●"}
+              NexRadar SSE · Live ●
             </span>
           </div>
         </div>
