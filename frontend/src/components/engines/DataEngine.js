@@ -147,8 +147,10 @@ export async function getOptions(symbol) {
 
 export async function getNews(symbol) {
   try {
-    const data = await polyGet(`/v2/reference/news`,
-      { ticker:symbol, limit:5, order:"desc", sort:"published_utc" });
+    // Proxy through backend — MASSIVE_API_KEY stays server-side, no VITE_POLYGON_API_KEY needed
+    const res = await fetch(`${API_BASE}/api/news/${symbol.toUpperCase()}`);
+    if (!res.ok) throw new Error(`News proxy ${res.status}`);
+    const data = await res.json();
     return (data.results || []).map(n => ({
       headline:  n.title,
       source:    n.publisher?.name,

@@ -1076,25 +1076,21 @@ async def get_quote(symbol: str):
         raise HTTPException(status_code=502, detail=str(e))
 
 
-# ── Yahoo Finance Proxy — News ─────────────────────────────────────────────────
+# ── Polygon Proxy — News ──────────────────────────────────────────────────────
+# DataEngine.getNews() calls this — MASSIVE_API_KEY stays server-side.
+# Returns Polygon format: {results: [{title, publisher, article_url, published_utc, insights}]}
 @app.get("/api/news/{symbol}")
 async def get_news(symbol: str):
-    url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol.upper()}&region=US&lang=en-US"
+    api_key = os.getenv("MASSIVE_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Polygon API key not configured")
+    sym = symbol.upper().strip()
+    params = {"ticker": sym, "limit": 5, "order": "desc", "sort": "published_utc", "apiKey": api_key}
     try:
         async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(url, headers=_YF_HEADERS)
+            r = await client.get("https://api.polygon.io/v2/reference/news", params=params)
             r.raise_for_status()
-        import xml.etree.ElementTree as ET
-        root  = ET.fromstring(r.text)
-        items = []
-        for item in root.findall(".//item")[:8]:
-            items.append({
-                "title":   (item.findtext("title")   or "").strip(),
-                "link":    (item.findtext("link")    or "#").strip(),
-                "pubDate": (item.findtext("pubDate") or "").strip(),
-                "source":  (item.findtext("source")  or "Yahoo Finance").strip(),
-            })
-        return {"items": items}
+            return r.json()
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -1319,6 +1315,7 @@ async def get_stock_data(symbol: str, force: bool = False):
         pass
 
     return result
+
 
 # ── Debug: Sector Map ──────────────────────────────────────────────────────────
 @app.get("/api/debug/sectors")
