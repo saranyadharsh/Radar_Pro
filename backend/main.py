@@ -201,6 +201,7 @@ class SSEBroadcaster:
         # TIERED-RECONNECT: per-ticker last-update timestamp (ms)
         # Used to build a "changed since client_ts" delta instead of full snapshot
         self._ticker_ts:    Dict[str, int]      = {}   # symbol -> last update ms
+        self._start_ts:     float               = time.monotonic()
 
     async def publish(self, payload: dict) -> None:
         msg_type = payload.get("type")
@@ -488,6 +489,23 @@ async def health():
 
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
+# ── Health / Cold-start detection ─────────────────────────────────────────────
+# Frontend polls this on first connect to detect if server just woke up.
+@app.get("/api/health")
+async def get_api_health():
+    uptime_s  = time.monotonic() - broadcaster._start_ts if broadcaster else 999
+    eng       = getattr(app.state, "engine", None)
+    ws_ready  = eng is not None and eng._connected.is_set() if eng else False
+    cache_size = len(eng._cache) if eng else 0
+    return {
+        "ok":           True,
+        "uptime_s":     round(uptime_s, 1),
+        "warming_up":   uptime_s < 90,
+        "ws_ready":     ws_ready,
+        "ticker_count": cache_size,
+    }
+
+
 @app.get("/api/metrics")
 async def get_metrics():
     snap_map = broadcaster.get_snapshot_map() if broadcaster else {}
@@ -589,7 +607,27 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
         q = broadcaster.subscribe(client_id)
         logger.info(f"SSE client {client_id} connected (total: {broadcaster.client_count})")
         try:
+            # LOAD-FIX: read from engine._cache directly when broadcaster._snapshot_map
+            # is empty — broadcaster.publish() is async-scheduled and may lag.
+            _eng     = getattr(app.state, "engine", None)
             snap_map = broadcaster.get_snapshot_map()
+            if not snap_map and _eng and _eng._cache:
+                with _eng._cache_lock:
+                    snap_map = {tk: dict(row) for tk, row in _eng._cache.items()}
+                logger.info(f"SSE {client_id}: engine cache directly "
+                            f"({len(snap_map)} tickers — broadcaster not yet synced)")
+            elif not snap_map:
+                for _ in range(16):
+                    await asyncio.sleep(0.5)
+                    snap_map = broadcaster.get_snapshot_map()
+                    if not snap_map and _eng and _eng._cache:
+                        with _eng._cache_lock:
+                            snap_map = {tk: dict(row) for tk, row in _eng._cache.items()}
+                    if snap_map:
+                        break
+                else:
+                    logger.warning(f"SSE {client_id}: cache empty after 8s")
+
             snap_ts  = int(time.time() * 1000)
             age_ms   = snap_ts - client_ts
 
@@ -687,10 +725,11 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
                         break
                     yield msg
                 except asyncio.TimeoutError:
-                    # HOP-2-FIX: SSE comment heartbeat every 15s.
-                    # SSE comments (": ...") keep TCP alive through Nginx/Cloudflare/proxies
-                    # without triggering client onmessage handlers — zero JS overhead.
-                    yield ": heartbeat\n\n"
+                    # KEEPALIVE-FIX: send as proper data message not SSE comment.
+                    # SSE comments (': ...') are silently ignored by EventSource —
+                    # they don't trigger onmessage so sseWorker watchdog (25s) was
+                    # firing every cycle during weekend/pre-market when no ticks flow.
+                    yield "data: {\"type\":\"keepalive\"}\n\n"
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -968,40 +1007,66 @@ async def get_market_monitor(refresh: int = Query(0)):
 
 
 
-# ── AI Proxy ─────────────────────────────────────────────────────────────────
-# Routes Claude API calls from the frontend through the backend so the
-# Anthropic API key is never exposed in the browser network tab.
-# Requires env var: ANTHROPIC_API_KEY on the Render backend service.
+# ── AI Proxy — Amazon Bedrock ─────────────────────────────────────────────────
+# Routes Claude API calls through Amazon Bedrock.
+# Frontend payload is identical to Anthropic API — no frontend changes needed.
+# Requires env vars: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+# Uses $200 AWS credits — no separate Anthropic billing account needed.
 @app.post("/api/ai/chat")
 async def ai_chat_proxy(payload: dict):
     """
-    Proxies Claude API requests from AgenticPanel / AIEngine.js.
-    The frontend sends the full messages/system/model payload here.
-    This endpoint injects the real Anthropic API key server-side.
+    Proxies Claude API requests from AgenticPanel / AIEngine.js via Bedrock.
+    The frontend sends the standard Anthropic messages payload — this endpoint
+    translates it to the Bedrock API format transparently.
     Rate-limiting note: each full analysis fires ~3 requests (brief + tech + verdict).
     AI toggle is OFF by default — user must explicitly enable in Dashboard Settings.
     """
-    import httpx
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise HTTPException(status_code=503, detail="AI not configured on this server.")
+    import boto3, json as _json
+    from botocore.exceptions import ClientError, NoCredentialsError
+
+    aws_key    = os.getenv("AWS_ACCESS_KEY_ID", "")
+    aws_secret = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    aws_region = os.getenv("AWS_REGION", "us-east-1")
+
+    if not aws_key or not aws_secret:
+        raise HTTPException(status_code=503, detail="AI not configured — set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in Render env vars.")
+
+    # Bedrock model ID — Claude Sonnet 4.5
+    model_id = "us.anthropic.claude-sonnet-4-6"
+
+    # Bedrock requires anthropic_version in the body
+    bedrock_body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens":        payload.get("max_tokens", 1000),
+        "messages":          payload.get("messages", []),
+    }
+    if payload.get("system"):
+        bedrock_body["system"] = payload["system"]
+
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key":         api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type":      "application/json",
-                },
-                json=payload,
-            )
-        if not resp.is_success:
-            logger.warning(f"/api/ai/chat upstream error {resp.status_code}: {resp.text[:200]}")
-            raise HTTPException(status_code=resp.status_code, detail="Claude API error")
-        return resp.json()
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Claude API timeout")
+        client = boto3.client(
+            service_name          = "bedrock-runtime",
+            region_name           = aws_region,
+            aws_access_key_id     = aws_key,
+            aws_secret_access_key = aws_secret,
+        )
+        response = await asyncio.to_thread(
+            client.invoke_model,
+            modelId     = model_id,
+            body        = _json.dumps(bedrock_body),
+            contentType = "application/json",
+            accept      = "application/json",
+        )
+        result = _json.loads(response["body"].read())
+        return result
+
+    except NoCredentialsError:
+        raise HTTPException(status_code=503, detail="AWS credentials invalid or expired.")
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        msg  = e.response["Error"]["Message"]
+        logger.warning(f"/api/ai/chat Bedrock error {code}: {msg}")
+        raise HTTPException(status_code=502, detail=f"Bedrock error: {msg}")
     except Exception as e:
         logger.error(f"/api/ai/chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

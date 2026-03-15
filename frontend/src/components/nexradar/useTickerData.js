@@ -38,6 +38,8 @@ const AH_FIELDS         = ['ah_dollar','ah_pct','today_close','prev_close','ah_m
 export function useTickerData() {
   const [tickers,       setTickers]       = useState(new Map());
   const [wsStatus,      setWsStatus]      = useState('connecting');
+  const [staleTickers,  setStaleTickers]  = useState(new Set());
+  const staleCheckRef   = useRef(null);
   const [marketSession, setMarketSession] = useState(getMarketSession);
   const [notifications, setNotifications] = useState([]);
   const [unreadCount,   setUnreadCount]   = useState(0);
@@ -212,6 +214,11 @@ export function useTickerData() {
       }
 
       // feed_status — Polygon WS up/down (ws_engine FIX-5)
+      if (msg.type === 'feed_warning') {
+        setWsStatus(msg.ok ? 'connected' : 'feed_warning')
+        return
+      }
+
       if (msg.type === 'feed_status') {
         setWsStatus(msg.ok ? 'connected' : 'connecting')
         return
@@ -374,7 +381,10 @@ export function useTickerData() {
       source = new EventSource(`${SSE_URL}?client_ts=${lastSnapTs}`)
       sseRef.current = source
       setWsStatus('connecting')
-
+      fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(8000) })
+        .then(r => r.ok ? r.json() : null)
+        .then(h => { if (h?.warming_up) setWsStatus('warming_up') })
+        .catch(() => {})
       source.onopen = () => {
         setWsStatus('connected')
         resetWatchdog()
@@ -429,10 +439,31 @@ export function useTickerData() {
     }
     scheduleMidnight()
 
+    // TIER1-1.1: stale ticker check every 15s — market hours only.
+    // During pre-market/after-hours/weekend Polygon sends no ticks so ts
+    // never updates — every ticker would appear stale even with correct data.
+    // Only meaningful during market hours when ticks should be flowing.
+    staleCheckRef.current = setInterval(() => {
+      const session = getMarketSession()
+      if (session !== 'market') {
+        // Outside market hours — clear any stale flags, nothing is stale
+        setStaleTickers(new Set())
+        return
+      }
+      const now   = Date.now()
+      const cache = tickerCacheRef.current
+      const stale = new Set()
+      cache.forEach((row) => {
+        if (row.ts && (now - row.ts) > 45_000) stale.add(row.ticker)
+      })
+      setStaleTickers(stale)
+    }, 15_000)
+
     return () => {
       cancelled = true
       if (rafRef.current)           cancelAnimationFrame(rafRef.current)
       if (watchdogTimer)            clearTimeout(watchdogTimer)
+      if (staleCheckRef.current)    clearInterval(staleCheckRef.current)
       if (midnightTimerRef.current) clearTimeout(midnightTimerRef.current)
       if (worker)                   worker.port.close()
       if (source) { source.onopen=null; source.onmessage=null; source.onerror=null; source.close() }
@@ -440,5 +471,5 @@ export function useTickerData() {
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  return { tickers, wsStatus, marketSession, sseRef, notifications, unreadCount, clearNotifications };
+  return { tickers, wsStatus, marketSession, sseRef, notifications, unreadCount, clearNotifications, staleTickers };
 }

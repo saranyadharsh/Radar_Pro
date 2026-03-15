@@ -9,7 +9,7 @@ import { fmt2, pct, fmtVol, normalizeSector } from "./utils.js";
 import { SectionHeader, SectorPills, TVChart, MatrixCell } from "./primitives.jsx";
 
 // ─── Memoized table row — skips re-render when visible data unchanged ─────────
-const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatchlist, subMode, gridCols, scalpSignals, setSelectedSymbol, haltedTickers, noiBySym, T }) {
+const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatchlist, subMode, gridCols, scalpSignals, setSelectedSymbol, haltedTickers, noiBySym, isStale = false, T }) {
   // MH: use day-over-day change_value / percent_change
   // AH: use ah_dollar / ah_pct (live_price vs today_close)
   const ahDollar    = ticker.ah_dollar    ?? (ticker.today_close > 0 ? ticker.live_price - ticker.today_close : ticker.change_value) ?? 0;
@@ -21,7 +21,7 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
   const isHalted    = haltedTickers?.has(ticker.ticker) ?? ticker.is_halted ?? false;
   const noi         = noiBySym?.[ticker.ticker] ?? null;
   return (
-    <div className={`tr-hover${isHalted ? ' halt-row' : ''}`} style={{ display:"grid", gridTemplateColumns:gridCols, borderBottom:`1px solid ${T.border}` }}>
+    <div className={`tr-hover${isHalted ? ' halt-row' : ''}`} style={{ display:"grid", gridTemplateColumns:gridCols, borderBottom:`1px solid ${T.border}`, opacity: isStale ? 0.45 : 1, transition:'opacity 0.3s' }}>
       {subMode === "MH" ? (
         <>
           <div style={{ padding:"10px 14px", display:"flex", alignItems:"flex-start", gap:10 }}>
@@ -119,7 +119,7 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
   (prev.noiBySym?.[prev.ticker.ticker]?.imbalance_side) === (next.noiBySym?.[next.ticker.ticker]?.imbalance_side)
 ));
 
-export default function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", wsWatchlistRef = null, quickFilter = null, onClearQuickFilter = null, wsStatus = 'connected', onLiveCount = null, watchlistProp = null, toggleWatchlistProp = null, isActive = true, T }) {
+export default function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", wsWatchlistRef = null, quickFilter = null, onClearQuickFilter = null, wsStatus = 'connected', onLiveCount = null, watchlistProp = null, toggleWatchlistProp = null, isActive = true, staleTickers = new Set(), T }) {
   const [viewMode,     setViewMode]     = useState("TABLE");
   const [source,       setSource]       = useState("ALL");
   const [minDelta,     setMinDelta]     = useState(0);
@@ -436,7 +436,7 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
               {tickers.size===0&&wsStatus==='disconnected'&&<div style={{ padding:40, textAlign:"center", color:T.red, fontSize:13, fontFamily:T.font }}>❌ WebSocket disconnected — reconnecting</div>}
               {paginatedTickers.length===0&&tickers.size>0&&<div style={{ padding:40, textAlign:"center", color:T.text2, fontSize:13, fontFamily:T.font }}>No tickers match the current filter</div>}
               {paginatedTickers.map((ticker,i) => (
-                <LiveTableRow key={ticker.ticker||i} ticker={ticker} isWatched={watchlist.has(ticker.ticker)} toggleWatchlist={toggleWatchlist} subMode={subMode} gridCols={gridCols} scalpSignals={scalpSignals} setSelectedSymbol={setSelectedSymbol} haltedTickers={haltedTickers} noiBySym={noiBySym} T={T}/>
+                <LiveTableRow key={ticker.ticker||i} ticker={ticker} isWatched={watchlist.has(ticker.ticker)} toggleWatchlist={toggleWatchlist} subMode={subMode} gridCols={gridCols} scalpSignals={scalpSignals} setSelectedSymbol={setSelectedSymbol} haltedTickers={haltedTickers} noiBySym={noiBySym} T={T} isStale={staleTickers.has(ticker.ticker)} />
               ))}
               {paginatedTickers.length>=10&&<div style={{ position:"sticky", bottom:0, left:0, right:0, height:40, background:`linear-gradient(to bottom,transparent,${T.bg1})`, pointerEvents:"none" }}/>}
             </div>

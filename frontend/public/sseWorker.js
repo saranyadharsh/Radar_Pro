@@ -33,7 +33,7 @@
  *   { type: "halt_alert",          ... }
  *   { type: "noi_update",          ... }
  *   { type: "reconnected" }                        — client_ts handshake ack
- *   { type: "keepalive" }                          — SSE comment, ignored by pages
+ *   { type: "keepalive" }                          — heartbeat data message, resets watchdog
  *
  * Message protocol (page → worker):
  *   "get_snapshot"   — page just mounted, wants current cache immediately
@@ -234,7 +234,8 @@ function connect() {
       // Fall through to broadcast — pages need to clear "reconnecting" banner
     }
     else if (msg.type === 'keepalive') {
-      // SSE comment heartbeat — watchdog already reset above, nothing to fan out
+      // KEEPALIVE-FIX: now a real data message (was SSE comment).
+      // resetWatchdog() already called above — don't fan out to tabs.
       return
     }
 

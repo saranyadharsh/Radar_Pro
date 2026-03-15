@@ -36,3 +36,6 @@ httpx>=0.28.0
 
 # requirements.txt
 websocket-client>=1.6.0
+
+# Amazon Bedrock — Claude AI via AWS credits
+boto3>=1.35.0

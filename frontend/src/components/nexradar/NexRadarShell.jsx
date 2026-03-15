@@ -67,7 +67,7 @@ function NexRadarDashboard({
   }, [sectorProp]);
 
   // ── Data hooks ───────────────────────────────────────────────────────────────
-  const { tickers, wsStatus, marketSession, sseRef, notifications, unreadCount, clearNotifications }
+  const { tickers, wsStatus, marketSession, sseRef, notifications, unreadCount, clearNotifications, staleTickers }
     = useTickerData();
   const { techData, techLoading, techError, techLastFetch, techCached, techDataAge, fetchTechData }
     = useTechData();
@@ -176,7 +176,7 @@ function NexRadarDashboard({
   const renderPage = () => {
     switch (page) {
       case 'dashboard': return <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange} onNavigate={setPage} sectorPerformance={sectorPerformance} tickers={tickers} techData={techData} techLoading={techLoading} T={T} />;
-      case 'live':      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={()=>setQuickFilter(null)} wsStatus={wsStatus} onLiveCount={handleLiveCount} watchlistProp={watchlist} toggleWatchlistProp={toggleWatchlist} isActive={page === 'live'} T={T} />;
+      case 'live':      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={()=>setQuickFilter(null)} wsStatus={wsStatus} onLiveCount={handleLiveCount} watchlistProp={watchlist} toggleWatchlistProp={toggleWatchlist} isActive={page === 'live'} staleTickers={staleTickers} T={T} />;
       case 'chart':     return <PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />;
       case 'scanner':   return <PageScanner T={T} onNavigateToChart={(sym) => { setChartInitSymbol(sym); setPage('chart'); }} />;
       case 'signals':   return <PageSignals tickers={tickers} selectedSectors={selectedSectors} watchlist={watchlist} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} sseRef={sseRef} T={T} />;
@@ -505,9 +505,33 @@ function NexRadarDashboard({
             onClose={()=>setShowAppearance(false)}/>
         )}
 
+        {/* TIER1 Status banners */}
+        {wsStatus === 'warming_up' && (
+          <div style={{ background:'#2a1f00', borderBottom:'1px solid #f59e0b40', padding:'8px 20px', display:'flex', alignItems:'center', gap:10, flexShrink:0 }}>
+            <span style={{ fontSize:14 }}>⏳</span>
+            <span style={{ color:'#f59e0b', fontSize:11, fontWeight:700, fontFamily:T.font, letterSpacing:0.5 }}>SERVER WAKING UP</span>
+            <span style={{ color:'#a07830', fontSize:11, fontFamily:T.font }}>Render free tier — ready in ~30s.</span>
+          </div>
+        )}
+        {wsStatus === 'connecting' && (
+          <div style={{ background:'#1a1200', borderBottom:'1px solid #f59e0b30', padding:'6px 20px', display:'flex', alignItems:'center', gap:10, flexShrink:0 }}>
+            <span style={{ fontSize:11 }}>🔄</span>
+            <span style={{ color:'#f59e0b', fontSize:11, fontWeight:700, fontFamily:T.font, letterSpacing:0.5 }}>RECONNECTING</span>
+            <span style={{ color:'#806820', fontSize:11, fontFamily:T.font }}>SSE stream interrupted — restoring live prices…</span>
+          </div>
+        )}
+        {wsStatus === 'feed_warning' && (
+          <div style={{ background:'#1f0a0a', borderBottom:'1px solid #ff3d5a40', padding:'6px 20px', display:'flex', alignItems:'center', gap:10, flexShrink:0 }}>
+            <span style={{ fontSize:11 }}>⚠</span>
+            <span style={{ color:'#ff3d5a', fontSize:11, fontWeight:700, fontFamily:T.font, letterSpacing:0.5 }}>FEED WARNING</span>
+            <span style={{ color:'#803030', fontSize:11, fontFamily:T.font }}>Polygon data feed silent — prices may be stale.</span>
+          </div>
+        )}
         {/* Page content */}
         <div key={page} style={{ flex:1, overflowY:'auto', padding:18 }}>
-          {renderPage()}
+          <NexRadarErrorBoundary key={page}>
+            {renderPage()}
+          </NexRadarErrorBoundary>
         </div>
       </div>
     </div>

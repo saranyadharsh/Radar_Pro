@@ -158,6 +158,7 @@ class WSEngine:
         self._tick_queue: deque = deque(maxlen=2000)
         self._dirty_tickers: set = set()
         self._last_tick_processed_ts: float = 0.0
+        self._feed_warned: bool = False  # TIER1-1.2
 
         # _watchlist_tickers: subset of all tickers — signal + AH scope
         self._watchlist_tickers: List[str] = []
@@ -303,11 +304,18 @@ class WSEngine:
             except Exception as e:
                 logger.error(f"WS run_forever exception: {e}")
             if not self._shutdown.is_set():
-                logger.info("WS disconnected  -  reconnecting in 5s …")
                 self._connected.clear()
-                time.sleep(5)
+                if not hasattr(self, "_ws_retry_count"):
+                    self._ws_retry_count = 0
+                wait_s = min(5 * (2 ** self._ws_retry_count), 60)
+                self._ws_retry_count += 1
+                logger.info(f"WS disconnected — reconnecting in {wait_s}s "
+                            f"(attempt {self._ws_retry_count}) …")
+                self._broadcast({"type": "feed_status", "ok": False})
+                time.sleep(wait_s)
 
     def _on_open(self, ws) -> None:
+        self._ws_retry_count = 0
         logger.info("Polygon WS connected")
 
     def _on_close(self, ws, code, msg) -> None:
@@ -315,6 +323,10 @@ class WSEngine:
         logger.info(f"Polygon WS closed ({code}: {msg})")
 
     def _on_error(self, ws, error) -> None:
+        err_str = str(error)
+        if "NoneType" in err_str and "sock" in err_str:
+            logger.debug("Polygon WS socket cleanup (expected on disconnect)")
+            return
         logger.warning(f"Polygon WS error: {error}")
 
     def _on_message(self, ws, raw: str) -> None:
@@ -342,6 +354,7 @@ class WSEngine:
                 # process symbols in our watchlist.
                 ws.send(orjson.dumps({"action": "subscribe", "params": "T.*,A.*"}).decode())
                 self._connected.set()
+                self._broadcast({"type": "feed_status", "ok": True})
                 logger.info(f"Subscribed T.*/A.* ({len(self._tickers)} tickers in watchlist)")
                 return
             if ev in ("T", "A"):
@@ -437,6 +450,15 @@ class WSEngine:
             self._dirty_tickers.add(ticker)
             self._last_tick_processed_ts = time.monotonic()
 
+            # TIER1-1.6: Cache size guard
+            if len(self._cache) > 10_000:
+                known  = set(self._tickers) | {ticker}
+                evict  = [k for k in list(self._cache) if k not in known]
+                for k in evict:
+                    self._cache.pop(k, None)
+                    self._dirty_tickers.discard(k)
+                logger.info(f"Cache eviction: removed {len(evict)} unknown tickers")
+
         # Feed to signal watcher
         if self._signal_watcher:
             self._signal_watcher.on_tick(ticker, price, msg.get("t"))
@@ -530,6 +552,18 @@ class WSEngine:
                 self._broadcast({"type": "snapshot_delta", "data": delta_rows,
                                  "ts": int(time.time() * 1000)})
 
+            # TIER1-1.2: Feed health check
+            _silence_s = time.monotonic() - self._last_tick_processed_ts
+            if _get_session() == "market" and self._last_tick_processed_ts > 0:
+                if _silence_s > 60 and not self._feed_warned:
+                    self._feed_warned = True
+                    self._broadcast({"type": "feed_warning", "ok": False,
+                                     "msg": f"No ticks for {int(_silence_s)}s — Polygon feed may be down"})
+                    logger.warning(f"FEED WARNING: no ticks for {int(_silence_s)}s")
+                elif _silence_s < 30 and self._feed_warned:
+                    self._feed_warned = False
+                    self._broadcast({"type": "feed_warning", "ok": True, "msg": "Feed restored"})
+
     # ── Historical / snapshot fetch from Polygon REST ─────────────────────────
 
     # DEPLOY-FIX: rows older than this are considered stale and need Polygon refresh.
@@ -619,6 +653,14 @@ class WSEngine:
                 self._broadcast({"type": "snapshot", "data": data,
                                  "ts": int(time.time() * 1000)})
             return
+
+        # LOAD-FIX: broadcast Supabase data immediately before Polygon refresh
+        with self._cache_lock:
+            early_data = [v for v in self._cache.values() if v.get("price", 0) > 0]
+        if early_data:
+            self._broadcast({"type": "snapshot", "data": early_data,
+                             "ts": int(time.time() * 1000)})
+            logger.info(f"LOAD-FIX: Early snapshot — {len(early_data)} tickers from Supabase")
 
         logger.info(f"DEPLOY-FIX: Refreshing {len(stale)} stale/missing tickers from Polygon …")
         try:
@@ -776,6 +818,20 @@ class WSEngine:
             f"Polygon snapshot loaded: {len(self._cache)} tickers "
             f"({len(failed)} yfinance fallbacks)"
         )
+
+        # BROADCAST-FIX: broadcast full snapshot now that Polygon data is loaded.
+        # _fetch_polygon_snapshot_bulk fills self._cache but never broadcasts —
+        # so broadcaster._snapshot_map stays empty and every SSE client hits the
+        # engine cache fallback indefinitely.
+        # This single broadcast populates _snapshot_map so all future SSE connects
+        # get served from broadcaster directly (no more fallback log messages).
+        with self._cache_lock:
+            final_data = [v for v in self._cache.values() if v.get("price", 0) > 0]
+        if final_data:
+            self._broadcast({"type": "snapshot", "data": final_data,
+                             "ts": int(time.time() * 1000)})
+            logger.info(f"BROADCAST-FIX: Full snapshot broadcast after Polygon load "
+                        f"— {len(final_data)} tickers. broadcaster._snapshot_map now populated.")
 
     def _fetch_yfinance_fallback(self, tickers: List[str], session_now: str) -> None:
         """
