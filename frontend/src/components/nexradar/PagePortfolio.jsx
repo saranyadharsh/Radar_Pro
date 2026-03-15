@@ -8,6 +8,7 @@ import { useState, useEffect, useMemo, useRef } from 'react';
 import { SectionHeader, Chip, Shimmer, EmptyState, EmptyChart } from './primitives.jsx';
 import { fmt2, fmtK } from './utils.js';
 import { API_BASE } from '../../config.js';
+import { isSharedWorker } from './sseConnection.js';
 
 // ── DonutChart ────────────────────────────────────────────────────────────────
 function DonutChart({ data, T, size=130, thick=18 }) {
@@ -118,7 +119,7 @@ export default function PagePortfolio({ tickers=new Map(), marketSession='market
     };
 
     let cleanup = () => {};
-    if (sse instanceof SharedWorker) {
+    if (isSharedWorker(sse)) {
       const prevHandler = sse.port.onmessage;
       sse.port.onmessage = (e) => { if (prevHandler) prevHandler(e); handlePayload(e.data); };
       cleanup = () => { if (sse.port) sse.port.onmessage = prevHandler; };
