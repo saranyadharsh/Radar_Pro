@@ -59,7 +59,7 @@ POLYGON_WS_URL   = "wss://socket.polygon.io/stocks"
 POLYGON_REST_URL = "https://api.polygon.io/v2"
 SNAPSHOT_INTERVAL_S  = 15     # check for dirty tickers every 15s
 PORTFOLIO_REFRESH_S  = 60   # PORTFIX-1: safety-net poll only; instant updates via /api/portfolio/sync
-AH_CLOSE_REFRESH_S   = 60   # 1 min  -  refresh AH closes during extended hours
+AH_CLOSE_REFRESH_S   = 300  # 5 min — OOM-FIX: was 60s, now watchlist-only so less urgent
 DB_WRITE_INTERVAL_S  = 300
 HIST_FETCH_WORKERS   = 8
 TICK_BATCH_SIZE      = 100    # ticks buffered before a flush
@@ -704,8 +704,9 @@ class WSEngine:
 
         target_tickers = tickers_override if tickers_override is not None else self._tickers
         session_now = _get_session()
-        batch_size  = 250
+        batch_size  = 100  # OOM-FIX: reduced from 250 — limits per-batch JSON to ~150KB
         failed: List[str] = []
+        import gc
 
         for i in range(0, len(target_tickers), batch_size):
             batch   = target_tickers[i:i + batch_size]
@@ -946,11 +947,32 @@ class WSEngine:
                     logger.warning(f"AH close refresh error: {e}")
 
     def _refresh_ah_closes(self) -> None:
-        """Update today_close for cached tickers using Polygon prev_day data."""
-        batch_size = 250
-        tickers = list(self._cache.keys())
-        for i in range(0, len(tickers), batch_size):
-            batch  = tickers[i:i + batch_size]
+        """
+        OOM-FIX: was refreshing ALL 5544 cached tickers every 60s (22 batches).
+        Now only refreshes:
+          1. Watchlist tickers (_watchlist_tickers — 30 tickers, 1 batch)
+          2. Tickers that actually ticked in the last hour (_dirty_tickers)
+        This reduces from 22 batches × 375KB = 8MB peak → 1-2 batches = 100KB peak.
+        Batch size reduced 250→100, sleep 0.5s between batches for GC to reclaim.
+        """
+        import gc
+        # Only refresh tickers the user actually cares about:
+        # watchlist + recently-active tickers (had a tick in last snapshot cycle)
+        with self._cache_lock:
+            active = set(self._watchlist_tickers)
+            # Also include tickers that were dirty in the last snapshot window
+            active |= self._dirty_tickers
+            # Cap at 500 to prevent runaway on large watchlists
+            target = list(active)[:500]
+
+        if not target:
+            return
+
+        batch_size = 100  # reduced from 250 to limit per-batch memory
+        for i in range(0, len(target), batch_size):
+            if self._shutdown.is_set():
+                return
+            batch  = target[i:i + batch_size]
             params = {"tickers": ",".join(batch), "apiKey": self._api_key}
             try:
                 resp = requests.get(
@@ -965,8 +987,11 @@ class WSEngine:
                         with self._cache_lock:
                             if tk in self._cache:
                                 self._cache[tk]["today_close"] = c
+                del resp  # explicit delete to help GC
             except Exception as e:
                 logger.warning(f"AH close batch {i//batch_size} failed: {e}")
+            gc.collect()           # reclaim batch JSON before next request
+            time.sleep(0.5)        # yield CPU + allow GC between batches
 
     # ── Session reset loop ─────────────────────────────────────────────────────
 
@@ -996,11 +1021,21 @@ class WSEngine:
                 return
 
             logger.info("9:30 AM ET  -  session reset: clearing AH cache prices")
-            # Re-fetch fresh snapshot from Polygon
+            # OOM-FIX: replaced _fetch_polygon_snapshot_bulk() (22 batches, 8MB peak)
+            # with an in-memory field clear. The Polygon WS feed updates live prices
+            # within seconds of market open — no REST fetch needed here.
             try:
-                self._fetch_polygon_snapshot_bulk()
+                import gc
+                with self._cache_lock:
+                    for row in self._cache.values():
+                        row["today_close"] = 0.0   # Fix-20a: reset for market hours
+                        row["ah_dollar"]   = 0.0
+                        row["ah_pct"]      = 0.0
+                        row["ah_momentum"] = False
+                gc.collect()
+                logger.info("Session reset complete — AH fields cleared in-memory")
             except Exception as e:
-                logger.error(f"Session reset snapshot failed: {e}")
+                logger.error(f"Session reset clear failed: {e}")
 
     # ── DB write loop ──────────────────────────────────────────────────────────
 

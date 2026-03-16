@@ -515,10 +515,10 @@ async def lifespan(app: FastAPI):
     # seen_accessions dedupes so each filing fires exactly one SSE alert.
     async def _edgar_watchlist_loop():
         POLL_INTERVAL_S = 600
-        LOOKBACK_DAYS   = 1          # yesterday → catches overnight pre-market filings
+        LOOKBACK_DAYS   = 1
         FORMS           = ["8-K", "SC 13D", "SC 13G", "S-4", "DEFR14A", "10-Q", "10-K"]
         seen_accessions : set  = set()
-        seen_ts         : dict = {}  # accession → date string for daily pruning
+        seen_ts         : dict = {}
 
         await asyncio.sleep(45)
 
@@ -530,23 +530,30 @@ async def lifespan(app: FastAPI):
                 startdt   = (date.today() - timedelta(days=LOOKBACK_DAYS)).isoformat()
                 wl_rows   = await asyncio.to_thread(db.get_signal_watchlist)
                 watchlist = [r["ticker"] for r in wl_rows if r.get("ticker")]
+                if not watchlist:
+                    await asyncio.sleep(POLL_INTERVAL_S)
+                    continue
 
-                for sym in watchlist:
-                    for form in FORMS:
-                        raw_hits = await _edgar_fetch_form(sym, form, startdt)
-                        for hit in raw_hits:
-                            accession = hit.get("_id", "")
-                            if not accession or accession in seen_accessions:
-                                continue
-                            items_str  = _edgar_items_str(hit.get("_source", {}).get("items"))
-                            item_codes = {i.strip() for i in items_str.split(",")} if items_str else set()
-                            if form == "8-K" and not (item_codes & _EDGAR_MATERIAL_8K):
-                                continue
-                            seen_accessions.add(accession)
-                            seen_ts[accession] = date.today().isoformat()
-                            await broadcaster.publish(_edgar_build_alert(sym, form, hit))
-                            logger.info(f"EDGAR alert: {sym} {form} items={items_str or '—'}")
-                    await asyncio.sleep(0.3)
+                # BATCH-FIX: 7 bulk calls (one per form) instead of 30×7=210
+                # per-ticker calls. 1,260 req/hr → 42 req/hr (97% reduction).
+                for form in FORMS:
+                    raw_hits = await _edgar_fetch_form_bulk(watchlist, form, startdt)
+                    for hit in raw_hits:
+                        accession = hit.get("_id", "")
+                        if not accession or accession in seen_accessions:
+                            continue
+                        items_str  = _edgar_items_str(hit.get("_source", {}).get("items"))
+                        item_codes = {i.strip() for i in items_str.split(",")} if items_str else set()
+                        if form == "8-K" and not (item_codes & _EDGAR_MATERIAL_8K):
+                            continue
+                        sym = hit.get("_matched_ticker", "")
+                        if not sym:
+                            continue
+                        seen_accessions.add(accession)
+                        seen_ts[accession] = date.today().isoformat()
+                        alert = _edgar_build_alert(sym, form, hit)
+                        await broadcaster.publish(alert)
+                        logger.info(f"EDGAR alert: {sym} {form} items={items_str or '—'}")
 
                 cutoff = (date.today() - timedelta(days=2)).isoformat()
                 for a in [k for k, v in seen_ts.items() if v < cutoff]:
@@ -2008,6 +2015,47 @@ async def _edgar_fetch_form(sym: str, form: str, startdt: str) -> list:
     except Exception as e:
         logger.debug(f"EDGAR fetch {sym}/{form}: {e}")
         return []
+
+async def _edgar_fetch_form_bulk(tickers: list, form: str, startdt: str) -> list:
+    """
+    BATCH-FIX: Fetch EDGAR hits for ALL tickers in ONE query per form.
+
+    Per-ticker (old): 30 tickers × 7 forms × 6 cycles/hr = 1,260 req/hr
+    Bulk (this):      1 batch    × 7 forms × 6 cycles/hr = 42 req/hr  (97% reduction)
+
+    efts.sec.gov supports free-text OR queries:
+      q="AAPL" OR "MSFT" OR "GOOGL"&forms=8-K
+    Batched in groups of 50 to stay within URL length limits.
+    Each hit's matched ticker is recovered from entity_name substring match.
+    """
+    all_hits = []
+    ticker_set = set(tickers)
+    for i in range(0, len(tickers), 50):
+        batch = tickers[i:i + 50]
+        query = " OR ".join(f"%22{sym}%22" for sym in batch)
+        url   = (
+            f"https://efts.sec.gov/LATEST/search-index"
+            f"?q={query}&forms={form}&dateRange=custom&startdt={startdt}"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=12, headers=_EDGAR_UA) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                hits = r.json().get("hits", {}).get("hits", [])
+                for hit in hits:
+                    name = (hit.get("_source", {}).get("entity_name") or "").upper()
+                    # Match ticker symbol as substring of entity name
+                    matched = next((s for s in set(batch) if s in name), None)
+                    if matched:
+                        hit["_matched_ticker"] = matched
+                        all_hits.append(hit)
+                    elif len(batch) == 1:
+                        hit["_matched_ticker"] = batch[0]
+                        all_hits.append(hit)
+        except Exception as e:
+            logger.debug(f"EDGAR bulk fetch {form} batch {i//50}: {e}")
+        await asyncio.sleep(0.5)
+    return all_hits
 
 def _edgar_items_str(raw_items) -> str:
     """
