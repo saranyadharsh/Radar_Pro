@@ -47,6 +47,11 @@ export function useTickerData() {
   // Mutable ref store — avoids Map copy on every tick
   const tickerCacheRef      = useRef(new Map());
   const tickerCacheDirtyRef = useRef(false);
+  // BLUR-FIX: tracks client-side receive time per ticker (Date.now() at SSE arrival).
+  // Intentionally separate from row.ts (server epoch at REST fetch time) — row.ts
+  // is stale by definition on delivery so using it for blur caused the entire table
+  // to blur ~6s after every page load / snapshot fetch, even with a healthy feed.
+  const tickerReceivedTsRef = useRef(new Map());
   // TICKER-MAP: {symbol: intId} — stored for future flat-array decoding
   const tickerMapRef        = useRef({});
   const lastSessionRef      = useRef(getMarketSession());
@@ -129,6 +134,7 @@ export function useTickerData() {
           sseRef.current = null;
         }
         setTickers(new Map());
+        tickerReceivedTsRef.current = new Map(); // BLUR-FIX: reset receive timestamps on session change
         schedule();
       }, msUntil);
     };
@@ -191,6 +197,9 @@ export function useTickerData() {
         for (const row of rows) m.set(row.ticker, normalizeTicker(row))
         tickerCacheRef.current      = m
         tickerCacheDirtyRef.current = false
+        // BLUR-FIX: stamp client receive time so blur check uses fresh baseline
+        const _rt0 = Date.now()
+        m.forEach((_, tk) => tickerReceivedTsRef.current.set(tk, _rt0))
         setTickers(new Map(m))
       } catch (err) {
         console.warn('[NexRadar] Snapshot fetch failed:', err)
@@ -239,6 +248,9 @@ export function useTickerData() {
         for (const row of msg.data ?? []) m.set(row.ticker, normalizeTicker(row))
         tickerCacheRef.current      = m
         tickerCacheDirtyRef.current = false
+        // BLUR-FIX: stamp client receive time for every ticker in snapshot
+        const _rt1 = Date.now()
+        m.forEach((_, tk) => tickerReceivedTsRef.current.set(tk, _rt1))
         setTickers(new Map(m))
         setWsStatus('connected')
         return
@@ -248,8 +260,12 @@ export function useTickerData() {
       if (msg.type === 'snapshot_delta') {
         lastSnapTs = msg.ts ?? Date.now()
         const cache = tickerCacheRef.current
+        const _rt2  = Date.now()
         for (const row of msg.data ?? []) {
-          if (row?.ticker) cache.set(row.ticker, normalizeTicker(row))
+          if (row?.ticker) {
+            cache.set(row.ticker, normalizeTicker(row))
+            tickerReceivedTsRef.current.set(row.ticker, _rt2)  // BLUR-FIX
+          }
         }
         tickerCacheDirtyRef.current = true
         scheduleFlush()
@@ -279,7 +295,21 @@ export function useTickerData() {
 
       if (msg.type === 'tick_batch') {
         const cache = tickerCacheRef.current
-        for (const row of msg.data ?? []) cache.set(row.ticker, normalizeTicker(row))
+        const _rt3  = Date.now()  // BLUR-FIX: one timestamp for whole batch
+        for (const row of msg.data ?? []) {
+          // MERGE-FIX: merge slim delta (7 fields) into existing full cache entry.
+          // tick_batch only carries: ticker, price, change_cpt, percent_change,
+          // volume, rvol, ts — NOT change_value, prev_close, open_price etc.
+          // Replacing with normalizeTicker(row) wiped those fields every tick,
+          // causing change_value to show $0.00 in watchlist/portfolio while
+          // percent_change was correct (it IS in the delta).
+          const existing = cache.get(row.ticker)
+          const merged   = existing
+            ? normalizeTicker({ ...existing, ...row })
+            : normalizeTicker(row)
+          cache.set(row.ticker, merged)
+          tickerReceivedTsRef.current.set(row.ticker, _rt3)  // BLUR-FIX
+        }
         tickerCacheDirtyRef.current = true
         scheduleFlush()
         return
@@ -432,6 +462,7 @@ export function useTickerData() {
         if (cancelled) return
         tickerCacheRef.current      = new Map()
         tickerCacheDirtyRef.current = true
+        tickerReceivedTsRef.current = new Map() // BLUR-FIX: reset receive timestamps at midnight
         setTickers(new Map())
         fetchSnapshot()
         scheduleMidnight()
@@ -439,25 +470,31 @@ export function useTickerData() {
     }
     scheduleMidnight()
 
-    // TIER1-1.1: stale ticker check every 15s — market hours only.
-    // During pre-market/after-hours/weekend Polygon sends no ticks so ts
-    // never updates — every ticker would appear stale even with correct data.
-    // Only meaningful during market hours when ticks should be flowing.
+    // BLUR-FIX: stale ticker check every 3s — market hours only.
+    // Threshold = 6000ms: backend force-pushes every quiet ticker at 5000ms
+    // (secs_since_sent >= 5 gate in ws_engine._handle_tick), plus 250ms
+    // tick_batch flush + 750ms headroom = 6000ms safe blur boundary.
+    // Uses tickerReceivedTsRef (client receive time) NOT row.ts (server epoch).
+    // row.ts is set at Polygon REST fetch time — already several seconds old
+    // by the time SSE delivers it to the client, causing the entire table to
+    // blur ~6s after every page load even with a perfectly healthy feed.
+    // tickerReceivedTsRef is stamped at Date.now() on SSE arrival, so blur
+    // only fires when the client genuinely hasn't received a tick for 6s.
+    // During pre/AH/weekend Polygon sends no ticks — clear flags to avoid
+    // blurring the whole table off-hours.
     staleCheckRef.current = setInterval(() => {
       const session = getMarketSession()
       if (session !== 'market') {
-        // Outside market hours — clear any stale flags, nothing is stale
         setStaleTickers(new Set())
         return
       }
       const now   = Date.now()
-      const cache = tickerCacheRef.current
       const stale = new Set()
-      cache.forEach((row) => {
-        if (row.ts && (now - row.ts) > 45_000) stale.add(row.ticker)
+      tickerReceivedTsRef.current.forEach((receivedAt, ticker) => {
+        if ((now - receivedAt) > 6_000) stale.add(ticker)
       })
       setStaleTickers(stale)
-    }, 15_000)
+    }, 3_000)
 
     return () => {
       cancelled = true

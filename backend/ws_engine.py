@@ -163,6 +163,10 @@ class WSEngine:
         # _watchlist_tickers: subset of all tickers — signal + AH scope
         self._watchlist_tickers: List[str] = []
 
+        # WS reconnect counter — initialised here (not lazily in _ws_run) to
+        # eliminate the hasattr read/write race between _on_open and _ws_run.
+        self._ws_retry_count: int = 0
+
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def start(
@@ -245,6 +249,22 @@ class WSEngine:
         """Called from main.py _refresh_signal_watcher to keep AH scope in sync."""
         self._watchlist_tickers = list(tickers)
 
+    def force_reconnect(self) -> None:
+        """
+        GAP-1: Called by the WS watchdog in main.py when no tick is seen
+        for >90s during market hours. Closes the current WS connection so
+        _ws_run()'s while-loop reconnects with exponential backoff.
+        Safe to call from any thread — ws.close() is thread-safe.
+        """
+        logger.warning("force_reconnect: closing Polygon WS to trigger reconnect")
+        self._connected.clear()
+        ws = self._ws
+        if ws:
+            try:
+                ws.close()
+            except Exception as e:
+                logger.debug(f"force_reconnect ws.close(): {e}")
+
     # ── Broadcast helper ───────────────────────────────────────────────────────
 
     def _broadcast(self, payload: dict) -> None:
@@ -305,8 +325,7 @@ class WSEngine:
                 logger.error(f"WS run_forever exception: {e}")
             if not self._shutdown.is_set():
                 self._connected.clear()
-                if not hasattr(self, "_ws_retry_count"):
-                    self._ws_retry_count = 0
+                # _ws_retry_count is initialised in __init__ — no hasattr race
                 wait_s = min(5 * (2 ** self._ws_retry_count), 60)
                 self._ws_retry_count += 1
                 logger.info(f"WS disconnected — reconnecting in {wait_s}s "

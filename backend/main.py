@@ -118,7 +118,8 @@ except ImportError:
         return json.dumps(obj)
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
-from typing import AsyncGenerator, Dict, Set
+from typing import AsyncGenerator, Dict, Set, Deque
+from collections import deque
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -194,7 +195,7 @@ class SSEBroadcaster:
         self._snapshot_map: Dict[str, dict]     = {}
         # SEQ-FIX: sequence counter + replay buffer for gap recovery
         self._seq:          int                 = 0
-        self._replay_buf:   list                = []   # list of (seq, ts, serialized_payload)
+        self._replay_buf:   deque               = deque(maxlen=self.REPLAY_BUFFER_SIZE)
         # TICKER-MAP: int ID map distributed to clients on connect
         self._ticker_map:   Dict[str, int]      = {}   # symbol -> int id
         self._ticker_map_rev: Dict[int, str]    = {}   # int id -> symbol
@@ -215,6 +216,14 @@ class SSEBroadcaster:
                 if tk:
                     self._snapshot_map[tk] = row
                     self._ticker_ts[tk]    = _now_ms
+            # GAP-4: signal SSE connects waiting on snapshot_ready
+            try:
+                _ready_evt = getattr(app.state, "snapshot_ready", None)
+                if _ready_evt and not _ready_evt.is_set():
+                    _ready_evt.set()
+                    logger.info("snapshot_ready event set — SSE connects unblocked")
+            except Exception:
+                pass
 
         elif msg_type == "snapshot_delta":
             _now_ms = payload.get("ts") or int(time.time() * 1000)
@@ -223,6 +232,16 @@ class SSEBroadcaster:
                 if tk:
                     self._snapshot_map[tk] = row
                     self._ticker_ts[tk]    = _now_ms
+            # GAP-4b: after a WS reconnect the first broadcast is often a
+            # snapshot_delta (not a full snapshot). Unblock waiting SSE connects
+            # so they don't time out and serve $0.00 to Portfolio/Screener.
+            try:
+                _ready_evt = getattr(app.state, "snapshot_ready", None)
+                if _ready_evt and not _ready_evt.is_set() and self._snapshot_map:
+                    _ready_evt.set()
+                    logger.info("snapshot_ready set via snapshot_delta — SSE connects unblocked")
+            except Exception:
+                pass
 
         elif msg_type == "tick_batch":
             _now_ms = int(time.time() * 1000)
@@ -230,6 +249,16 @@ class SSEBroadcaster:
                 tk = row.get("ticker")
                 if tk:
                     self._ticker_ts[tk] = _now_ms
+            # GAP-4b: tick_batch may arrive before any snapshot on reconnect.
+            # Unblock SSE connects if snapshot_map already has data seeded from
+            # the engine cache fallback, otherwise they wait the full 8s timeout.
+            try:
+                _ready_evt = getattr(app.state, "snapshot_ready", None)
+                if _ready_evt and not _ready_evt.is_set() and self._snapshot_map:
+                    _ready_evt.set()
+                    logger.info("snapshot_ready set via tick_batch — SSE connects unblocked")
+            except Exception:
+                pass
 
         # SEQ-FIX: stamp sequence number on every outgoing message
         self._seq += 1
@@ -241,10 +270,8 @@ class SSEBroadcaster:
 
         msg  = "data: " + _dumps(payload) + "\n\n"  # GAP-4: orjson
 
-        # SEQ-FIX: store in replay buffer (capped at REPLAY_BUFFER_SIZE)
+        # SEQ-FIX: store in replay buffer (capped by deque maxlen=REPLAY_BUFFER_SIZE)
         self._replay_buf.append((self._seq, time.monotonic(), msg))
-        if len(self._replay_buf) > self.REPLAY_BUFFER_SIZE:
-            self._replay_buf.pop(0)
         now  = time.monotonic()
         dead = set()
 
@@ -354,11 +381,50 @@ async def lifespan(app: FastAPI):
     else:
         logger.info(f"Loaded {len(tickers)} tickers")
 
+    # SPY-FIX: guarantee SPY + QQQ are always subscribed and cached.
+    # opportunity-scanner and RS calculations read directly from engine._cache.
+    # If SPY/QQQ are not in the master tickers list (e.g. not in live_tickers DB),
+    # the cache lookup returns None → spy_pct = None → Scanner shows "—".
+    _BENCHMARK_TICKERS = ["SPY", "QQQ"]
+    for _bt in _BENCHMARK_TICKERS:
+        if _bt not in tickers:
+            tickers = list(tickers) + [_bt]
+            company_map[_bt] = _bt
+            sector_map[_bt]  = "INDEX"
+            logger.info(f"SPY-FIX: added {_bt} to tickers list for RS calculations")
+
     loop   = asyncio.get_event_loop()
     engine = WSEngine(broadcast_cb=broadcaster.publish, loop=loop)
     engine.start(tickers, company_map, sector_map)
     logger.info("WSEngine started")
     app.state.engine = engine
+
+    # GAP-1: WS watchdog — detects a stalled feed during market hours
+    # and forces a reconnect if no tick is processed for >90s.
+    async def _ws_watchdog():
+        await asyncio.sleep(120)   # allow warm-up before monitoring
+        while True:
+            await asyncio.sleep(30)
+            eng = getattr(app.state, "engine", None)
+            if not eng or eng._shutdown.is_set():
+                break
+            last_ts = getattr(eng, "_last_tick_processed_ts", 0)
+            if last_ts == 0:
+                continue
+            stale_s = time.monotonic() - last_ts
+            if stale_s > 90 and _get_market_status_simple() == "MARKET_HOURS":
+                logger.error(
+                    f"WS watchdog: no tick for {stale_s:.0f}s during market hours — forcing reconnect"
+                )
+                try:
+                    eng.force_reconnect()
+                except Exception as _e:
+                    logger.warning(f"WS watchdog force_reconnect failed: {_e}")
+
+    asyncio.create_task(_ws_watchdog())
+
+    # GAP-4: snapshot_ready event — SSE connect waits on this instead of polling
+    app.state.snapshot_ready = asyncio.Event()
 
     try:
         from backend.Scalping_Signal import SmartAlertsEngine
@@ -444,6 +510,356 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         logger.warning(f"Startup seed setup failed: {_e}")
 
+    # ── Loop 1: EDGAR watchlist poller ────────────────────────────────────────
+    # Every 10 min — all material forms across full watchlist.
+    # seen_accessions dedupes so each filing fires exactly one SSE alert.
+    async def _edgar_watchlist_loop():
+        POLL_INTERVAL_S = 600
+        LOOKBACK_DAYS   = 1          # yesterday → catches overnight pre-market filings
+        FORMS           = ["8-K", "SC 13D", "SC 13G", "S-4", "DEFR14A", "10-Q", "10-K"]
+        seen_accessions : set  = set()
+        seen_ts         : dict = {}  # accession → date string for daily pruning
+
+        await asyncio.sleep(45)
+
+        while True:
+            try:
+                eng = getattr(app.state, "engine", None)
+                if not eng or eng._shutdown.is_set():
+                    break
+                startdt   = (date.today() - timedelta(days=LOOKBACK_DAYS)).isoformat()
+                wl_rows   = await asyncio.to_thread(db.get_signal_watchlist)
+                watchlist = [r["ticker"] for r in wl_rows if r.get("ticker")]
+
+                for sym in watchlist:
+                    for form in FORMS:
+                        raw_hits = await _edgar_fetch_form(sym, form, startdt)
+                        for hit in raw_hits:
+                            accession = hit.get("_id", "")
+                            if not accession or accession in seen_accessions:
+                                continue
+                            items_str  = hit.get("_source", {}).get("items", "")
+                            item_codes = {i.strip() for i in items_str.split(",")} if items_str else set()
+                            if form == "8-K" and not (item_codes & _EDGAR_MATERIAL_8K):
+                                continue
+                            seen_accessions.add(accession)
+                            seen_ts[accession] = date.today().isoformat()
+                            await broadcaster.publish(_edgar_build_alert(sym, form, hit))
+                            logger.info(f"EDGAR alert: {sym} {form} items={items_str or '—'}")
+                    await asyncio.sleep(0.3)
+
+                cutoff = (date.today() - timedelta(days=2)).isoformat()
+                for a in [k for k, v in seen_ts.items() if v < cutoff]:
+                    seen_accessions.discard(a); seen_ts.pop(a, None)
+
+            except Exception as _e:
+                logger.warning(f"_edgar_watchlist_loop: {_e}")
+            await asyncio.sleep(POLL_INTERVAL_S)
+
+    asyncio.create_task(_edgar_watchlist_loop())
+    logger.info("EDGAR watchlist poller started (10-min, 7 form types)")
+
+    # ── Loop 2: Earnings proximity alert loop ─────────────────────────────────
+    # Every 30 min — Supabase earnings table only (EDGAR has no forward calendar).
+    # T-1 = tomorrow's earnings, T-0 = today pre-market/market open.
+    # EDGAR 8-K Item 2.02 fires separately (Loop 1) when the actual result drops.
+    async def _earnings_alert_loop():
+        POLL_INTERVAL_S = 1800
+        alerted : dict  = {}   # "{sym}_{horizon}_{date}": date_str
+
+        await asyncio.sleep(90)
+
+        while True:
+            try:
+                today    = date.today()
+                tomorrow = today + timedelta(days=1)
+                session  = _get_market_status_simple()
+                wl_rows  = await asyncio.to_thread(db.get_signal_watchlist)
+                watchlist = [r["ticker"] for r in wl_rows if r.get("ticker")]
+                earn_rows = await asyncio.to_thread(
+                    db.get_earnings_for_range, today.isoformat(), tomorrow.isoformat()
+                )
+                earn_map = {r["ticker"]: r for r in (earn_rows or [])}
+
+                for sym in watchlist:
+                    earn = earn_map.get(sym)
+                    if not earn:
+                        continue
+                    earn_date = earn.get("report_date") or earn.get("date", "")
+                    when      = earn.get("when", "")
+                    eps_est   = earn.get("eps_estimate")
+                    rev_est   = earn.get("revenue_estimate")
+                    when_str  = f"{when}-market" if when else "time TBD"
+
+                    k1 = f"{sym}_T1_{today.isoformat()}"
+                    if earn_date == tomorrow.isoformat() and k1 not in alerted:
+                        alerted[k1] = today.isoformat()
+                        await broadcaster.publish({
+                            "type": "earnings_alert", "ticker": sym, "horizon": "T-1",
+                            "title": f"{sym} earnings tomorrow",
+                            "sub": f"Reports {when_str} · EPS est. {eps_est if eps_est is not None else '—'}",
+                            "earn_date": earn_date, "when": when,
+                            "eps_est": eps_est, "rev_est": rev_est,
+                            "color": "cyan", "emoji": "📅",
+                        })
+                        logger.info(f"Earnings T-1 alert: {sym} {earn_date}")
+
+                    k0 = f"{sym}_T0_{today.isoformat()}"
+                    if (earn_date == today.isoformat()
+                            and session in ("PRE_MARKET", "MARKET_HOURS")
+                            and k0 not in alerted):
+                        alerted[k0] = today.isoformat()
+                        await broadcaster.publish({
+                            "type": "earnings_alert", "ticker": sym, "horizon": "T-0",
+                            "title": f"{sym} earnings TODAY",
+                            "sub": f"Reports {when_str} · EPS est. {eps_est if eps_est is not None else '—'}",
+                            "earn_date": earn_date, "when": when,
+                            "eps_est": eps_est, "rev_est": rev_est,
+                            "color": "gold", "emoji": "⚡",
+                        })
+                        logger.info(f"Earnings T-0 alert: {sym} {earn_date}")
+
+                yesterday = (today - timedelta(days=1)).isoformat()
+                alerted   = {k: v for k, v in alerted.items() if v > yesterday}
+
+            except Exception as _e:
+                logger.warning(f"_earnings_alert_loop: {_e}")
+            await asyncio.sleep(POLL_INTERVAL_S)
+
+    asyncio.create_task(_earnings_alert_loop())
+    logger.info("Earnings proximity alert loop started (30-min, T-1 + T-0)")
+
+    # ── Loop 3: FDA approvals poller ──────────────────────────────────────────
+    # Every 30 min — openFDA drug approvals API, filtered to watchlist companies.
+    # Matches by company name substring (case-insensitive) since FDA uses full
+    # legal names (e.g. "SANDISK LLC" matches watchlist ticker SNDK).
+    # Fires fda_alert SSE event — gold toast, links to openFDA record.
+    #
+    # Why openFDA: free, no API key, real-time approvals/accelerated approvals.
+    # Covers: NDA, ANDA, BLA approvals — material for pharma/biotech watchlist tickers.
+    async def _fda_alert_loop():
+        POLL_INTERVAL_S = 1800       # 30 minutes
+        FDA_BASE        = "https://api.fda.gov/drug/drugsfda.json"
+        seen_applnos    : set  = set()
+        seen_ts         : dict = {}
+
+        # company name keywords per ticker — built from Polygon company_map at startup
+        # Falls back to ticker symbol if no company name available
+        await asyncio.sleep(120)     # warm-up — let engine cache populate first
+
+        while True:
+            try:
+                eng = getattr(app.state, "engine", None)
+                if not eng or eng._shutdown.is_set():
+                    break
+
+                wl_rows   = await asyncio.to_thread(db.get_signal_watchlist)
+                watchlist = [r["ticker"] for r in wl_rows if r.get("ticker")]
+
+                # Build ticker → company name keyword map from engine cache
+                company_map : dict = {}
+                if eng and eng._cache:
+                    with eng._cache_lock:
+                        for tk in watchlist:
+                            row = eng._cache.get(tk, {})
+                            name = (row.get("company_name") or row.get("company") or "").strip()
+                            if name and name != tk:
+                                # Use first meaningful word (avoids "Inc", "Corp" false matches)
+                                keyword = name.split()[0].upper().rstrip(".,")
+                                if len(keyword) > 3:
+                                    company_map[tk] = keyword
+
+                if not company_map:
+                    await asyncio.sleep(POLL_INTERVAL_S)
+                    continue
+
+                # Build OR search query: "SANDISK+HIMS+MODERNA+..."
+                keywords = list(set(company_map.values()))
+                # FDA full-text search — batch up to 20 keywords per call
+                for i in range(0, len(keywords), 20):
+                    batch   = keywords[i:i+20]
+                    query   = "+".join(f'"{k}"' for k in batch)
+                    fda_url = (
+                        f"{FDA_BASE}?search=openfda.manufacturer_name:({query})"
+                        f"&sort=submissions.submission_status_date:desc&limit=20"
+                    )
+                    try:
+                        async with httpx.AsyncClient(timeout=10) as client:
+                            resp = await client.get(fda_url)
+                            if resp.status_code == 404:
+                                continue   # no results for this batch
+                            resp.raise_for_status()
+                            results = resp.json().get("results", [])
+                    except Exception:
+                        continue
+
+                    for rec in results:
+                        appl_no = rec.get("application_number", "")
+                        if not appl_no or appl_no in seen_applnos:
+                            continue
+
+                        # Find latest approval submission
+                        subs = rec.get("submissions", [])
+                        approved = [
+                            s for s in subs
+                            if s.get("submission_status", "").upper() == "AP"
+                        ]
+                        if not approved:
+                            continue
+                        latest  = sorted(approved, key=lambda s: s.get("submission_status_date",""), reverse=True)[0]
+                        appr_dt = latest.get("submission_status_date", "")
+
+                        # Only alert on approvals within last 2 days
+                        try:
+                            from datetime import datetime as _dt2
+                            age_days = (date.today() - _dt2.strptime(appr_dt[:10], "%Y-%m-%d").date()).days
+                            if age_days > 2:
+                                continue
+                        except Exception:
+                            continue
+
+                        # Match back to watchlist ticker
+                        mfr_names = [
+                            n.upper() for n in
+                            (rec.get("openfda", {}).get("manufacturer_name") or [])
+                        ]
+                        matched_ticker = None
+                        for tk, kw in company_map.items():
+                            if any(kw in mfr for mfr in mfr_names):
+                                matched_ticker = tk
+                                break
+                        if not matched_ticker:
+                            continue
+
+                        seen_applnos.add(appl_no)
+                        seen_ts[appl_no] = date.today().isoformat()
+
+                        brand  = (rec.get("openfda", {}).get("brand_name") or [""])[0]
+                        generic = (rec.get("openfda", {}).get("generic_name") or [""])[0]
+                        drug   = brand or generic or appl_no
+                        sub_type = latest.get("submission_type", "")
+                        fda_url_rec = f"https://www.accessdata.fda.gov/scripts/cder/daf/index.cfm?event=overview.process&ApplNo={appl_no.replace('NDA','').replace('ANDA','').replace('BLA','')}"
+
+                        await broadcaster.publish({
+                            "type":      "fda_alert",
+                            "ticker":    matched_ticker,
+                            "title":     f"{matched_ticker} FDA Approval — {drug}",
+                            "sub":       f"{sub_type} approved · {appr_dt[:10]}",
+                            "drug":      drug,
+                            "appl_no":   appl_no,
+                            "appr_date": appr_dt[:10],
+                            "url":       fda_url_rec,
+                            "color":     "gold",
+                            "emoji":     "💊",
+                        })
+                        logger.info(f"FDA alert: {matched_ticker} {drug} {appl_no} approved {appr_dt[:10]}")
+
+                    await asyncio.sleep(0.5)
+
+                # Prune seen set daily
+                cutoff = (date.today() - timedelta(days=3)).isoformat()
+                for a in [k for k, v in seen_ts.items() if v < cutoff]:
+                    seen_applnos.discard(a); seen_ts.pop(a, None)
+
+            except Exception as _e:
+                logger.warning(f"_fda_alert_loop: {_e}")
+            await asyncio.sleep(POLL_INTERVAL_S)
+
+    asyncio.create_task(_fda_alert_loop())
+    logger.info("FDA approvals poller started (30-min, openFDA drug approvals)")
+
+    # ── Loop 4: News watchlist poller ─────────────────────────────────────────
+    # Every 15 min — Polygon /v2/reference/news for each watchlist ticker.
+    # Dedupes by article URL. Pushes news_alert SSE event so frontend can
+    # display a notification toast with headline + sentiment + source link.
+    # Only fires for articles published within the last 2 hours to avoid
+    # flooding on startup with old news.
+    async def _news_watchlist_loop():
+        POLL_INTERVAL_S = 900        # 15 minutes
+        MAX_AGE_HOURS   = 2          # only alert on very recent articles
+        seen_urls       : set  = set()
+        seen_ts         : dict = {}
+
+        api_key = os.getenv("MASSIVE_API_KEY", "")
+        if not api_key:
+            logger.warning("NEWS poller: MASSIVE_API_KEY not set — skipping news loop")
+            return
+
+        await asyncio.sleep(150)     # warm-up after FDA loop
+
+        while True:
+            try:
+                eng = getattr(app.state, "engine", None)
+                if not eng or eng._shutdown.is_set():
+                    break
+
+                wl_rows   = await asyncio.to_thread(db.get_signal_watchlist)
+                watchlist = [r["ticker"] for r in wl_rows if r.get("ticker")]
+
+                from datetime import datetime as _dt3, timezone as _tz
+                now_utc    = _dt3.now(_tz.utc)
+                cutoff_iso = (now_utc - timedelta(hours=MAX_AGE_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                for sym in watchlist:
+                    news_url = (
+                        f"https://api.polygon.io/v2/reference/news"
+                        f"?ticker={sym}&limit=5&order=desc&sort=published_utc"
+                        f"&published_utc.gte={cutoff_iso}&apiKey={api_key}"
+                    )
+                    try:
+                        async with httpx.AsyncClient(timeout=8) as client:
+                            resp = await client.get(news_url)
+                            resp.raise_for_status()
+                            articles = resp.json().get("results", [])
+                    except Exception:
+                        await asyncio.sleep(0.2)
+                        continue
+
+                    for art in articles:
+                        art_url = art.get("article_url", "")
+                        if not art_url or art_url in seen_urls:
+                            continue
+                        seen_urls.add(art_url)
+                        seen_ts[art_url] = date.today().isoformat()
+
+                        headline  = art.get("title", "")
+                        source    = (art.get("publisher") or {}).get("name", "")
+                        published = art.get("published_utc", "")
+                        sentiment = (art.get("insights") or [{}])[0].get("sentiment", "neutral")
+                        sent_color = (
+                            "green" if sentiment == "positive"
+                            else "red" if sentiment == "negative"
+                            else "cyan"
+                        )
+                        await broadcaster.publish({
+                            "type":      "news_alert",
+                            "ticker":    sym,
+                            "title":     f"{sym} — {headline[:60]}{'…' if len(headline)>60 else ''}",
+                            "sub":       f"{source} · {sentiment}",
+                            "headline":  headline,
+                            "source":    source,
+                            "published": published,
+                            "sentiment": sentiment,
+                            "url":       art_url,
+                            "color":     sent_color,
+                            "emoji":     "📰",
+                        })
+                        logger.debug(f"News alert: {sym} '{headline[:50]}' ({source})")
+
+                    await asyncio.sleep(0.25)  # rate-limit between tickers
+
+                # Prune seen URLs daily
+                cutoff = (date.today() - timedelta(days=1)).isoformat()
+                for u in [k for k, v in seen_ts.items() if v < cutoff]:
+                    seen_urls.discard(u); seen_ts.pop(u, None)
+
+            except Exception as _e:
+                logger.warning(f"_news_watchlist_loop: {_e}")
+            await asyncio.sleep(POLL_INTERVAL_S)
+
+    asyncio.create_task(_news_watchlist_loop())
+    logger.info("News watchlist poller started (15-min, Polygon news, 2hr recency filter)")
+
     yield
 
     logger.info("Shutting down …")
@@ -495,7 +911,7 @@ async def health():
 async def get_api_health():
     uptime_s  = time.monotonic() - broadcaster._start_ts if broadcaster else 999
     eng       = getattr(app.state, "engine", None)
-    ws_ready  = eng is not None and eng._connected.is_set() if eng else False
+    ws_ready  = bool(getattr(eng, "_connected", None) and eng._connected.is_set())
     cache_size = len(eng._cache) if eng else 0
     return {
         "ok":           True,
@@ -607,26 +1023,28 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
         q = broadcaster.subscribe(client_id)
         logger.info(f"SSE client {client_id} connected (total: {broadcaster.client_count})")
         try:
-            # LOAD-FIX: read from engine._cache directly when broadcaster._snapshot_map
-            # is empty — broadcaster.publish() is async-scheduled and may lag.
-            _eng     = getattr(app.state, "engine", None)
+            # GAP-4: wait on snapshot_ready Event instead of a spin-wait loop.
+            # All concurrent SSE connects block here without holding any lock —
+            # zero serialisation contention during cold-start multi-tab connects.
+            # The event is set in lifespan once WSEngine broadcasts its first snapshot.
+            _snapshot_ready_evt = getattr(app.state, "snapshot_ready", None)
+            _eng = getattr(app.state, "engine", None)
             snap_map = broadcaster.get_snapshot_map()
-            if not snap_map and _eng and _eng._cache:
-                with _eng._cache_lock:
-                    snap_map = {tk: dict(row) for tk, row in _eng._cache.items()}
-                logger.info(f"SSE {client_id}: engine cache directly "
-                            f"({len(snap_map)} tickers — broadcaster not yet synced)")
-            elif not snap_map:
-                for _ in range(16):
-                    await asyncio.sleep(0.5)
-                    snap_map = broadcaster.get_snapshot_map()
-                    if not snap_map and _eng and _eng._cache:
-                        with _eng._cache_lock:
-                            snap_map = {tk: dict(row) for tk, row in _eng._cache.items()}
-                    if snap_map:
-                        break
-                else:
-                    logger.warning(f"SSE {client_id}: cache empty after 8s")
+            if not snap_map:
+                if _snapshot_ready_evt:
+                    try:
+                        await asyncio.wait_for(_snapshot_ready_evt.wait(), timeout=8.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"SSE {client_id}: snapshot_ready timeout after 8s")
+                # After event fires, prefer broadcaster map; fall back to engine cache
+                snap_map = broadcaster.get_snapshot_map()
+                if not snap_map and _eng and _eng._cache:
+                    with _eng._cache_lock:
+                        snap_map = {tk: dict(row) for tk, row in _eng._cache.items()}
+                    logger.info(f"SSE {client_id}: engine cache fallback "
+                                f"({len(snap_map)} tickers — broadcaster not yet synced)")
+                if not snap_map:
+                    logger.warning(f"SSE {client_id}: cache still empty after wait")
 
             snap_ts  = int(time.time() * 1000)
             age_ms   = snap_ts - client_ts
@@ -651,13 +1069,13 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
                     list(snap_map.keys()) if snap_map else []
                 )
                 if ticker_map:
-                    yield "data: " + json.dumps({
+                    yield "data: " + _dumps({
                         "type": "ticker_map",
                         "map":  ticker_map,
                         "seq":  broadcaster.get_current_seq(),
                     }) + "\n\n"
                 if snap_map:
-                    yield "data: " + json.dumps({
+                    yield "data: " + _dumps({
                         "type": "snapshot",
                         "data": list(snap_map.values()),
                         "ts":   snap_ts,
@@ -671,7 +1089,7 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
                         for s in signals:
                             if not s.get("ticker") and s.get("symbol"):
                                 s["ticker"] = s["symbol"]
-                        yield "data: " + json.dumps({
+                        yield "data: " + _dumps({
                             "type":      "signal_snapshot",
                             "data":      signals,
                             "server_ts": int(time.time() * 1000),
@@ -684,7 +1102,7 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
                     wl_rows = await asyncio.to_thread(db.get_signal_watchlist)
                     wl      = [r["ticker"] for r in wl_rows if r.get("ticker")]
                     if wl:
-                        yield "data: " + json.dumps({
+                        yield "data: " + _dumps({
                             "type":      "watchlist_snapshot",
                             "watchlist": wl,
                             "server_ts": int(time.time() * 1000),
@@ -699,7 +1117,7 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
                 # After-hours or quiet market → often 0 rows → pure ack.
                 changed = broadcaster.get_changed_since(client_ts)
                 if changed:
-                    yield "data: " + json.dumps({
+                    yield "data: " + _dumps({
                         "type":    "snapshot_delta",
                         "data":    changed,
                         "ts":      snap_ts,
@@ -766,10 +1184,106 @@ async def get_tickers(
 # ── Earnings ───────────────────────────────────────────────────────────────────
 @app.get("/api/earnings")
 async def get_earnings(start: str = Query(default=None), end: str = Query(default=None)):
+    """
+    Enriched earnings calendar for PageEarnings.jsx.
+
+    Base:        Supabase earnings table  → ticker, report_date, when, eps_estimate, rev_estimate
+    +sector:     engine._sector_map       → zero HTTP, in-memory
+    +company:    engine._company_map      → zero HTTP, in-memory
+    +live_price: engine._cache            → zero HTTP, in-memory
+    +market_cap: Polygon /v3/reference/tickers/{sym} batched concurrently
+    +surprise:   Polygon /v1/meta/symbols/{sym}/earnings last 4Q, batched concurrently
+
+    All enrichment is non-blocking — missing data shows as null/[] not an error.
+    """
     today = date.today()
     s = start or today.isoformat()
     e = end   or (today + timedelta(days=7)).isoformat()
-    return await asyncio.to_thread(db.get_earnings_for_range, s, e)
+
+    # ── Base rows from Supabase ────────────────────────────────────────────────
+    rows = await asyncio.to_thread(db.get_earnings_for_range, s, e)
+    if not rows:
+        return []
+
+    # ── In-memory enrichment (zero HTTP) ──────────────────────────────────────
+    eng         = getattr(app.state, "engine", None)
+    company_map = getattr(eng, "_company_map", {}) if eng else {}
+    sector_map  = getattr(eng, "_sector_map",  {}) if eng else {}
+    cache       = eng._cache if eng else {}
+
+    enriched = []
+    for row in rows:
+        sym  = (row.get("ticker") or "").upper()
+        live = {}
+        if eng and sym in cache:
+            with eng._cache_lock:
+                live = dict(cache.get(sym, {}))
+        enriched.append({
+            **row,
+            "ticker":         sym,
+            "company_name":   row.get("company_name") or company_map.get(sym, ""),
+            "sector":         row.get("sector")       or sector_map.get(sym, ""),
+            "live_price":     live.get("live_price")  or live.get("price"),
+            "percent_change": live.get("percent_change"),
+            "market_cap":     None,       # filled below via Polygon
+            "surprise_history": [],       # filled below via Polygon
+        })
+
+    api_key = os.getenv("MASSIVE_API_KEY", "")
+    if not api_key:
+        return enriched
+
+    tickers_in_range = [r["ticker"] for r in enriched if r.get("ticker")]
+
+    # ── Polygon surprise history: last 4 reported quarters ────────────────────
+    async def _fetch_surprise(sym: str) -> tuple:
+        url = f"https://api.polygon.io/v1/meta/symbols/{sym}/earnings?limit=4&apiKey={api_key}"
+        try:
+            async with httpx.AsyncClient(timeout=6) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                history = [
+                    {
+                        "quarter":      e.get("quarter"),
+                        "year":         e.get("year"),
+                        "eps_est":      (e.get("eps") or {}).get("estimate"),
+                        "eps_actual":   (e.get("eps") or {}).get("actual"),
+                        "surprise_pct": (e.get("eps") or {}).get("surprisePercent"),
+                    }
+                    for e in (r.json().get("results") or [])
+                    if (e.get("eps") or {}).get("actual") is not None
+                ]
+                return sym, history
+        except Exception:
+            return sym, []
+
+    # ── Polygon market cap: /v3/reference/tickers/{sym} ───────────────────────
+    async def _fetch_mktcap(sym: str) -> tuple:
+        url = f"https://api.polygon.io/v3/reference/tickers/{sym}?apiKey={api_key}"
+        try:
+            async with httpx.AsyncClient(timeout=6) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                mkt_cap = (r.json().get("results") or {}).get("market_cap")
+                return sym, mkt_cap
+        except Exception:
+            return sym, None
+
+    # Run both enrichment batches concurrently
+    surprise_res, mktcap_res = await asyncio.gather(
+        asyncio.gather(*[_fetch_surprise(sym) for sym in tickers_in_range], return_exceptions=True),
+        asyncio.gather(*[_fetch_mktcap(sym)  for sym in tickers_in_range], return_exceptions=True),
+    )
+
+    surprise_map = {r[0]: r[1] for r in surprise_res if isinstance(r, tuple)}
+    mktcap_map   = {r[0]: r[1] for r in mktcap_res   if isinstance(r, tuple)}
+
+    for row in enriched:
+        sym = row["ticker"]
+        row["surprise_history"] = surprise_map.get(sym, [])
+        row["market_cap"]       = mktcap_map.get(sym)
+
+    return enriched
 
 
 # ── Signals ────────────────────────────────────────────────────────────────────
@@ -961,7 +1475,7 @@ async def set_signal_watchlist(payload: dict):
     for ticker in symbols:
         await asyncio.to_thread(db.add_signal_watchlist, ticker)
     logger.info(f"Signal watchlist bulk-set: {len(symbols)} symbols")
-    _refresh_signal_watcher()
+    await _refresh_signal_watcher()
     return {"accepted": symbols, "count": len(symbols)}
 
 
@@ -1118,6 +1632,30 @@ async def get_opportunity_scanner():
             spy_pct = spy_e.get("percent_change") or spy_e.get("change_pct")
         if qqq_e:
             qqq_pct = qqq_e.get("percent_change") or qqq_e.get("change_pct")
+        # SPY-FIX: if still None after cache lookup (cold-start or not subscribed),
+        # fall back to Polygon REST snapshot for SPY/QQQ immediately.
+        api_key = os.getenv("MASSIVE_API_KEY", "")
+        if (spy_pct is None or qqq_pct is None) and api_key:
+            for sym, attr in [("SPY", "spy_pct"), ("QQQ", "qqq_pct")]:
+                if locals().get(attr.split("_")[0] + "_pct") is not None:
+                    continue
+                try:
+                    async with httpx.AsyncClient(timeout=5) as _c:
+                        _r = await _c.get(
+                            f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{sym}",
+                            params={"apiKey": api_key}
+                        )
+                        _t   = (_r.json().get("ticker") or {})
+                        _day = _t.get("day") or {}
+                        _prev= _t.get("prevDay") or {}
+                        _p   = float(_t.get("lastTrade", {}).get("p") or _day.get("c") or 0)
+                        _pc  = float(_prev.get("c") or 0)
+                        if _p > 0 and _pc > 0:
+                            _pct = round((_p - _pc) / _pc * 100, 3)
+                            if sym == "SPY": spy_pct = _pct
+                            else:           qqq_pct = _pct
+                except Exception as _fe:
+                    logger.debug(f"SPY-FIX REST fallback {sym}: {_fe}")
     except Exception as e:
         logger.warning(f"opportunity-scanner: SPY/QQQ cache read failed: {e}")
 
@@ -1516,25 +2054,122 @@ async def get_stock_data(symbol: str, force: bool = False):
     return result
 
 
-# ── EDGAR Proxy ────────────────────────────────────────────────────────────────
-# DataEngine.checkEdgarFilings() calls this — efts.sec.gov blocks browser CORS.
-@app.get("/api/edgar/{symbol}")
-async def edgar_proxy(symbol: str):
-    import datetime
-    sym   = symbol.upper().strip()
-    today = datetime.date.today().isoformat()
-    url   = f"https://efts.sec.gov/LATEST/search-index?q=%22{sym}%22&forms=8-K&dateRange=custom&startdt={today}"
+# ── EDGAR / News / FDA — shared constants & helpers ───────────────────────────
+#
+# Forms covered by watchlist poller + on-demand endpoint:
+#   8-K  items 1.01 1.02 1.03 2.01 2.02 5.02 7.01 8.01 — material events
+#   SC 13D / SC 13G   — activist / institutional stake buildup
+#   S-4               — merger registration
+#   DEFR14A           — shareholder M&A vote proxy
+#   10-Q / 10-K       — quarterly / annual financials
+#
+# FDA approvals: polled from openFDA drug approvals API every 30 min,
+#   filtered to watchlist tickers by company name substring match.
+#
+# News: Polygon /v2/reference/news polled every 15 min per watchlist ticker,
+#   deduped by article URL, pushed as news_alert SSE event.
+
+_EDGAR_MATERIAL_8K = {"1.01","1.02","1.03","2.01","2.02","5.02","7.01","8.01"}
+_EDGAR_ITEM_LABELS = {
+    "1.01": "Material agreement signed",
+    "1.02": "Agreement terminated",
+    "1.03": "Bankruptcy / receivership",
+    "2.01": "Asset acquisition or disposal",
+    "2.02": "Earnings results released",
+    "5.02": "CEO / CFO change",
+    "7.01": "Reg FD disclosure",
+    "8.01": "Other material event",
+}
+_EDGAR_FORM_LABELS = {
+    "SC 13D":  "Activist stake — potential M&A",
+    "SC 13G":  "Institutional stake",
+    "S-4":     "Merger registration",
+    "DEFR14A": "Shareholder M&A vote (proxy)",
+    "10-Q":    "Quarterly financials (10-Q)",
+    "10-K":    "Annual report (10-K)",
+}
+_EDGAR_UA = {"User-Agent": "NexRadar/1.0 contact@nexradar.info"}
+
+async def _edgar_fetch_form(sym: str, form: str, startdt: str) -> list:
+    """Fetch EDGAR EFTS hits for one ticker + one form. Returns list of raw hit dicts."""
+    url = (
+        f"https://efts.sec.gov/LATEST/search-index"
+        f"?q=%22{sym}%22&forms={form}&dateRange=custom&startdt={startdt}"
+    )
     try:
-        async with httpx.AsyncClient(
-            timeout=8,
-            headers={"User-Agent": "NexRadar/1.0 contact@nexradar.info"}
-        ) as client:
+        async with httpx.AsyncClient(timeout=8, headers=_EDGAR_UA) as client:
             r = await client.get(url)
             r.raise_for_status()
-            return r.json()
+            return r.json().get("hits", {}).get("hits", [])
     except Exception as e:
-        logger.debug(f"EDGAR proxy {sym}: {e}")
-        return {"hits": {"hits": [], "total": {"value": 0}}}
+        logger.debug(f"EDGAR fetch {sym}/{form}: {e}")
+        return []
+
+def _edgar_build_alert(sym: str, form: str, hit: dict) -> dict:
+    """Normalise a raw EDGAR hit into a structured edgar_alert SSE payload."""
+    src        = hit.get("_source", {})
+    items_str  = src.get("items", "")
+    item_codes = {i.strip() for i in items_str.split(",")} if items_str else set()
+    filed_at   = src.get("file_date", "")
+    entity_id  = src.get("entity_id", "")
+    accession  = hit.get("_id", "")
+    acc_clean  = accession.replace("-", "")
+    doc_url    = (
+        f"https://www.sec.gov/Archives/edgar/data/{entity_id}/{acc_clean}/{accession}-index.htm"
+        if entity_id and accession else ""
+    )
+    if form == "8-K":
+        matched = item_codes & _EDGAR_MATERIAL_8K
+        title   = "8-K Filing · Item " + ", ".join(sorted(matched)) if matched else "8-K Filing"
+        sub     = " · ".join(_EDGAR_ITEM_LABELS.get(c, c) for c in sorted(matched)) if matched else items_str
+        emoji   = "⚠️" if "5.02" in matched else "📋"
+        color   = "gold" if "5.02" in matched or "2.01" in matched else "cyan"
+    elif form in ("10-Q", "10-K"):
+        title   = _EDGAR_FORM_LABELS[form]
+        sub     = f"Period: {src.get('period_of_report', filed_at)}"
+        emoji   = "📊"
+        color   = "cyan"
+    else:
+        title   = _EDGAR_FORM_LABELS.get(form, form)
+        sub     = f"Filed {filed_at}"
+        emoji   = "🚨" if form in ("SC 13D", "S-4") else "📋"
+        color   = "gold" if form in ("SC 13D", "S-4", "DEFR14A") else "cyan"
+    return {
+        "type":      "edgar_alert",
+        "ticker":    sym,
+        "form":      form,
+        "items":     items_str,
+        "title":     title,
+        "sub":       sub,
+        "filed_at":  filed_at,
+        "url":       doc_url,
+        "accession": accession,
+        "emoji":     emoji,
+        "color":     color,
+    }
+
+
+# ── EDGAR on-demand proxy (user click + background poller) ─────────────────────
+@app.get("/api/edgar/{symbol}")
+async def edgar_proxy(symbol: str, days: int = Query(default=7, le=90)):
+    """
+    On-demand EDGAR lookup for all material forms.
+    days=7 default covers last week. Frontend passes days=30 for chart deep-history.
+    Also used by _edgar_watchlist_loop internally via _edgar_fetch_form().
+    """
+    sym     = symbol.upper().strip()
+    startdt = (date.today() - timedelta(days=days)).isoformat()
+    forms   = ["8-K", "SC 13D", "SC 13G", "S-4", "DEFR14A", "10-Q", "10-K"]
+    alerts  = []
+    for form in forms:
+        raw_hits = await _edgar_fetch_form(sym, form, startdt)
+        for hit in raw_hits:
+            items_str  = hit.get("_source", {}).get("items", "")
+            item_codes = {i.strip() for i in items_str.split(",")} if items_str else set()
+            if form == "8-K" and not (item_codes & _EDGAR_MATERIAL_8K):
+                continue
+            alerts.append(_edgar_build_alert(sym, form, hit))
+    return {"alerts": alerts, "ticker": sym, "days": days, "count": len(alerts)}
 
 
 # ── Sequence Gap Recovery ──────────────────────────────────────────────────────

@@ -88,10 +88,33 @@ function NexRadarDashboard({
   }, []);
 
   useEffect(() => {
-    const handler = (e) => setLiveAlerts(prev => [e.detail, ...prev].slice(0, 6));
+    // TOAST-FIX: only genuinely actionable events get the overlay toast.
+    // EMA crosses, score updates, routine signal_alerts → bell panel only.
+    // Price-action and fundamental events → toast overlay (max 3 at once).
+    const TOAST_TYPES = new Set([
+      // Price action
+      'gap', 'vol_spike', 'ah_momentum', 'hod_break', 'lod_break',
+      // Trading halts
+      'luld_halt', 'luld_resume',
+      // Fundamental / regulatory (from background pollers)
+      'edgar_alert', 'earnings_alert', 'fda_alert', 'news_alert',
+    ]);
+    const handler = (e) => {
+      const a = e.detail;
+      if (!a || !TOAST_TYPES.has(a.type)) return; // EMA cross etc. → bell only
+      setLiveAlerts(prev => [a, ...prev].slice(0, 3));
+    };
     window.addEventListener('nexradar_alert', handler);
     return () => window.removeEventListener('nexradar_alert', handler);
   }, []);
+  useEffect(() => {
+    // TOAST-FIX: auto-dismiss — drop oldest alert after 8s so toasts never pile up.
+    // Each new alert resets the timer so rapid events don't thrash the UI.
+    if (!liveAlerts.length) return;
+    const t = setTimeout(() => setLiveAlerts(prev => prev.slice(0, -1)), 8000);
+    return () => clearTimeout(t);
+  }, [liveAlerts]);
+
   const [headerPanel,    setHeaderPanel]    = useState(null);
 
   // ── Theme tokens ─────────────────────────────────────────────────────────────
@@ -243,8 +266,8 @@ function NexRadarDashboard({
       case 'screener':  return withLazy(<PageScreener tickers={tickers} watchlist={watchlist} toggleWatchlist={toggleWatchlist} techData={techData} scalpData={sideScalpSignals} T={T} />);
       case 'chart':     return withLazy(<PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />);
       case 'signals':   return withLazy(<PageSignals tickers={tickers} selectedSectors={selectedSectors} watchlist={watchlist} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} sseRef={sseRef} T={T} />);
-      case 'earnings':  return withLazy(<PageEarnings T={T} />);
-      case 'scanner':  return withLazy(<PageScanner T={T} onNavigateToChart={(sym) => { setChartInitSymbol(sym); setPage('chart'); }} />);
+      case 'earnings':  return withLazy(<PageEarnings T={T} tickers={tickers} watchlist={watchlist} toggleWatchlist={toggleWatchlist} />);
+      case 'scanner':   return withLazy(<PageScanner T={T} onNavigateToChart={(sym) => { setChartInitSymbol(sym); setPage('chart'); }} tickers={tickers} />);
       case 'portfolio': return withLazy(<PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlist} sseRef={sseRef} T={T} />);
       case 'watchlist': return withLazy(<PageWatchlist T={T} onNavigateToSettings={() => setHeaderPanel('settings')} watchlistSet={watchlist} toggleWatchlist={toggleWatchlist} tickers={tickers} />);
       default:          return null;
@@ -644,8 +667,10 @@ function NexRadarDashboard({
         </>
       )}
 
-      {/* Alert toasts — Feature #1 */}
-      <AlertToast alerts={liveAlerts} setAlerts={setLiveAlerts} T={T} />
+      {/* Alert toasts — Feature #1: only on pages where feed alerts are actionable */}
+      {['live', 'dashboard', 'signals'].includes(page) && (
+        <AlertToast alerts={liveAlerts} setAlerts={setLiveAlerts} T={T} />
+      )}
 
     </div>
   );

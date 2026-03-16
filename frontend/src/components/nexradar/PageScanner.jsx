@@ -16,7 +16,7 @@
  * Props: { T }
  */
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { API_BASE } from '../../config.js';
 
 const REFRESH_MS = 30_000;
@@ -533,7 +533,7 @@ function MTFRow({ row, onClickTicker, T }) {
 }
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
-export default function PageScanner({ T, onNavigateToChart }) {
+export default function PageScanner({ T, onNavigateToChart, tickers = new Map() }) {
   const [tab,       setTab]       = useState('opportunities'); // 'opportunities' | 'rs'
   const [data,      setData]      = useState([]);
   const [spyPct,    setSpyPct]    = useState(null);
@@ -608,8 +608,37 @@ export default function PageScanner({ T, onNavigateToChart }) {
     else { setRsSortKey(key); setRsSortDir('desc'); }
   };
 
+  // ── Live SSE enrichment ────────────────────────────────────────────────────
+  // SPY / QQQ: prefer live tickers Map (250ms updates) over REST poll baseline.
+  // Falls back to REST value when SSE hasn't delivered the ticker yet.
+  const liveSpy      = tickers.get('SPY');
+  const liveQqq      = tickers.get('QQQ');
+  const displaySpyPct = liveSpy?.percent_change ?? spyPct;
+  const displayQqqPct = liveQqq?.percent_change ?? qqqPct;
+
+  // Row enrichment: merge live SSE price/pct into each REST row between polls.
+  // rs_spy recomputed live = ticker% - SPY% whenever both are available.
+  // Dependency on `tickers` means this re-runs on every 250ms tick_batch,
+  // keeping price/% CHG/RS columns live without waiting for the 30s REST poll.
+  const enrichedData = useMemo(() => {
+    return data.map(row => {
+      const live = tickers.get(row.ticker);
+      if (!live) return row;
+      const livePct = live.percent_change ?? row.percent_change;
+      const liveRs  = (displaySpyPct != null && livePct != null)
+        ? parseFloat((livePct - displaySpyPct).toFixed(2))
+        : row.rs_spy;
+      return {
+        ...row,
+        price:          live.live_price    ?? row.price,
+        percent_change: livePct,
+        rs_spy:         liveRs,
+      };
+    });
+  }, [data, tickers, displaySpyPct]);
+
   // ── Filtering ──────────────────────────────────────────────────────────────
-  const filtered = data.filter(r => {
+  const filtered = enrichedData.filter(r => {
     if (filters.tier   !== 'ALL' && r.tier   !== filters.tier)   return false;
     if (filters.signal !== 'ALL' && r.signal !== filters.signal) return false;
     if (filters.rs === 'OUTPERFORM'   && !(r.rs_spy > 0))        return false;
@@ -675,7 +704,7 @@ export default function PageScanner({ T, onNavigateToChart }) {
 
       {/* Benchmark bar */}
       <BenchmarkBar
-        spyPct={spyPct} qqqPct={qqqPct}
+        spyPct={displaySpyPct} qqqPct={displayQqqPct}
         tickerCount={filtered.length}
         lastUpdate={genAt} loading={loading} T={T}
       />

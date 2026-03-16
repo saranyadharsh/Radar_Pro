@@ -1,19 +1,20 @@
 /**
  * PageEarnings.jsx — NexRadar Pro
  * Full-page earnings calendar with week navigation, day pills, per-day fallback fetch.
- * Props: { T }
+ * Props: { T, tickers, watchlist, toggleWatchlist }
  */
 import { useState, useEffect, useMemo } from 'react';
 import { SectionHeader, Chip, Shimmer, EmptyState } from './primitives.jsx';
-import { fmtK, getWeekDates } from './utils.js';
+import { fmtK, getWeekDates, fmt2 } from './utils.js';
 import { API_BASE } from '../../config.js';
 
-export default function PageEarnings({ T }) {
-  const [weekOffset,   setWeekOffset]   = useState(0);
-  const [selectedDay,  setSelectedDay]  = useState(null);
-  const [earningsData, setEarningsData] = useState([]);
-  const [loading,      setLoading]      = useState(true);
-  const [error,        setError]        = useState(null);
+export default function PageEarnings({ T, tickers = new Map(), watchlist = new Set(), toggleWatchlist = () => {} }) {
+  const [weekOffset,      setWeekOffset]      = useState(0);
+  const [selectedDay,     setSelectedDay]     = useState(null);
+  const [earningsData,    setEarningsData]    = useState([]);
+  const [loading,         setLoading]         = useState(true);
+  const [error,           setError]           = useState(null);
+  const [selectedEarning, setSelectedEarning] = useState(null);
 
   const weekDates = useMemo(() => getWeekDates(weekOffset), [weekOffset]);
 
@@ -26,19 +27,30 @@ export default function PageEarnings({ T }) {
         const endDate   = weekDates[weekDates.length - 1]?.isoDate;
 
         const normalize = (data) => {
-          const arr = Array.isArray(data)          ? data         :
-                      Array.isArray(data?.data)    ? data.data    :
+          const arr = Array.isArray(data)           ? data          :
+                      Array.isArray(data?.data)     ? data.data     :
                       Array.isArray(data?.earnings) ? data.earnings :
-                      Array.isArray(data?.results) ? data.results : [];
-          return arr.map(e => ({
-            ...e,
-            ticker:       e.ticker        || e.symbol       || '',
-            company_name: e.company_name  || e.name         || '',
-            date:         e.earnings_date || e.date         || e.report_date || '',
-            time:         e.earnings_time || e.time         || e.when        || 'TNS',
-            eps_est:      e.eps_estimate  || e.eps_est      || e.epsEstimate || null,
-            rev_est:      e.rev_estimate  || e.rev_est      || e.revenueEstimate || null,
-          }));
+                      Array.isArray(data?.results)  ? data.results  : [];
+          return arr.map(e => {
+            // Live price from SSE tickers Map (250ms updates) takes priority
+            const live = tickers.get((e.ticker || e.symbol || '').toUpperCase()) ?? {};
+            return {
+              ...e,
+              ticker:           (e.ticker        || e.symbol       || '').toUpperCase(),
+              company_name:     e.company_name   || e.name         || '',
+              date:             e.earnings_date  || e.date         || e.report_date || '',
+              time:             e.earnings_time  || e.time         || e.when        || 'TNS',
+              eps_est:          e.eps_estimate   || e.eps_est      || e.epsEstimate || null,
+              rev_est:          e.rev_estimate   || e.rev_est      || e.revenueEstimate || null,
+              // Enriched fields from backend
+              sector:           e.sector         || '',
+              market_cap:       e.market_cap     || null,
+              surprise_history: e.surprise_history || [],
+              // Live price: SSE tickers overrides REST snapshot
+              live_price:       live.live_price  || e.live_price   || null,
+              percent_change:   live.percent_change ?? e.percent_change ?? null,
+            };
+          });
         };
 
         const res  = await fetch(`${API_BASE}/api/earnings?start=${startDate}&end=${endDate}`);
@@ -83,7 +95,8 @@ export default function PageEarnings({ T }) {
     return earningsData.filter(e => e.date === activeDay);
   }, [earningsData, activeDay]);
 
-  const HEADERS = ['SYMBOL','DATE','TIME','EPS EST','REV EST','MKT CAP','SECTOR','WATCH'];
+  const HEADERS = ['SYMBOL','COMPANY','DATE','TIME','PRICE','EPS EST','REV EST','MKT CAP','SECTOR','WATCH'];
+  const gridCols = 'repeat(10,1fr)';
 
   return (
     <div className="page-enter" style={{ display:'flex', flexDirection:'column', gap:16 }}>
@@ -118,7 +131,7 @@ export default function PageEarnings({ T }) {
             }
           </SectionHeader>
           <div>
-            <div style={{ display:'grid', gridTemplateColumns:'repeat(8,1fr)', background:T.bg0, borderBottom:`1px solid ${T.border}` }}>
+            <div style={{ display:'grid', gridTemplateColumns:gridCols, background:T.bg0, borderBottom:`1px solid ${T.border}` }}>
               {HEADERS.map(h=>(
                 <div key={h} style={{ padding:'9px 12px', color:T.text1, fontSize:9, letterSpacing:1.5, fontFamily:T.font, fontWeight:800, textTransform:'uppercase' }}>{h}</div>
               ))}
@@ -128,13 +141,12 @@ export default function PageEarnings({ T }) {
                 <EmptyState icon="⚠" label="ERROR LOADING EARNINGS" sub={error} h={200} T={T}/>
               ) : loading ? (
                 Array(10).fill(0).map((_,i)=>(
-                  <div key={i} className="tr-hover" style={{ display:'grid', gridTemplateColumns:'repeat(8,1fr)', borderBottom:`1px solid #080f1a` }}>
-                    {[50,55,70,55,70,55,60,45].map((w,j)=>(
+                  <div key={i} className="tr-hover" style={{ display:'grid', gridTemplateColumns:gridCols, borderBottom:`1px solid #080f1a` }}>
+                    {[50,80,55,45,60,45,55,50,55,26].map((w,j)=>(
                       <div key={j} style={{ padding:'11px 12px' }}>
-                        {j===7
+                        {j===9
                           ? <div style={{ width:26,height:16,background:T.cyanDim,border:`1px solid ${T.cyanMid}`,borderRadius:3 }}/>
-                          : <Shimmer w={w} h={10} opacity={j===0?0.75:0.45} T={T}/>
-                        }
+                          : <Shimmer w={w} h={10} opacity={j===0?0.75:0.45} T={T}/>}
                       </div>
                     ))}
                   </div>
@@ -143,18 +155,62 @@ export default function PageEarnings({ T }) {
                 <EmptyState icon="◎" label="NO EARNINGS" sub="No earnings scheduled for this day" h={200} T={T}/>
               ) : (
                 <>
-                  {dayEarnings.map((earning,i)=>(
-                    <div key={i} className="tr-hover" style={{ display:'grid', gridTemplateColumns:'repeat(8,1fr)', borderBottom:`1px solid ${T.border}` }}>
-                      <div style={{ padding:'11px 12px', color:T.cyan, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{earning.ticker||earning.symbol}</div>
-                      <div style={{ padding:'11px 12px', color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>{earning.date||earning.earnings_date}</div>
-                      <div style={{ padding:'11px 12px', color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>{earning.time||earning.earnings_time||'—'}</div>
-                      <div style={{ padding:'11px 12px', color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>{earning.eps_est||earning.eps_estimate||'—'}</div>
-                      <div style={{ padding:'11px 12px', color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>{earning.rev_est||earning.revenue_estimate||'—'}</div>
-                      <div style={{ padding:'11px 12px', color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>{earning.market_cap?fmtK(earning.market_cap):'—'}</div>
-                      <div style={{ padding:'11px 12px', color:T.text2, fontSize:10, fontFamily:T.font, fontWeight:600 }}>{earning.sector||'—'}</div>
-                      <div style={{ padding:'11px 12px' }}><button className="btn-ghost" style={{ fontSize:8, padding:'3px 8px', fontWeight:600 }}>⭐</button></div>
-                    </div>
-                  ))}
+                  {dayEarnings.map((earning,i)=>{
+                    const isSelected = selectedEarning?.ticker === earning.ticker;
+                    const isWatched  = watchlist.has(earning.ticker);
+                    const pct        = earning.percent_change;
+                    const pctColor   = pct == null ? T.text2 : pct >= 0 ? T.green : T.red;
+                    return (
+                      <div key={i} onClick={()=>setSelectedEarning(isSelected ? null : earning)}
+                        className="tr-hover"
+                        style={{ display:'grid', gridTemplateColumns:gridCols,
+                          borderBottom:`1px solid ${T.border}`,
+                          background: isSelected ? T.cyanDim : 'transparent', cursor:'pointer' }}>
+                        <div style={{ padding:'11px 12px', color:T.cyan, fontSize:12, fontFamily:T.font, fontWeight:700 }}>
+                          {earning.ticker}
+                        </div>
+                        <div style={{ padding:'11px 12px', color:T.text2, fontSize:10, fontFamily:T.font,
+                          whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>
+                          {earning.company_name || '—'}
+                        </div>
+                        <div style={{ padding:'11px 12px', color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>
+                          {earning.date || '—'}
+                        </div>
+                        <div style={{ padding:'11px 12px', color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>
+                          {earning.time === 'pre' ? 'Pre-mkt' : earning.time === 'post' ? 'After' : earning.time || '—'}
+                        </div>
+                        <div style={{ padding:'11px 12px', fontFamily:T.font, fontSize:11 }}>
+                          {earning.live_price
+                            ? <><span style={{ color:T.text0, fontWeight:700 }}>${fmt2(earning.live_price)}</span>
+                                {pct != null && <span style={{ color:pctColor, fontSize:10, marginLeft:4 }}>
+                                  {pct>=0?'+':''}{pct.toFixed(2)}%
+                                </span>}</>
+                            : <span style={{ color:T.text2 }}>—</span>}
+                        </div>
+                        <div style={{ padding:'11px 12px', color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>
+                          {earning.eps_est != null ? `$${earning.eps_est}` : '—'}
+                        </div>
+                        <div style={{ padding:'11px 12px', color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>
+                          {earning.rev_est != null ? fmtK(earning.rev_est) : '—'}
+                        </div>
+                        <div style={{ padding:'11px 12px', color:T.text1, fontSize:11, fontFamily:T.font, fontWeight:600 }}>
+                          {earning.market_cap ? fmtK(earning.market_cap) : '—'}
+                        </div>
+                        <div style={{ padding:'11px 12px', color:T.text2, fontSize:10, fontFamily:T.font, fontWeight:600 }}>
+                          {earning.sector || '—'}
+                        </div>
+                        <div style={{ padding:'11px 12px' }}>
+                          <button onClick={e=>{ e.stopPropagation(); toggleWatchlist(earning.ticker); }}
+                            className="btn-ghost"
+                            style={{ fontSize:8, padding:'3px 8px', fontWeight:600,
+                              color: isWatched ? T.gold : T.text2,
+                              borderColor: isWatched ? T.gold : T.border }}>
+                            {isWatched ? '★' : '☆'}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
                   {dayEarnings.length>=10&&(
                     <div style={{ position:'sticky', bottom:0, left:0, right:0, height:40,
                       background:`linear-gradient(to bottom, transparent, ${T.bg1})`, pointerEvents:'none' }}/>
@@ -166,22 +222,100 @@ export default function PageEarnings({ T }) {
         </div>
 
         {/* Right panel */}
-        <div style={{ flex:1, minWidth:190, display:'flex', flexDirection:'column', gap:14 }}>
+        <div style={{ flex:1, minWidth:200, display:'flex', flexDirection:'column', gap:14 }}>
+
+          {/* Selected earnings detail */}
           <div className="card">
-            <SectionHeader title="Selected Earnings"/>
-            <EmptyState icon="◎" label="SELECT A TICKER" sub="Click any row to see earnings details, historical beats/misses, and implied move" h={140}/>
-          </div>
-          <div className="card">
-            <SectionHeader title="Gap Stats"/>
-            <div style={{ padding:14 }}>
-              {['AVG GAP UP','AVG GAP DOWN','BEAT RATE','MISS RATE'].map(s=>(
-                <div key={s} style={{ display:'flex', justifyContent:'space-between', padding:'8px 0', borderBottom:`1px solid ${T.border}` }}>
-                  <span style={{ color:T.text2, fontSize:9.5, fontFamily:T.font }}>{s}</span>
-                  <Shimmer w={44} h={10}/>
+            <SectionHeader title={selectedEarning ? selectedEarning.ticker : 'Selected Earnings'} T={T}>
+              {selectedEarning && (
+                <Chip color={T.cyan} T={T}>{selectedEarning.company_name || selectedEarning.ticker}</Chip>
+              )}
+            </SectionHeader>
+            {!selectedEarning ? (
+              <EmptyState icon="◎" label="SELECT A TICKER"
+                sub="Click any row to see earnings details, historical beats/misses, and implied move" h={140} T={T}/>
+            ) : (
+              <div style={{ padding:14, display:'flex', flexDirection:'column', gap:10 }}>
+                {/* Key stats row */}
+                <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
+                  {[
+                    { label:'REPORT DATE', value: selectedEarning.date || '—' },
+                    { label:'TIME',        value: selectedEarning.time === 'pre' ? 'Pre-market'
+                                                : selectedEarning.time === 'post' ? 'After hours' : selectedEarning.time || '—' },
+                    { label:'EPS EST',     value: selectedEarning.eps_est != null ? `$${selectedEarning.eps_est}` : '—' },
+                    { label:'REV EST',     value: selectedEarning.rev_est != null ? fmtK(selectedEarning.rev_est) : '—' },
+                  ].map(s=>(
+                    <div key={s.label} style={{ background:T.bg0, borderRadius:4, padding:'8px 10px' }}>
+                      <div style={{ color:T.text2, fontSize:8, letterSpacing:1.5, fontFamily:T.font, marginBottom:3 }}>{s.label}</div>
+                      <div style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{s.value}</div>
+                    </div>
+                  ))}
                 </div>
-              ))}
+
+                {/* Surprise history */}
+                {selectedEarning.surprise_history?.length > 0 ? (
+                  <div>
+                    <div style={{ color:T.text2, fontSize:9, letterSpacing:1.5, fontFamily:T.font, marginBottom:6 }}>
+                      LAST {selectedEarning.surprise_history.length}Q SURPRISE HISTORY
+                    </div>
+                    {selectedEarning.surprise_history.map((q,i)=>{
+                      const beat = q.surprise_pct != null && q.surprise_pct >= 0;
+                      const miss = q.surprise_pct != null && q.surprise_pct < 0;
+                      return (
+                        <div key={i} style={{ display:'flex', justifyContent:'space-between', alignItems:'center',
+                          padding:'7px 0', borderBottom:`1px solid ${T.border}` }}>
+                          <span style={{ color:T.text2, fontSize:10, fontFamily:T.font }}>
+                            Q{q.quarter} {q.year}
+                          </span>
+                          <span style={{ color:T.text1, fontSize:10, fontFamily:T.font }}>
+                            Est: {q.eps_est != null ? `$${q.eps_est}` : '—'}
+                          </span>
+                          <span style={{ color:T.text0, fontSize:10, fontFamily:T.font, fontWeight:700 }}>
+                            Act: {q.eps_actual != null ? `$${q.eps_actual}` : '—'}
+                          </span>
+                          <span style={{ fontSize:10, fontFamily:T.font, fontWeight:700,
+                            color: beat ? T.green : miss ? T.red : T.text2 }}>
+                            {q.surprise_pct != null
+                              ? `${q.surprise_pct >= 0 ? '+' : ''}${q.surprise_pct.toFixed(1)}%`
+                              : '—'}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div style={{ color:T.text2, fontSize:10, fontFamily:T.font, textAlign:'center', padding:'12px 0' }}>
+                    No surprise history available
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Gap stats — computed from current day earnings */}
+          <div className="card">
+            <SectionHeader title="Day Summary" T={T}/>
+            <div style={{ padding:14 }}>
+              {(() => {
+                const withSurprise = dayEarnings.filter(e => e.surprise_history?.length > 0);
+                const beats  = withSurprise.filter(e => (e.surprise_history[0]?.surprise_pct ?? -1) >= 0).length;
+                const misses = withSurprise.length - beats;
+                const beatRate = withSurprise.length > 0 ? Math.round(beats/withSurprise.length*100) : null;
+                return [
+                  { label:'EARNINGS TODAY',  value: dayEarnings.length || '—' },
+                  { label:'BEAT RATE',        value: beatRate != null ? `${beatRate}%` : '—' },
+                  { label:'BEATS',            value: withSurprise.length > 0 ? beats : '—', color: T.green },
+                  { label:'MISSES',           value: withSurprise.length > 0 ? misses : '—', color: T.red },
+                ].map(s=>(
+                  <div key={s.label} style={{ display:'flex', justifyContent:'space-between', padding:'8px 0', borderBottom:`1px solid ${T.border}` }}>
+                    <span style={{ color:T.text2, fontSize:9.5, fontFamily:T.font }}>{s.label}</span>
+                    <span style={{ color: s.color || T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{s.value}</span>
+                  </div>
+                ));
+              })()}
             </div>
           </div>
+
         </div>
       </div>
     </div>

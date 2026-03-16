@@ -21,7 +21,7 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
   const isHalted    = haltedTickers?.has(ticker.ticker) ?? ticker.is_halted ?? false;
   const noi         = noiBySym?.[ticker.ticker] ?? null;
   return (
-    <div className={`tr-hover${isHalted ? ' halt-row' : ''}`} style={{ display:"grid", gridTemplateColumns:gridCols, borderBottom:`1px solid ${T.border}`, opacity: isStale ? 0.45 : 1, transition:'opacity 0.3s' }}>
+    <div className={`tr-hover${isHalted ? ' halt-row' : ''}`} style={{ display:"grid", gridTemplateColumns:gridCols, borderBottom:`1px solid ${T.border}` }}>
       {subMode === "MH" ? (
         <>
           <div style={{ padding:"10px 14px", display:"flex", alignItems:"flex-start", gap:10 }}>
@@ -41,9 +41,9 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
             </div>
           </div>
           <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.open||0)}</div>
-          <div style={{ padding:"10px 14px", color:T.text0, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price||0)}</div>
-          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{isPositive?"+":" "}{fmt2(displayChg)}</div>
-          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{pct(displayPct)}</div>
+          <div style={{ padding:"10px 14px", color:T.text0, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{fmt2(ticker.live_price||0)}</div>
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{isPositive?"+":" "}{fmt2(displayChg)}</div>
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{pct(displayPct)}</div>
           <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmtVol(ticker.volume||0)}</div>
           <div style={{ padding:"10px 14px", display:"flex", alignItems:"center", gap:5 }}>
             {(() => {
@@ -97,9 +97,9 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
           </div>
           <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{ticker.prev_close>0?`$${fmt2(ticker.prev_close)}`:"—"}</div>
           <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{ticker.today_close>0?`$${fmt2(ticker.today_close)}`:"—"}</div>
-          <div style={{ padding:"10px 14px", color:T.cyan, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price||0)}</div>
-          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{isPositive?"+":" "}{fmt2(displayChg)}</div>
-          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{pct(displayPct)}</div>
+          <div style={{ padding:"10px 14px", color:T.cyan, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{fmt2(ticker.live_price||0)}</div>
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{isPositive?"+":" "}{fmt2(displayChg)}</div>
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{pct(displayPct)}</div>
         </>
       )}
     </div>
@@ -112,6 +112,7 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
   prev.ticker.volume       === next.ticker.volume &&
   prev.ticker.volume_spike === next.ticker.volume_spike &&
   prev.isWatched           === next.isWatched &&
+  prev.isStale             === next.isStale    &&
   prev.subMode             === next.subMode &&
   prev.gridCols            === next.gridCols &&
   prev.scalpSignals?.[prev.ticker.ticker]?.signal === next.scalpSignals?.[next.ticker.ticker]?.signal &&
