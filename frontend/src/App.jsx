@@ -28,10 +28,22 @@ export default function App() {
     // onAuthStateChange fires immediately with the current session AND
     // also fires when Google OAuth redirects back to the app (SIGNED_IN event).
     // This single listener handles all cases: page refresh, OAuth redirect, sign out.
+    //
+    // TOKEN_REFRESH_ERROR fix: when localStorage has a stale/expired refresh token
+    // from a previous session, Supabase SDK retries → gets 400 repeatedly →
+    // logs "AuthApiError: Invalid Refresh Token" in console → also causes the
+    // SSE RECONNECTING banner because network errors interrupt the stream.
+    // Fix: on TOKEN_REFRESH_ERROR, clear the bad session and sign out cleanly.
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
       if (event === 'INITIAL_SESSION' || event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
         setUser(session?.user ?? null)
       } else if (event === 'SIGNED_OUT') {
+        setUser(null)
+      } else if (event === 'TOKEN_REFRESH_ERROR') {
+        // Stale / invalid refresh token in localStorage — clear it and force re-login.
+        // Without this, the SDK retries the bad token on every page load → 400 loop.
+        console.warn('[NexRadar] Refresh token invalid — clearing session')
+        supabase.auth.signOut({ scope: 'local' }) // local only — no server round-trip needed
         setUser(null)
       }
     })

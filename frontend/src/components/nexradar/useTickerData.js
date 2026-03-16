@@ -269,6 +269,9 @@ export function useTickerData() {
         }
         tickerCacheDirtyRef.current = true
         scheduleFlush()
+        // RECONNECTING-FIX: after GAP-4b the first worker message is often
+        // snapshot_delta not snapshot — set connected so banner clears
+        setWsStatus('connected')
         return
       }
 
@@ -312,6 +315,8 @@ export function useTickerData() {
         }
         tickerCacheDirtyRef.current = true
         scheduleFlush()
+        // RECONNECTING-FIX: tick_batch = feed is live — clear banner
+        setWsStatus('connected')
         return
       }
 

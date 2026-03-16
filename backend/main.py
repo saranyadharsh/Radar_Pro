@@ -538,7 +538,7 @@ async def lifespan(app: FastAPI):
                             accession = hit.get("_id", "")
                             if not accession or accession in seen_accessions:
                                 continue
-                            items_str  = hit.get("_source", {}).get("items", "")
+                            items_str  = _edgar_items_str(hit.get("_source", {}).get("items"))
                             item_codes = {i.strip() for i in items_str.split(",")} if items_str else set()
                             if form == "8-K" and not (item_codes & _EDGAR_MATERIAL_8K):
                                 continue
@@ -1184,106 +1184,10 @@ async def get_tickers(
 # ── Earnings ───────────────────────────────────────────────────────────────────
 @app.get("/api/earnings")
 async def get_earnings(start: str = Query(default=None), end: str = Query(default=None)):
-    """
-    Enriched earnings calendar for PageEarnings.jsx.
-
-    Base:        Supabase earnings table  → ticker, report_date, when, eps_estimate, rev_estimate
-    +sector:     engine._sector_map       → zero HTTP, in-memory
-    +company:    engine._company_map      → zero HTTP, in-memory
-    +live_price: engine._cache            → zero HTTP, in-memory
-    +market_cap: Polygon /v3/reference/tickers/{sym} batched concurrently
-    +surprise:   Polygon /v1/meta/symbols/{sym}/earnings last 4Q, batched concurrently
-
-    All enrichment is non-blocking — missing data shows as null/[] not an error.
-    """
     today = date.today()
     s = start or today.isoformat()
     e = end   or (today + timedelta(days=7)).isoformat()
-
-    # ── Base rows from Supabase ────────────────────────────────────────────────
-    rows = await asyncio.to_thread(db.get_earnings_for_range, s, e)
-    if not rows:
-        return []
-
-    # ── In-memory enrichment (zero HTTP) ──────────────────────────────────────
-    eng         = getattr(app.state, "engine", None)
-    company_map = getattr(eng, "_company_map", {}) if eng else {}
-    sector_map  = getattr(eng, "_sector_map",  {}) if eng else {}
-    cache       = eng._cache if eng else {}
-
-    enriched = []
-    for row in rows:
-        sym  = (row.get("ticker") or "").upper()
-        live = {}
-        if eng and sym in cache:
-            with eng._cache_lock:
-                live = dict(cache.get(sym, {}))
-        enriched.append({
-            **row,
-            "ticker":         sym,
-            "company_name":   row.get("company_name") or company_map.get(sym, ""),
-            "sector":         row.get("sector")       or sector_map.get(sym, ""),
-            "live_price":     live.get("live_price")  or live.get("price"),
-            "percent_change": live.get("percent_change"),
-            "market_cap":     None,       # filled below via Polygon
-            "surprise_history": [],       # filled below via Polygon
-        })
-
-    api_key = os.getenv("MASSIVE_API_KEY", "")
-    if not api_key:
-        return enriched
-
-    tickers_in_range = [r["ticker"] for r in enriched if r.get("ticker")]
-
-    # ── Polygon surprise history: last 4 reported quarters ────────────────────
-    async def _fetch_surprise(sym: str) -> tuple:
-        url = f"https://api.polygon.io/v1/meta/symbols/{sym}/earnings?limit=4&apiKey={api_key}"
-        try:
-            async with httpx.AsyncClient(timeout=6) as client:
-                r = await client.get(url)
-                r.raise_for_status()
-                history = [
-                    {
-                        "quarter":      e.get("quarter"),
-                        "year":         e.get("year"),
-                        "eps_est":      (e.get("eps") or {}).get("estimate"),
-                        "eps_actual":   (e.get("eps") or {}).get("actual"),
-                        "surprise_pct": (e.get("eps") or {}).get("surprisePercent"),
-                    }
-                    for e in (r.json().get("results") or [])
-                    if (e.get("eps") or {}).get("actual") is not None
-                ]
-                return sym, history
-        except Exception:
-            return sym, []
-
-    # ── Polygon market cap: /v3/reference/tickers/{sym} ───────────────────────
-    async def _fetch_mktcap(sym: str) -> tuple:
-        url = f"https://api.polygon.io/v3/reference/tickers/{sym}?apiKey={api_key}"
-        try:
-            async with httpx.AsyncClient(timeout=6) as client:
-                r = await client.get(url)
-                r.raise_for_status()
-                mkt_cap = (r.json().get("results") or {}).get("market_cap")
-                return sym, mkt_cap
-        except Exception:
-            return sym, None
-
-    # Run both enrichment batches concurrently
-    surprise_res, mktcap_res = await asyncio.gather(
-        asyncio.gather(*[_fetch_surprise(sym) for sym in tickers_in_range], return_exceptions=True),
-        asyncio.gather(*[_fetch_mktcap(sym)  for sym in tickers_in_range], return_exceptions=True),
-    )
-
-    surprise_map = {r[0]: r[1] for r in surprise_res if isinstance(r, tuple)}
-    mktcap_map   = {r[0]: r[1] for r in mktcap_res   if isinstance(r, tuple)}
-
-    for row in enriched:
-        sym = row["ticker"]
-        row["surprise_history"] = surprise_map.get(sym, [])
-        row["market_cap"]       = mktcap_map.get(sym)
-
-    return enriched
+    return await asyncio.to_thread(db.get_earnings_for_range, s, e)
 
 
 # ── Signals ────────────────────────────────────────────────────────────────────
@@ -2105,10 +2009,23 @@ async def _edgar_fetch_form(sym: str, form: str, startdt: str) -> list:
         logger.debug(f"EDGAR fetch {sym}/{form}: {e}")
         return []
 
+def _edgar_items_str(raw_items) -> str:
+    """
+    EDGAR-FIX: the 'items' field in _source can be:
+      - a string: "5.02, 9.01"
+      - a list:   ["5.02", "9.01"]
+      - None / missing
+    Normalize to a comma-separated string in all cases.
+    Error was: 'list' object has no attribute 'split'
+    """
+    if isinstance(raw_items, list):
+        return ", ".join(str(i).strip() for i in raw_items if i)
+    return str(raw_items).strip() if raw_items else ""
+
 def _edgar_build_alert(sym: str, form: str, hit: dict) -> dict:
     """Normalise a raw EDGAR hit into a structured edgar_alert SSE payload."""
     src        = hit.get("_source", {})
-    items_str  = src.get("items", "")
+    items_str  = _edgar_items_str(src.get("items"))
     item_codes = {i.strip() for i in items_str.split(",")} if items_str else set()
     filed_at   = src.get("file_date", "")
     entity_id  = src.get("entity_id", "")
@@ -2164,7 +2081,7 @@ async def edgar_proxy(symbol: str, days: int = Query(default=7, le=90)):
     for form in forms:
         raw_hits = await _edgar_fetch_form(sym, form, startdt)
         for hit in raw_hits:
-            items_str  = hit.get("_source", {}).get("items", "")
+            items_str  = _edgar_items_str(hit.get("_source", {}).get("items"))
             item_codes = {i.strip() for i in items_str.split(",")} if items_str else set()
             if form == "8-K" and not (item_codes & _EDGAR_MATERIAL_8K):
                 continue
