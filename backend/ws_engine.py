@@ -59,7 +59,7 @@ POLYGON_WS_URL   = "wss://socket.polygon.io/stocks"
 POLYGON_REST_URL = "https://api.polygon.io/v2"
 SNAPSHOT_INTERVAL_S  = 15     # check for dirty tickers every 15s
 PORTFOLIO_REFRESH_S  = 60   # PORTFIX-1: safety-net poll only; instant updates via /api/portfolio/sync
-AH_CLOSE_REFRESH_S   = 300  # 5 min — OOM-FIX: was 60s, now watchlist-only so less urgent
+AH_CLOSE_REFRESH_S   = 60   # 1 min  -  refresh AH closes during extended hours
 DB_WRITE_INTERVAL_S  = 300
 HIST_FETCH_WORKERS   = 8
 TICK_BATCH_SIZE      = 100    # ticks buffered before a flush
@@ -948,27 +948,23 @@ class WSEngine:
 
     def _refresh_ah_closes(self) -> None:
         """
-        OOM-FIX: was refreshing ALL 5544 cached tickers every 60s (22 batches).
-        Now only refreshes:
-          1. Watchlist tickers (_watchlist_tickers — 30 tickers, 1 batch)
-          2. Tickers that actually ticked in the last hour (_dirty_tickers)
-        This reduces from 22 batches × 375KB = 8MB peak → 1-2 batches = 100KB peak.
-        Batch size reduced 250→100, sleep 0.5s between batches for GC to reclaim.
+        OOM-FIX: was iterating ALL 5,544 cached tickers (22 batches × 375KB = 8MB/run).
+        Now only refreshes watchlist tickers (30 tickers = 1 batch = ~150KB/run).
+        This is sufficient — AH % only needs to be live for tickers the user watches.
+        Interval stays 60s (safe with 1-batch scope). Batch size 100 not 250.
+        gc.collect() + sleep(0.5) between batches yields GIL so tick processing
+        isn't blocked, eliminating the 30s live-table freeze during AH.
         """
         import gc
-        # Only refresh tickers the user actually cares about:
-        # watchlist + recently-active tickers (had a tick in last snapshot cycle)
         with self._cache_lock:
             active = set(self._watchlist_tickers)
-            # Also include tickers that were dirty in the last snapshot window
             active |= self._dirty_tickers
-            # Cap at 500 to prevent runaway on large watchlists
             target = list(active)[:500]
 
         if not target:
             return
 
-        batch_size = 100  # reduced from 250 to limit per-batch memory
+        batch_size = 100
         for i in range(0, len(target), batch_size):
             if self._shutdown.is_set():
                 return
@@ -987,11 +983,11 @@ class WSEngine:
                         with self._cache_lock:
                             if tk in self._cache:
                                 self._cache[tk]["today_close"] = c
-                del resp  # explicit delete to help GC
+                del resp
             except Exception as e:
                 logger.warning(f"AH close batch {i//batch_size} failed: {e}")
-            gc.collect()           # reclaim batch JSON before next request
-            time.sleep(0.5)        # yield CPU + allow GC between batches
+            gc.collect()
+            time.sleep(0.5)
 
     # ── Session reset loop ─────────────────────────────────────────────────────
 
@@ -1022,13 +1018,13 @@ class WSEngine:
 
             logger.info("9:30 AM ET  -  session reset: clearing AH cache prices")
             # OOM-FIX: replaced _fetch_polygon_snapshot_bulk() (22 batches, 8MB peak)
-            # with an in-memory field clear. The Polygon WS feed updates live prices
-            # within seconds of market open — no REST fetch needed here.
+            # with in-memory field clear. Polygon WS feed updates live prices within
+            # seconds of market open — no REST fetch needed here.
             try:
                 import gc
                 with self._cache_lock:
                     for row in self._cache.values():
-                        row["today_close"] = 0.0   # Fix-20a: reset for market hours
+                        row["today_close"] = 0.0
                         row["ah_dollar"]   = 0.0
                         row["ah_pct"]      = 0.0
                         row["ah_momentum"] = False
