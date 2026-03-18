@@ -1,8 +1,39 @@
 /**
  * PagePortfolio.jsx — NexRadar Pro
- * Portfolio table from /api/portfolio (30s refresh), enriched with live prices,
- * SVG DonutChart for sector allocation, KPI cards, pagination.
- * Props: { tickers, marketSession, watchlist, toggleWatchlist, T }
+ * Portfolio table from /api/portfolio (REST on mount + SSE push), enriched with
+ * live prices from SSE tickers Map, DonutChart sector allocation, KPI cards.
+ *
+ * Props: { tickers, marketSession, watchlist, toggleWatchlist, sseRef, T }
+ *
+ * FIXES IN THIS VERSION:
+ *
+ *   SSE-LISTENER-RACE-FIX: The prod version checked sseRef?.current once at
+ *     mount time (always null on first render since useTickerData's useEffect
+ *     runs asynchronously). When null, it returned immediately and the SSE
+ *     listener was NEVER registered — portfolio_update messages silently
+ *     dropped forever. Fix: poll every 300ms until sseRef.current is populated,
+ *     then attach the listener. Same pattern as useWatchlist.js.
+ *
+ *   HIJACK-FIX: Prod version used sse.port.onmessage = handler (single-slot
+ *     assignment). Multiple components writing to the same slot overwrote each
+ *     other's handlers on every navigation/mount cycle. Fix: use
+ *     port.addEventListener('message', handler) which is multi-subscriber safe.
+ *
+ *   LIVE-PRICE-FIX: Prod version read position.last_price which is NEVER
+ *     populated by the backend. Fix: use position.live_price (enriched by
+ *     ws_engine._portfolio_loop PORTFIX-2) then fall back to SSE tickers Map.
+ *
+ *   TIMEOUT-FIX: REST fetch timeout reduced from 25s to 8s on first attempt.
+ *     Cold-start is handled by the 3-retry loop; a single 25s wait produced
+ *     the "LOADING PORTFOLIO..." stuck screen during Render free-tier cold starts.
+ *
+ *   EFFECT-SPLIT-FIX: REST fetch and SSE listener are now in two independent
+ *     useEffects with correct dependency arrays. The prod version had them
+ *     combined in one effect with [sseRef] dep — the REST fetch re-ran on every
+ *     sseRef change (every tab switch with SharedWorker), spamming /api/portfolio.
+ *
+ *   PATCH-MAIN-2: X-Data-Timestamp race guard preserved — REST response is
+ *     discarded if a fresher SSE delta already arrived.
  */
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { SectionHeader, Chip, Shimmer, EmptyState, EmptyChart } from './primitives.jsx';
@@ -74,70 +105,122 @@ export default function PagePortfolio({ tickers=new Map(), marketSession='market
   const [currentPage,   setCurrentPage]   = useState(1);
   const ITEMS_PER_PAGE = 50;
 
-  // PATCH-MAIN-2: track last SSE delta timestamp to guard against REST race
+  // PATCH-MAIN-2: track last SSE delta timestamp to guard REST race condition
   const lastSseTsRef = useRef(0);
 
+  // ── Effect 1: REST fetch on mount ──────────────────────────────────────────
+  // EFFECT-SPLIT-FIX: separate from SSE listener so REST doesn't re-fire on
+  // every sseRef change (tab switches with SharedWorker).
+  // TIMEOUT-FIX: 8s per attempt (was 25s) — retries handle cold-start window.
   useEffect(() => {
-    // ── 1. One-shot REST fetch on mount (fallback / cold start) ──────────────
-    // Only applied if it arrives BEFORE any SSE portfolio_update.
-    fetch(`${API_BASE}/api/portfolio`)
-      .then(r => {
+    let cancelled = false;
+
+    const fetchPortfolio = async (attempt = 1) => {
+      const controller = new AbortController();
+      const timeout    = setTimeout(() => controller.abort(), 8_000);
+      try {
+        const r = await fetch(`${API_BASE}/api/portfolio`, { signal: controller.signal });
+        clearTimeout(timeout);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        // PATCH-MAIN-2: read server timestamp from header
         const serverTs = parseInt(r.headers.get('X-Data-Timestamp') || '0', 10);
-        return r.json().then(data => ({ data, serverTs }));
-      })
-      .then(({ data, serverTs }) => {
-        // Discard if a fresher SSE delta already arrived
-        if (serverTs < lastSseTsRef.current) {
+        const data     = await r.json();
+        if (cancelled) return;
+        // PATCH-MAIN-2: discard if fresher SSE delta already arrived
+        if (serverTs > 0 && serverTs < lastSseTsRef.current) {
           console.debug('[Portfolio] REST response discarded — older than SSE delta');
+          setLoading(false);
           return;
         }
         setPortfolioData(data || []);
         setLoading(false);
-      })
-      .catch(err => {
-        console.error('[Portfolio] Fetch error:', err);
-        setLoading(false);
-      });
-
-    // ── 2. SSE listener — fires on every server-pushed portfolio_update ──────
-    // SharedWorker-aware: sseRef.current may be a SharedWorker (pre-parsed
-    // objects on port.onmessage) or a direct EventSource (raw strings via
-    // addEventListener). Both paths handled.
-    if (!sseRef?.current) return;
-    const sse = sseRef.current;
-
-    const handlePayload = (payload) => {
-      if (!payload || typeof payload !== 'object') return;
-      if (payload.type === 'portfolio_update' && Array.isArray(payload.data)) {
-        // PATCH-MAIN-2: record SSE arrival time so REST race guard works
-        lastSseTsRef.current = payload.server_ts ?? Date.now();
-        setPortfolioData(payload.data);
-        setLoading(false);
+      } catch (err) {
+        clearTimeout(timeout);
+        if (cancelled) return;
+        console.warn(`[Portfolio] Fetch attempt ${attempt}/3:`, err.message);
+        if (attempt < 3) {
+          setTimeout(() => { if (!cancelled) fetchPortfolio(attempt + 1); }, 3_000);
+        } else {
+          console.error('[Portfolio] All fetch attempts failed — showing empty state');
+          setLoading(false);
+        }
       }
     };
 
-    let cleanup = () => {};
-    if (isSharedWorker(sse)) {
-      const prevHandler = sse.port.onmessage;
-      sse.port.onmessage = (e) => { if (prevHandler) prevHandler(e); handlePayload(e.data); };
-      cleanup = () => { if (sse.port) sse.port.onmessage = prevHandler; };
-    } else if (typeof sse.addEventListener === 'function') {
-      const handleMessage = (e) => { try { handlePayload(JSON.parse(e.data)); } catch {} };
-      sse.addEventListener('message', handleMessage);
-      cleanup = () => sse.removeEventListener('message', handleMessage);
-    }
-    return cleanup;
-  }, [sseRef]);
+    fetchPortfolio();
+    return () => { cancelled = true; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Effect 2: SSE listener for live portfolio_update pushes ───────────────
+  // SSE-LISTENER-RACE-FIX: sseRef.current is null on first render (useTickerData's
+  // useEffect runs asynchronously). Poll every 300ms until it's available, then
+  // attach the listener. This guarantees we never miss a portfolio_update message
+  // even when the user navigates to Portfolio before SSE finishes connecting.
+  //
+  // HIJACK-FIX: use port.addEventListener (multi-subscriber) not port.onmessage
+  // (single-slot). Multiple hooks writing to the same slot overwrote each other.
+  useEffect(() => {
+    let cleanup  = () => {};
+    let pollId   = null;
+
+    const attach = () => {
+      const sse = sseRef?.current;
+      if (!sse) {
+        // SSE not ready yet — retry shortly
+        pollId = setTimeout(attach, 300);
+        return;
+      }
+
+      const handlePayload = (payload) => {
+        if (!payload || typeof payload !== 'object') return;
+        if (payload.type === 'portfolio_update' && Array.isArray(payload.data)) {
+          // PATCH-MAIN-2: record SSE arrival time
+          lastSseTsRef.current = payload.server_ts ?? Date.now();
+          setPortfolioData(payload.data);
+          setLoading(false);
+        }
+      };
+
+      if (isSharedWorker(sse)) {
+        // HIJACK-FIX: addEventListener is multi-subscriber safe
+        const handler = (e) => handlePayload(e.data);
+        sse.port.addEventListener('message', handler);
+        cleanup = () => {
+          clearTimeout(pollId);
+          if (sse.port) sse.port.removeEventListener('message', handler);
+        };
+      } else if (typeof sse.addEventListener === 'function') {
+        const handler = (e) => { try { handlePayload(JSON.parse(e.data)); } catch {} };
+        sse.addEventListener('message', handler);
+        cleanup = () => {
+          clearTimeout(pollId);
+          sse.removeEventListener('message', handler);
+        };
+      }
+    };
+
+    attach();
+    return () => { clearTimeout(pollId); cleanup(); };
+  }, [sseRef]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Enrich portfolio rows with live prices ────────────────────────────────
+  // LIVE-PRICE-FIX: priority order:
+  //   1. SSE tickers Map (250ms live, always fresh)
+  //   2. position.live_price (enriched by ws_engine PORTFIX-2 / main.py REST)
+  //   3. position.price (alias from ws_engine)
+  //   4. 0 fallback
+  // REMOVED: position.last_price — this field is never populated by the backend.
   const enrichedPortfolio = useMemo(() => {
     return portfolioData.map(position => {
       const ticker    = tickers.get(position.ticker);
-      const livePrice = ticker?.live_price || position.last_price || 0;
-      const openPrice = ticker?.open       || 0;
-      const prevClose = ticker?.prev_close || 0;
-      const todayClose= ticker?.today_close|| 0;
+      const livePrice = ticker?.live_price
+                     || ticker?.price
+                     || position.live_price   // ← PORTFIX-2 enriched by backend
+                     || position.price
+                     || 0;
+      const openPrice = ticker?.open_price || ticker?.open
+                     || position.open_price || position.open || 0;
+      const prevClose = ticker?.prev_close || position.prev_close || 0;
+      const todayClose= ticker?.today_close|| position.today_close || 0;
       const shares    = position.shares    || 0;
       const avgCost   = position.avg_cost  || 0;
       const marketValue = shares * livePrice;
@@ -149,15 +232,24 @@ export default function PagePortfolio({ tickers=new Map(), marketSession='market
       const dayChange   = dayBase > 0 ? livePrice - dayBase : 0;
       const dayPnL      = shares * dayChange;
       const dayPct      = dayBase > 0 ? (dayChange / dayBase) * 100 : 0;
-      return { ...position, livePrice, openPrice, prevClose, todayClose, marketValue, costBasis, totalPnL, totalPnLPct, dayPnL, dayPct, sector: ticker?.sector || position.sector || 'OTHER' };
+      return {
+        ...position,
+        livePrice, openPrice, prevClose, todayClose,
+        marketValue, costBasis, totalPnL, totalPnLPct,
+        dayPnL, dayPct,
+        sector: ticker?.sector || position.sector || 'OTHER',
+      };
     });
-  }, [portfolioData, tickers]);
+  }, [portfolioData, tickers, marketSession]);
 
   const allocationData = useMemo(() => {
     if (!enrichedPortfolio.length) return [];
     const totalValue = enrichedPortfolio.reduce((s,p)=>s+p.marketValue,0);
     if (!totalValue) return [];
-    const sectorColors = { TECHNOLOGY:T.cyan, BANKING:T.green, BIO:T.purple, CONSUMER:T.gold, 'BM & UENE':T.orange, REALCOM:'#00bcd4', INDUSTRIALS:'#ff9800', OTHER:T.text2 };
+    const sectorColors = {
+      TECHNOLOGY:T.cyan, BANKING:T.green, BIO:T.purple, CONSUMER:T.gold,
+      'BM & UENE':T.orange, REALCOM:'#00bcd4', INDUSTRIALS:'#ff9800', OTHER:T.text2,
+    };
     const sectorMap = {};
     enrichedPortfolio.forEach(p => {
       const sec = (p.sector||'OTHER').toUpperCase();
@@ -216,7 +308,7 @@ export default function PagePortfolio({ tickers=new Map(), marketSession='market
             ))}
           </div>
           {loading ? (
-            <EmptyState icon="◆" label="LOADING PORTFOLIO..." sub="Awaiting SSE portfolio_update…" h={120}/>
+            <EmptyState icon="◆" label="LOADING PORTFOLIO..." sub="Loading positions from server…" h={120}/>
           ) : enrichedPortfolio.length===0 ? (
             <EmptyState icon="◆" label="NO POSITIONS" sub="Add your first position to get started" h={120} T={T}/>
           ) : (
@@ -267,7 +359,7 @@ export default function PagePortfolio({ tickers=new Map(), marketSession='market
               {enrichedPortfolio.length>ITEMS_PER_PAGE&&(
                 <div style={{ padding:'14px 18px', borderTop:`2px solid ${T.border}`, display:'flex', justifyContent:'space-between', alignItems:'center', background:T.bg1, position:'sticky', bottom:0, zIndex:10 }}>
                   <span style={{ color:T.text1, fontSize:13, fontFamily:T.font, fontWeight:600 }}>
-                    Showing {((currentPage-1)*ITEMS_PER_PAGE)+1}-{Math.min(currentPage*ITEMS_PER_PAGE,enrichedPortfolio.length)} of {enrichedPortfolio.length.toLocaleString()} positions
+                    Showing {((currentPage-1)*ITEMS_PER_PAGE)+1}–{Math.min(currentPage*ITEMS_PER_PAGE,enrichedPortfolio.length)} of {enrichedPortfolio.length.toLocaleString()} positions
                   </span>
                   <div style={{ display:'flex', gap:10, alignItems:'center' }}>
                     <span style={{ color:T.text1, fontSize:13, fontFamily:T.font, fontWeight:600 }}>Page {currentPage} of {Math.ceil(enrichedPortfolio.length/ITEMS_PER_PAGE)}</span>
@@ -315,9 +407,9 @@ export default function PagePortfolio({ tickers=new Map(), marketSession='market
               </div>
               <div style={{ marginTop:14, paddingTop:12, borderTop:`1px solid ${T.border}`, display:'flex', gap:8, flexWrap:'wrap' }}>
                 {[
-                  {lbl:'TOP HOLDING',   val:kpis.topHolding,             note:'symbol'},
+                  {lbl:'TOP HOLDING',   val:kpis.topHolding,                   note:'symbol'},
                   {lbl:'CONCENTRATION', val:`${kpis.concentration.toFixed(0)}%`, note:'top 5%'},
-                  {lbl:'SECTORS',       val:kpis.sectorCount,            note:'count'},
+                  {lbl:'SECTORS',       val:kpis.sectorCount,                   note:'count'},
                 ].map(k=>(
                   <div key={k.lbl} style={{ flex:1, background:T.bg2, border:`1px solid ${T.border}`, borderRadius:6, padding:'7px 10px', minWidth:70 }}>
                     <div style={{ color:T.text2, fontSize:7.5, letterSpacing:1.5, fontFamily:T.font }}>{k.lbl}</div>

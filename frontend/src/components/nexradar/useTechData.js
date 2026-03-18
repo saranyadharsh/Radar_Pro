@@ -20,24 +20,44 @@ export function useTechData() {
   const techLoadingRef   = useRef(false);
   const techLastFetchRef = useRef(null);
 
-  const fetchTechData = useCallback((forceRefresh = false) => {
+  const fetchTechData = useCallback(async (forceRefresh = false) => {
     if (techLoadingRef.current) return;
     techLoadingRef.current = true;
     setTechLoading(true);
     setTechError(null);
-    fetch(`${API_BASE}/api/market-monitor${forceRefresh ? "?refresh=1" : ""}`)
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .then(json => {
-        if (json.error) { setTechError(json.error); return; }
+    // TECH-RETRY-FIX: /api/market-monitor hangs indefinitely on ERR_EMPTY_RESPONSE
+    // (backend restarting / Polygon REST blocking the event loop). Add a 15s
+    // AbortController timeout and retry once after 3s before giving up.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15_000);
+      try {
+        const r = await fetch(
+          `${API_BASE}/api/market-monitor${forceRefresh ? "?refresh=1" : ""}`,
+          { signal: controller.signal }
+        );
+        clearTimeout(timer);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const json = await r.json();
+        if (json.error) { setTechError(json.error); break; }
         const now = new Date();
         setTechData(json.data || []);
         setTechCached(json.cached || false);
         setTechDataAge(json.data_age_sec || 0);
         setTechLastFetch(now);
         techLastFetchRef.current = now;
-      })
-      .catch(err => setTechError(err.message))
-      .finally(() => { techLoadingRef.current = false; setTechLoading(false); });
+        break; // success
+      } catch (err) {
+        clearTimeout(timer);
+        if (attempt < 2 && err.name !== 'AbortError') {
+          await new Promise(r => setTimeout(r, 3_000)); // 3s before retry
+        } else {
+          setTechError(err.name === 'AbortError' ? 'Request timed out — backend may be starting up' : err.message);
+        }
+      }
+    }
+    techLoadingRef.current = false;
+    setTechLoading(false);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {

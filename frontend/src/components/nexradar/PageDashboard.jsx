@@ -8,25 +8,50 @@ import { pct, normalizeSector } from "./utils.js";
 import { SectionHeader, Shimmer, EmptyState } from "./primitives.jsx";
 import { normalizeEarningsResponse } from "./normalizer.js";
 
-export default function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerformance = {}, tickers, techData = [], techLoading = false, T }) {
+export default function PageDashboard({ onNavigate, onSectorChange, selectedSectors, sectorPerformance = {}, tickers, techData = [], techLoading = false, watchlist: watchlistProp = null, toggleWatchlist: toggleWatchlistProp = null, T }) {
   const sectorTiles = SECTORS.filter(s => s.id !== "ALL");
   const [earnings,        setEarnings]        = useState([]);
   const [earningsLoading, setEarningsLoading] = useState(true);
-  const [watchlist,       setWatchlist]       = useState(new Set());
+  // WATCHLIST-DEDUP-FIX: use watchlist prop from root (already loaded by useWatchlist).
+  // Fall back to local state only if prop is not provided (standalone usage).
+  const [_localWatchlist, _setLocalWatchlist] = useState(new Set());
+  const watchlist = watchlistProp ?? _localWatchlist;
   const [breadthTimeframe, setBreadthTimeframe] = useState("1D");
   const [scalpFilter,     setScalpFilter]     = useState("ALL");
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/watchlist`)
-      .then(r => r.ok ? r.json() : Promise.reject(r.status))
-      .then(data => setWatchlist(new Set(data.watchlist ?? [])))
-      .catch(() => {});
+    // WATCHLIST-DEDUP-FIX: only fetch if prop not provided (standalone / no root shell)
+    if (watchlistProp === null) {
+      fetch(`${API_BASE}/api/watchlist`)
+        .then(r => r.ok ? r.json() : Promise.reject(r.status))
+        .then(data => _setLocalWatchlist(new Set(data.watchlist ?? [])))
+        .catch(() => {});
+    }
 
     const now = new Date();
-    const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+    // EARNINGS-TZ-FIX: toISOString() returns UTC — after 6 PM MT that's already
+    // the *next* calendar day, so today's earnings never show up.
+    // toLocaleDateString('en-CA') returns YYYY-MM-DD in the browser's local TZ
+    // which matches the market-date convention the backend uses.
+    const today = now.toLocaleDateString('en-CA');
     fetch(`${API_BASE}/api/earnings?start=${today}&end=${today}`)
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .then(data => { setEarnings(normalizeEarningsResponse(data)); setEarningsLoading(false); })
+      .then(data => {
+        // EARNINGS-ARRAY-FIX: backend /api/earnings returns a bare [] not {data:[]}.
+        // normalizeEarningsResponse may expect a wrapper — guard both shapes here
+        // so a backend shape change never silently empties the earnings tiles.
+        const arr = Array.isArray(data)           ? data          :
+                    Array.isArray(data?.data)      ? data.data     :
+                    Array.isArray(data?.earnings)  ? data.earnings :
+                    Array.isArray(data?.results)   ? data.results  : [];
+        try {
+          setEarnings(normalizeEarningsResponse(arr.length ? data : arr));
+        } catch {
+          // normalizeEarningsResponse not available or threw — use raw array
+          setEarnings(arr);
+        }
+        setEarningsLoading(false);
+      })
       .catch(() => { setEarnings([]); setEarningsLoading(false); });
   }, []);
 

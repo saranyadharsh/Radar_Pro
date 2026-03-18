@@ -53,10 +53,55 @@ async function callClaude({ system, user, maxTokens = 1200 }) {
     .filter(b => b.type === "text")
     .map(b => b.text)
     .join("\n");
-  const match = text.match(/[\[{][\s\S]*[\]}]/);
-  if (match) {
-    try { return { text, parsed: JSON.parse(match[0]) }; } catch {}
+
+  // REGEX-FIX: the previous /[{[][sS]*[}\]]/ is greedy — it matches from the
+  // first opening bracket all the way to the LAST closing bracket in the entire
+  // string. If Claude appends any text containing brackets after the JSON
+  // (e.g. "{"verdict":"BUY"} Note: [Watch VWAP]"), the regex captures everything
+  // up to the final ], producing fatally invalid JSON and silently returning
+  // the hardcoded fallback.
+  //
+  // Fix: three-stage extraction in order of reliability:
+  //   1. Direct parse — handles the clean 'ONLY valid JSON' case (99% of calls).
+  //   2. Balanced-bracket scan — walks char-by-char to find the FIRST complete
+  //      {...} or [...] block, stopping at its matching close. Immune to any
+  //      trailing text.
+  //   3. Return { text, parsed: null } so callers use their own fallback.
+  const tryParse = (str) => { try { return JSON.parse(str); } catch { return null; } };
+
+  // Stage 1: direct parse (Claude returned pure JSON as instructed)
+  const direct = tryParse(text.trim());
+  if (direct) return { text, parsed: direct };
+
+  // Stage 2: balanced-bracket extraction
+  const openChars  = new Set(['{', '[']);
+  const closeMatch = { '{': '}', '[': ']' };
+  for (let i = 0; i < text.length; i++) {
+    if (!openChars.has(text[i])) continue;
+    const open = text[i];
+    const close = closeMatch[open];
+    let depth = 0;
+    let inStr = false;
+    let escape = false;
+    for (let j = i; j < text.length; j++) {
+      const ch = text[j];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\' && inStr) { escape = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === open)  depth++;
+      if (ch === close) {
+        depth--;
+        if (depth === 0) {
+          const candidate = text.slice(i, j + 1);
+          const parsed = tryParse(candidate);
+          if (parsed) return { text, parsed };
+          break; // malformed — keep scanning for next opening bracket
+        }
+      }
+    }
   }
+
   return { text, parsed: null };
 }
 

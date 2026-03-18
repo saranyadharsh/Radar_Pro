@@ -654,6 +654,10 @@ class ScalpingSignalEngine:
         # FIX-5: date-guard prevents missed/double VWAP reset
         self._vwap_reset_date: Optional[date] = None
 
+        # LULD-GAP-FIX: tickers currently halted, cleared on first post-halt tick.
+        # Prevents false-positive signals from the gap bar on halt resumption.
+        self._halted_tickers: set = set()
+
         # If a broadcast_cb was passed, register it
         if broadcast_cb:
             self.on_signal(broadcast_cb)
@@ -666,13 +670,25 @@ class ScalpingSignalEngine:
         return list(self._watched)
 
     def set_watchlist(self, symbols: List[str]):
-        """Updates the active watchlist symbols."""
+        """Updates the active watchlist symbols.
+
+        SIGNAL-BLANK-FIX: pre-create IndicatorCalculator entries for every new
+        symbol so get_scalp_snapshot() immediately returns warming_up rows.
+        Previously _calcs only got entries when on_tick() fired — meaning
+        get_scalp_snapshot returned [] until the first Polygon tick arrived for
+        each watchlist symbol, leaving the Signals and Scanner tabs blank.
+        """
+        new_watched = set(s.upper().strip() for s in symbols)
         with self._lock:
-            self._watched = set([s.upper().strip() for s in symbols])
-            # Optional: Clear calculators for symbols no longer watched
+            self._watched = new_watched
+            # Remove calculators for symbols no longer watched
             to_remove = [s for s in self._calcs if s not in self._watched]
             for s in to_remove:
                 del self._calcs[s]
+            # Pre-create entries for new symbols so snapshot returns warming_up rows
+            for s in self._watched:
+                if s not in self._calcs:
+                    self._calcs[s] = IndicatorCalculator(s)
         logger.info(f"Signal Watchlist updated: {len(self._watched)} symbols")
 
     def start(self):
@@ -716,8 +732,23 @@ class ScalpingSignalEngine:
             # Stock is frozen — do NOT process bars or generate signals.
             # Avoids: slippage on halt entry, RSI skew from bad ticks,
             # false volume-spike signals from halt-related prints.
+            # LULD-GAP-FIX: mark that this ticker was halted so we can
+            # suppress the first post-halt bar (gap bar) on resumption.
+            self._halted_tickers.add(ticker)
             logger.debug(f"SIGNAL SUPPRESSED: {ticker} LULD halt state={halt_state}")
             return
+
+        # LULD-GAP-FIX: first tick after halt resumption — the opening print
+        # often gaps 3-10% from the pre-halt price. Feeding this as a normal
+        # 1-bar pseudo-bar into EMA/RSI/Volume-delta would spike indicators
+        # and fire false BUY/SELL signals immediately on resumption.
+        # Feed the bar for indicator continuity but suppress signal generation
+        # by temporarily extending the cooldown for this ticker.
+        if ticker in self._halted_tickers:
+            self._halted_tickers.discard(ticker)
+            logger.info(f"LULD-GAP-FIX: {ticker} resumed — suppressing first post-halt bar signals")
+            # Force cooldown so process_aggregate_bar feeds the bar but returns None
+            self._last_sig[ticker] = (ts_ms / 1000.0) if ts_ms else datetime.now().timestamp()
 
         et_tz = pytz.timezone("America/New_York")
         ts = datetime.fromtimestamp(ts_ms/1000.0, tz=et_tz) if ts_ms else datetime.now(et_tz)
@@ -1035,19 +1066,25 @@ class ScalpingSignalEngine:
         FIX-5: Uses a date guard + 10-second poll instead of exact-second check.
         Original polled every 0.5s checking second==0 — on Windows (15ms sleep
         resolution) this frequently missed the window, leaving stale VWAP all day.
-        Now: checks every 10s, fires once per calendar day (date guard ensures
-        no double-trigger even if the check runs at 09:30:05 or 09:30:50).
+
+        VWAP-TIMING-FIX: Changed from minute==30 to time >= 09:30 combined with
+        the existing date guard. The old check only fired while minute==30 exactly.
+        If sleep(10) woke at 09:31:01 the window was permanently missed for the day.
+        With >= 09:30: any wakeup on a new calendar date after market open fires
+        the reset exactly once (date guard prevents double-trigger). This guarantees
+        the reset always fires, even if the scheduler thread was briefly delayed.
         """
         def scheduler_loop():
+            import datetime as _dt_mod
             et_tz = pytz.timezone("America/New_York")
+            _market_open = _dt_mod.time(9, 30, 0)
             while True:
                 now_et = datetime.now(et_tz)
                 today  = now_et.date()
 
-                if (now_et.weekday() < 5
-                        and now_et.hour == 9
-                        and now_et.minute == 30
-                        and self._vwap_reset_date != today):
+                if (now_et.weekday() < 5                      # Mon–Fri
+                        and now_et.time() >= _market_open     # at or past 09:30
+                        and self._vwap_reset_date != today):  # not yet reset today
                     self._vwap_reset_date = today
                     self.reset_vwap_all()
                     logger.info("⏰ Auto VWAP+OBV Reset triggered at market open")

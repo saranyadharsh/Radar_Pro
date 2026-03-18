@@ -34,13 +34,13 @@ function EarningsSubPanel({ T }) {
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
       .then(d  => { setEarningsData(d || []); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
-  }, [weekOffset, weekDates]);
+  }, [weekOffset]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const today = weekDates.find(d => d.isToday);
     if (today) setSelectedDay(today.isoDate);
     else if (weekOffset === 0) setSelectedDay(null);
-  }, [weekOffset, weekDates]);
+  }, [weekOffset]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const activeDay   = selectedDay || weekDates.find(d => d.isToday)?.isoDate || weekDates[0]?.isoDate;
   const dayEarnings = useMemo(() =>
@@ -198,13 +198,15 @@ export default function PageSignals({
     // Cold-start: one REST call while SSE buffer populates
     fetchProData();
 
-    const sse = sseRef?.current;
-    if(!sse) return;
+    // SSE-LISTENER-RACE-FIX (same as PagePortfolio.jsx):
+    // sseRef.current is null on first render — useTickerData's useEffect runs
+    // asynchronously. The old code did `if(!sse) return` which permanently
+    // skipped the listener if SSE wasn't ready yet. React never re-runs this
+    // effect when ref.current changes (refs don't trigger re-renders).
+    // Fix: poll every 300ms until sseRef.current is populated, then attach.
+    let pollId  = null;
+    let cleanup = () => { clearTimeout(pollId); };
 
-    // Handle both SharedWorker (port.onmessage — pre-parsed objects)
-    // and direct EventSource (addEventListener — raw strings via e.data).
-    // SharedWorker: sseRef.current = SharedWorker instance → use port.onmessage
-    // EventSource:  sseRef.current = EventSource instance  → use addEventListener
     const handlePayload = (payload) => {
       if(!payload || typeof payload !== 'object') return;
       if(payload.type === 'signal_snapshot' && Array.isArray(payload.data)){
@@ -232,29 +234,30 @@ export default function PageSignals({
       }
     };
 
-    let cleanup = () => {};
+    const attach = () => {
+      const sse = sseRef?.current;
+      if(!sse) {
+        // Not ready yet — retry in 300ms (same pattern as PagePortfolio/useWatchlist)
+        pollId = setTimeout(attach, 300);
+        return;
+      }
+      if(isSharedWorker(sse)) {
+        // HIJACK-FIX: addEventListener (multi-subscriber) not port.onmessage (single-slot)
+        const handler = (e) => { handlePayload(e.data); };
+        sse.port.addEventListener('message', handler);
+        cleanup = () => {
+          clearTimeout(pollId);
+          if(sse.port) sse.port.removeEventListener('message', handler);
+        };
+      } else if(typeof sse.addEventListener === 'function') {
+        const handler = (e) => { try { handlePayload(JSON.parse(e.data)); } catch {} };
+        sse.addEventListener('message', handler);
+        cleanup = () => { clearTimeout(pollId); sse.removeEventListener('message', handler); };
+      }
+    };
 
-    if(isSharedWorker(sse)) {
-      // SharedWorker path — messages arrive as pre-parsed objects on port
-      const prevHandler = sse.port.onmessage;
-      sse.port.onmessage = (e) => {
-        if(prevHandler) prevHandler(e);   // preserve existing handler chain
-        handlePayload(e.data);
-      };
-      cleanup = () => {
-        // Restore previous handler on cleanup
-        if(sse.port) sse.port.onmessage = prevHandler;
-      };
-    } else if(typeof sse.addEventListener === 'function') {
-      // Direct EventSource fallback — messages arrive as raw strings
-      const handleMessage = (e) => {
-        try { handlePayload(JSON.parse(e.data)); } catch {}
-      };
-      sse.addEventListener('message', handleMessage);
-      cleanup = () => sse.removeEventListener('message', handleMessage);
-    }
-
-    return cleanup;
+    attach();
+    return () => { clearTimeout(pollId); cleanup(); };
   },[signalView, fetchProData, sseRef]);
 
   const [techSortKey, setTechSortKey] = useState('score');

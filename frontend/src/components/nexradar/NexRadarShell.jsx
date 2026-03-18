@@ -79,12 +79,14 @@ function NexRadarDashboard({
   const [sideScalpSignals, setSideScalpSignals] = useState({});
   const [aiEnabled,        setAiEnabledState]   = useState(false);
 
+  // WATCHLIST-DEDUP: derive sideWatchlist count directly from useWatchlist state
+  // — eliminates the redundant /api/watchlist REST fetch that was firing here
+  // simultaneously with useWatchlist's own fetch on every connect.
   useEffect(() => {
-    // Cold-start: one REST call each while SSE connects
-    fetch(`${API_BASE}/api/watchlist`)
-      .then(r => r.ok ? r.json() : {})
-      .then(d => setSideWatchlist((d.watchlist ?? []).length))
-      .catch(() => {});
+    setSideWatchlist(watchlist.size);
+  }, [watchlist]);
+
+  useEffect(() => {
 
     fetch(`${API_BASE}/api/scalp-analysis`)
       .then(r => r.ok ? r.json() : null)
@@ -175,7 +177,7 @@ function NexRadarDashboard({
   // ── Page router ──────────────────────────────────────────────────────────────
   const renderPage = () => {
     switch (page) {
-      case 'dashboard': return <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange} onNavigate={setPage} sectorPerformance={sectorPerformance} tickers={tickers} techData={techData} techLoading={techLoading} T={T} />;
+      case 'dashboard': return <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange} onNavigate={setPage} sectorPerformance={sectorPerformance} tickers={tickers} techData={techData} techLoading={techLoading} watchlist={watchlist} toggleWatchlist={toggleWatchlist} T={T} />;
       case 'live':      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={()=>setQuickFilter(null)} wsStatus={wsStatus} onLiveCount={handleLiveCount} watchlistProp={watchlist} toggleWatchlistProp={toggleWatchlist} isActive={page === 'live'} staleTickers={staleTickers} T={T} />;
       case 'chart':     return <PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />;
       case 'scanner':   return <PageScanner T={T} onNavigateToChart={(sym) => { setChartInitSymbol(sym); setPage('chart'); }} />;

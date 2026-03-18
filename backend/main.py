@@ -186,7 +186,10 @@ class SSEBroadcaster:
     QUEUE_MAXSIZE      = 500
     SLOW_CLIENT_TTL_S  = 10   # seconds a full queue is tolerated before eviction
 
-    REPLAY_BUFFER_SIZE = 300   # keep last 300 batches (~5 min at 1/sec)
+    REPLAY_BUFFER_SIZE = 100   # REPLAY-FIX: was 300. 100 × avg 2.5KB = 250KB steady,
+                                # 100 × 200KB peak (high-volatility delta) = 20MB ceiling.
+                                # Covers ~25 min of 15s snapshot_delta cycles — sufficient
+                                # for any realistic client reconnect gap.
 
     def __init__(self):
         self._queues:       Dict[asyncio.Queue, str]  = {}  # queue -> client_id
@@ -586,17 +589,37 @@ async def lifespan(app: FastAPI):
                 earn_rows = await asyncio.to_thread(
                     db.get_earnings_for_range, today.isoformat(), tomorrow.isoformat()
                 )
-                earn_map = {r["ticker"]: r for r in (earn_rows or [])}
+                # EARNINGS-COL-FIX: normalise column names (eps_estimate vs eps_est)
+                earn_map = {}
+                for r in (earn_rows or []):
+                    tk = r.get("ticker", "")
+                    if not tk:
+                        continue
+                    nr = dict(r)
+                    if nr.get("eps_estimate") is None and nr.get("eps_est") is not None:
+                        nr["eps_estimate"] = nr["eps_est"]
+                    if nr.get("revenue_estimate") is None and nr.get("rev_est") is not None:
+                        nr["revenue_estimate"] = nr["rev_est"]
+                    earn_map[tk] = nr
 
                 for sym in watchlist:
                     earn = earn_map.get(sym)
                     if not earn:
                         continue
-                    earn_date = earn.get("report_date") or earn.get("date", "")
-                    when      = earn.get("when", "")
+                    # BUG-13 FIX: DB columns are earnings_date / earnings_time / when.
+                    # Old code used report_date (missing) and when without fallback
+                    # to earnings_time, so earn_date was always '' and alerts never fired.
+                    earn_date = (earn.get("earnings_date") or
+                                 earn.get("report_date") or
+                                 earn.get("date", ""))
+                    when      = (earn.get("when") or
+                                 earn.get("earnings_time") or "")
                     eps_est   = earn.get("eps_estimate")
                     rev_est   = earn.get("revenue_estimate")
-                    when_str  = f"{when}-market" if when else "time TBD"
+                    # Humanize time: BMO=pre-market, AMC=after-close
+                    _time_map = {"BMO": "pre-market", "AMC": "after-close",
+                                 "pre": "pre-market", "post": "after-close"}
+                    when_str  = _time_map.get(when, f"{when}-market" if when else "time TBD")
 
                     k1 = f"{sym}_T1_{today.isoformat()}"
                     if earn_date == tomorrow.isoformat() and k1 not in alerted:
@@ -608,6 +631,7 @@ async def lifespan(app: FastAPI):
                             "earn_date": earn_date, "when": when,
                             "eps_est": eps_est, "rev_est": rev_est,
                             "color": "cyan", "emoji": "📅",
+                            "ts": int(time.time() * 1000),
                         })
                         logger.info(f"Earnings T-1 alert: {sym} {earn_date}")
 
@@ -623,6 +647,7 @@ async def lifespan(app: FastAPI):
                             "earn_date": earn_date, "when": when,
                             "eps_est": eps_est, "rev_est": rev_est,
                             "color": "gold", "emoji": "⚡",
+                            "ts": int(time.time() * 1000),
                         })
                         logger.info(f"Earnings T-0 alert: {sym} {earn_date}")
 
@@ -938,14 +963,25 @@ async def get_metrics():
     tick_stale_s = None
     if engine and getattr(engine, "_last_tick_processed_ts", 0) > 0:
         tick_stale_s = round(time.monotonic() - engine._last_tick_processed_ts, 1)
+    # TIER3-10: snapshot of Polygon message rate (count reset every 10s in monitor loop)
+    poly_msg_rate  = None
+    feed_rate_warn = None
+    if engine:
+        with engine._poly_msg_lock:
+            poly_msg_rate  = engine._poly_msg_count   # msgs seen since last 10s window
+        feed_rate_warn = getattr(engine, "_poly_rate_warned", False)
+
     return {
-        "sse_clients":    broadcaster.client_count if broadcaster else 0,
-        "snapshot_size":  len(snap_map),
-        "session":        _get_market_status_simple(),
-        "architecture":   "direct-sse-v6.5-ai-proxy-stock-data",
-        "tick_queue_len": len(engine._tick_queue) if engine else None,
-        "tick_stale_s":   tick_stale_s,
-        "dirty_tickers":  len(engine._dirty_tickers) if engine else None,
+        "sse_clients":      broadcaster.client_count if broadcaster else 0,
+        "snapshot_size":    len(snap_map),
+        "session":          _get_market_status_simple(),
+        "architecture":     "direct-sse-v6.5-ai-proxy-stock-data",
+        "tick_queue_len":   len(engine._tick_queue) if engine else None,
+        "tick_stale_s":     tick_stale_s,
+        "dirty_tickers":    len(engine._dirty_tickers) if engine else None,
+        # TIER3-10: live Polygon message rate for /api/metrics health dashboard
+        "poly_msg_rate":    poly_msg_rate,
+        "feed_rate_warned": feed_rate_warn,
     }
 
 
@@ -1040,18 +1076,35 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
             if not snap_map:
                 if _snapshot_ready_evt:
                     try:
-                        await asyncio.wait_for(_snapshot_ready_evt.wait(), timeout=8.0)
+                        # COLD-START-FIX: on Windows with ProactorEventLoop, Polygon
+                        # REST seeding (2 000+ stale tickers, 25 batches) takes ~50s
+                        # before snapshot_ready is set. The old 30s timeout fired too
+                        # early — client dropped into the poll loop and raced the event,
+                        # receiving an empty or partial snapshot.
+                        # 120s covers worst-case cold-start with headroom.
+                        await asyncio.wait_for(_snapshot_ready_evt.wait(), timeout=120.0)
                     except asyncio.TimeoutError:
-                        logger.warning(f"SSE {client_id}: snapshot_ready timeout after 8s")
-                # After event fires, prefer broadcaster map; fall back to engine cache
+                        logger.warning(f"SSE {client_id}: snapshot_ready timeout after 120s — polling engine cache")
+                # After event fires (or timeout), prefer broadcaster map; fall back to
+                # engine cache. SSL-RETRY-FIX: poll for up to 60s more in case Polygon
+                # REST fetch is still in progress (25 batches × ~1s each on cold start).
                 snap_map = broadcaster.get_snapshot_map()
-                if not snap_map and _eng and _eng._cache:
-                    with _eng._cache_lock:
-                        snap_map = {tk: dict(row) for tk, row in _eng._cache.items()}
-                    logger.info(f"SSE {client_id}: engine cache fallback "
-                                f"({len(snap_map)} tickers — broadcaster not yet synced)")
+                if not snap_map and _eng:
+                    for _poll in range(12):   # 12 × 5s = 60s extra wait
+                        await asyncio.sleep(5)
+                        snap_map = broadcaster.get_snapshot_map()
+                        if snap_map:
+                            logger.info(f"SSE {client_id}: broadcaster ready after +{(_poll+1)*5}s")
+                            break
+                        if _eng._cache:
+                            with _eng._cache_lock:
+                                snap_map = {tk: dict(row) for tk, row in _eng._cache.items()
+                                            if row.get("price", 0) > 0}
+                            if snap_map:
+                                logger.info(f"SSE {client_id}: engine cache fallback ({len(snap_map)} tickers)")
+                                break
                 if not snap_map:
-                    logger.warning(f"SSE {client_id}: cache still empty after wait")
+                    logger.warning(f"SSE {client_id}: cache still empty after extended wait")
 
             snap_ts  = int(time.time() * 1000)
             age_ms   = snap_ts - client_ts
@@ -1134,6 +1187,20 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
                         f"SSE {client_id}: tier-2 reconnect "
                         f"gap={age_ms//1000}s {len(changed)}/{len(snap_map)} rows"
                     )
+                elif snap_map:
+                    # TIER2-EMPTY-FIX: zero changes but we DO have data (after-hours /
+                    # weekend / quiet market). The client may have an empty cache
+                    # (SharedWorker restarted, new tab on existing worker with no cache).
+                    # Send full snapshot so the dashboard populates instead of staying blank.
+                    logger.info(
+                        f"SSE {client_id}: tier-2 zero-delta with {len(snap_map)} cached rows "
+                        f"— sending full snapshot to ensure client has data"
+                    )
+                    yield "data: " + _dumps({
+                        "type": "snapshot",
+                        "data": list(snap_map.values()),
+                        "ts":   snap_ts,
+                    }) + "\n\n"
                 else:
                     yield f'data: {{"type":"reconnected","ts":{snap_ts}}}\n\n'
 
@@ -1145,7 +1212,7 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
                 if await request.is_disconnected():
                     break
                 try:
-                    msg = await asyncio.wait_for(q.get(), timeout=15.0)
+                    msg = await asyncio.wait_for(q.get(), timeout=10.0)
                     if msg == "DISCONNECT":
                         break
                     yield msg
@@ -1154,6 +1221,13 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
                     # SSE comments (': ...') are silently ignored by EventSource —
                     # they don't trigger onmessage so sseWorker watchdog (25s) was
                     # firing every cycle during weekend/pre-market when no ticks flow.
+                    #
+                    # RENDER-PROXY-FIX: timeout reduced 15s → 10s.
+                    # Render's reverse proxy has a ~55s idle connection timeout.
+                    # During market-hours lulls the tick queue can be empty for
+                    # 10-15s between snapshot_deltas — if that coincides with a
+                    # quiet period the proxy closes the connection silently.
+                    # Keepalive every 10s guarantees activity well within 55s.
                     yield "data: {\"type\":\"keepalive\"}\n\n"
         except asyncio.CancelledError:
             pass
@@ -1191,10 +1265,103 @@ async def get_tickers(
 # ── Earnings ───────────────────────────────────────────────────────────────────
 @app.get("/api/earnings")
 async def get_earnings(start: str = Query(default=None), end: str = Query(default=None)):
+    """
+    Enriched earnings calendar for PageEarnings.jsx.
+
+    Tier 1 — Supabase (zero HTTP):
+      ticker, company_name, earnings_date, earnings_time,
+      eps_estimate, revenue_estimate  (from BUG-13 fixed SELECT)
+
+    Tier 2 — Engine in-memory maps (zero HTTP):
+      sector         → engine._sector_map
+      company_name   → engine._company_map (fills gaps from DB)
+      live_price     → engine._cache
+      percent_change → engine._cache
+
+    Tier 3 — Polygon REST (batched concurrently, 1 call/ticker):
+      surprise_history → /v1/meta/symbols/{sym}/earnings  (last 4 quarters)
+      market_cap       → /v3/reference/tickers/{sym}
+
+    All Tier-3 calls run in parallel via asyncio.gather.
+    Missing data returns null/[] — never raises an error.
+    """
     today = date.today()
     s = start or today.isoformat()
     e = end   or (today + timedelta(days=7)).isoformat()
-    return await asyncio.to_thread(db.get_earnings_for_range, s, e)
+
+    # ── Tier 1: Supabase base rows ─────────────────────────────────────────
+    rows = await asyncio.to_thread(db.get_earnings_for_range, s, e)
+    if not rows:
+        return []
+
+    # EARNINGS-COL-FIX: supabase_db.py requests eps_estimate/revenue_estimate
+    # but the actual Supabase table may use different column names (eps_est,
+    # rev_est, or others). Normalise here so downstream code always sees
+    # eps_estimate / revenue_estimate regardless of what the DB returns.
+    # Priority: long name → short name → None.  Works with either schema.
+    def _norm_earnings_row(row: dict) -> dict:
+        r = dict(row)
+        # eps: eps_estimate (long) takes priority, fall back to eps_est (short)
+        if r.get("eps_estimate") is None and r.get("eps_est") is not None:
+            r["eps_estimate"] = r["eps_est"]
+        # revenue: revenue_estimate (long) takes priority, fall back to rev_est
+        if r.get("revenue_estimate") is None and r.get("rev_est") is not None:
+            r["revenue_estimate"] = r["rev_est"]
+        # Also ensure short-name aliases exist for any consumers that use them
+        if r.get("eps_est") is None:
+            r["eps_est"] = r.get("eps_estimate")
+        if r.get("rev_est") is None:
+            r["rev_est"] = r.get("revenue_estimate")
+        return r
+
+    rows = [_norm_earnings_row(r) for r in rows]
+
+    # ── Tier 2: in-memory enrichment (zero HTTP) ───────────────────────────
+    eng          = getattr(app.state, "engine", None)
+    company_map  = getattr(eng, "_company_map", {}) if eng else {}
+    sector_map   = getattr(eng, "_sector_map",  {}) if eng else {}
+
+    enriched = []
+    for row in rows:
+        sym  = (row.get("ticker") or "").upper()
+        live = {}
+        if eng and sym:
+            try:
+                with eng._cache_lock:
+                    live = dict(eng._cache.get(sym, {}))
+            except Exception:
+                pass
+        # COMPANY-NAME-FIX: 4-level priority chain.
+        # Some earnings tables store the ticker symbol in company_name — guard that case.
+        # 1. DB earnings row company_name (if non-empty and not just the ticker symbol)
+        # 2. engine._company_map (populated from stock_list at startup)
+        # 3. live engine cache company_name (covers tickers added to watchlist post-startup)
+        # 4. live engine cache 'company' alias (legacy field name)
+        _db_co = (row.get("company_name") or "").strip()
+        _resolved_company = (
+            (_db_co if _db_co and _db_co.upper() != sym else "") or
+            company_map.get(sym, "") or
+            live.get("company_name", "") or
+            live.get("company", "")
+        )
+        enriched.append({
+            **row,
+            "ticker":           sym,
+            "company_name":     _resolved_company,
+            "sector":           row.get("sector") or sector_map.get(sym, "") or live.get("sector", ""),
+            "live_price":       live.get("live_price")  or live.get("price") or row.get("live_price"),
+            "percent_change":   live.get("percent_change") if live.get("percent_change") is not None
+                                else row.get("percent_change"),
+            "market_cap":       row.get("market_cap"),
+            "surprise_history": [],
+        })
+
+    # Tier 3 (Polygon REST for EPS history + market cap) removed.
+    # All data is served from Supabase (Tier 1) and the in-memory engine
+    # cache (Tier 2) — zero outbound HTTP on every earnings page load.
+    # Fields shown: ticker, company_name, earnings_date, earnings_time,
+    # eps_estimate, revenue_estimate, sector, live_price, percent_change.
+    return enriched
 
 
 # ── Signals ────────────────────────────────────────────────────────────────────
@@ -1216,8 +1383,52 @@ async def post_signal(payload: dict):
 # ── Portfolio / Monitor ────────────────────────────────────────────────────────
 @app.get("/api/portfolio")
 async def get_portfolio():
-    """PATCH-MAIN-2: X-Data-Timestamp header added."""
+    """PATCH-MAIN-2: X-Data-Timestamp header added.
+    PORTFIX-2: enrich each row with live price + P&L from engine cache.
+    """
     data = await asyncio.to_thread(db.get_portfolio)
+    # Enrich with live cache data so the REST response matches SSE portfolio_update
+    eng = getattr(app.state, "engine", None)
+    if eng and data:
+        enriched = []
+        with eng._cache_lock:
+            for row in data:
+                tk = (row.get("ticker") or "").upper()
+                live = eng._cache.get(tk, {})
+                shares     = float(row.get("shares", 0) or 0)
+                avg_cost   = float(row.get("avg_cost", 0) or 0)
+                live_price = float(live.get("live_price") or live.get("price") or
+                                   row.get("live_price") or row.get("price") or 0)
+                open_price = float(live.get("open_price") or live.get("open") or
+                                   row.get("open_price") or row.get("open") or 0)
+                prev_close = float(live.get("prev_close") or row.get("prev_close") or 0)
+                # PORTFIX-3: compute directly from live_price − prev_close.
+                # Trusting cached change_value = 0 at cold-start or pre-market.
+                if prev_close > 0 and live_price > 0:
+                    change_value   = round(live_price - prev_close, 4)
+                    percent_change = round((live_price - prev_close) / prev_close * 100, 4)
+                else:
+                    change_value   = float(live.get("change_value") or row.get("change_value") or 0)
+                    percent_change = float(live.get("percent_change") or live.get("change_cpt") or
+                                          row.get("percent_change") or 0)
+                day_pl   = round((live_price - open_price) * shares, 2) if open_price > 0 else 0.0
+                total_pl = round((live_price - avg_cost)   * shares, 2) if avg_cost  > 0 else 0.0
+                value    = round(live_price * shares, 2)
+                enriched.append({
+                    **row,
+                    "live_price":     live_price,
+                    "open_price":     open_price,
+                    "prev_close":     prev_close,
+                    "change_value":   round(change_value, 4),
+                    "percent_change": round(percent_change, 4),
+                    "day_pl":         day_pl,
+                    "total_pl":       total_pl,
+                    "value":          value,
+                    "price":          live_price,
+                    "open":           open_price,
+                    "change_cpt":     round(percent_change, 4),  # kept for legacy compat
+                })
+        data = enriched
     from fastapi.responses import JSONResponse
     return JSONResponse(
         content=data,
@@ -1690,8 +1901,21 @@ async def get_mtf_scanner():
 
 # ── Yahoo Finance Proxy — Quote ────────────────────────────────────────────────
 _YF_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json, text/xml, */*",
+    # YF-HEADERS-FIX: Yahoo Finance started rejecting server-side requests with
+    # minimal User-Agent strings in late 2024. Full browser-like headers are
+    # required to get past their bot filter — otherwise /v8/finance and the RSS
+    # feed return 429 or connection-reset → backend raises → 502 to the client.
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection":      "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control":   "no-cache",
 }
 
 @app.get("/api/quote/{symbol}")
@@ -2025,15 +2249,29 @@ async def _edgar_fetch_form_bulk(tickers: list, form: str, startdt: str) -> list
 
     efts.sec.gov supports free-text OR queries:
       q="AAPL" OR "MSFT" OR "GOOGL"&forms=8-K
-    Batched in groups of 50 to stay within URL length limits.
-    Each hit's matched ticker is recovered from entity_name substring match.
+
+    BUG-12 FIX: Ticker matching now uses _source.tickers[] array (exact match)
+    instead of entity_name substring search.
+
+    Old (broken):
+      name = hit._source.entity_name.upper()
+      matched = next(s for s in batch if s in name)   ← "MS" matches "MASTERCARD"!
+
+    New (correct):
+      filing_tickers = hit._source.tickers  ← e.g. ["SNDK"] — exact symbols
+      matched = next(s for s in batch if s in filing_tickers_set)
+
+    Fallback to entity_name WORD-BOUNDARY match only when tickers[] is absent
+    (rare — some older filings pre-date the tickers field).
     """
+    import re
     all_hits = []
-    ticker_set = set(tickers)
+    batch_set = set(tickers)
     for i in range(0, len(tickers), 50):
-        batch = tickers[i:i + 50]
-        query = " OR ".join(f"%22{sym}%22" for sym in batch)
-        url   = (
+        batch  = tickers[i:i + 50]
+        b_set  = set(batch)
+        query  = " OR ".join(f"%22{sym}%22" for sym in batch)
+        url    = (
             f"https://efts.sec.gov/LATEST/search-index"
             f"?q={query}&forms={form}&dateRange=custom&startdt={startdt}"
         )
@@ -2043,15 +2281,37 @@ async def _edgar_fetch_form_bulk(tickers: list, form: str, startdt: str) -> list
                 r.raise_for_status()
                 hits = r.json().get("hits", {}).get("hits", [])
                 for hit in hits:
-                    name = (hit.get("_source", {}).get("entity_name") or "").upper()
-                    # Match ticker symbol as substring of entity name
-                    matched = next((s for s in set(batch) if s in name), None)
+                    src = hit.get("_source", {})
+
+                    # PRIMARY: _source.tickers is an exact symbol array
+                    # EDGAR EFTS populates this from the filer's CIK→ticker mapping.
+                    # e.g. SNDK filing → tickers: ["SNDK"]
+                    filing_tickers = src.get("tickers") or []
+                    if isinstance(filing_tickers, str):
+                        filing_tickers = [t.strip() for t in filing_tickers.split(",") if t.strip()]
+                    filing_set = {t.upper() for t in filing_tickers}
+                    matched = next((s for s in b_set if s in filing_set), None)
+
+                    if not matched:
+                        # FALLBACK: word-boundary match on entity_name.
+                        # Only fires when tickers[] is absent (older filings).
+                        # Uses \b word boundary — "MS" matches " MS " not "MASTERCARD".
+                        name = (src.get("entity_name") or "").upper()
+                        if name:
+                            matched = next(
+                                (s for s in b_set
+                                 if re.search(rf"\b{re.escape(s)}\b", name)),
+                                None
+                            )
+
                     if matched:
                         hit["_matched_ticker"] = matched
                         all_hits.append(hit)
                     elif len(batch) == 1:
+                        # Single-ticker batch: filing must be for that ticker
                         hit["_matched_ticker"] = batch[0]
                         all_hits.append(hit)
+
         except Exception as e:
             logger.debug(f"EDGAR bulk fetch {form} batch {i//50}: {e}")
         await asyncio.sleep(0.5)

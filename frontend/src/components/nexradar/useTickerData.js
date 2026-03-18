@@ -5,28 +5,37 @@
 // Returns: { tickers, wsStatus, marketSession, notifications, unreadCount,
 //            clearNotifications, sseRef }
 //
-// HOP-3 FIXES APPLIED:
+// FIXES IN THIS VERSION:
 //
-//   HOP-3-A  requestAnimationFrame batching (replaces 1000ms setInterval flush)
-//            tick, tick_batch, snapshot_delta all write into tickerCacheRef and
-//            call scheduleFlush(). A single rAF callback flushes to React state
-//            at most once per frame (~16ms). Zero renders during idle periods.
-//            Also adds snapshot_delta handler — ws_engine FIX-2 sends only the
-//            changed rows (200-400) instead of full 6200 on every 2s cycle.
+//   MARKET-OPEN-FIX: The market-open reset useEffect was calling
+//     sseRef.current.onopen / .onmessage / .onerror / .close() directly.
+//     These are EventSource methods — sseRef.current is a SharedWorker,
+//     which has none of them. The call silently failed (no error thrown),
+//     leaving the worker connected but React state cleared → blank dashboard
+//     with no recovery path.
+//     Fix: send { type:'clear_cache' } message to the worker instead.
+//     The worker clears its cache and forces a fresh SSE reconnect so the
+//     backend sends a new snapshot with the session's data.
 //
-//   HOP-3-B  feed_status + session_change SSE event handlers
-//            feed_status ok:false → wsStatus='connecting' (Polygon WS dropped)
-//            feed_status ok:true  → wsStatus='connected'  (Polygon WS restored)
-//            session_change       → setMarketSession() instantly on boundary,
-//            no longer waiting for the 30s clock-tick interval.
+//   MIDNIGHT-RESET-FIX: scheduleMidnight() in the SSE useEffect also wiped
+//     tickers and called fetchSnapshot() — but fetchSnapshot() only works on
+//     the direct EventSource fallback path. On the SharedWorker path it
+//     fetches from /api/snapshot and applies to tickerCacheRef directly, which
+//     is correct and kept. The worker also receives clear_cache so its own
+//     cache is flushed in sync.
 //
-//   HOP-3-C  client_ts reconnect handshake
-//            lastSnapTs tracks the ts field of the last received snapshot.
-//            On reconnect, ?client_ts=lastSnapTs is appended to the SSE URL.
-//            Backend skips the full 3 MB snapshot if client data is <10s old —
-//            eliminates the blast on tab switches and short network hiccups.
+//   FEED-WARNING-DEBOUNCE: feed_status {ok:false} fires on every SSE reconnect
+//     bounce. Without debounce, users saw the red "Polygon data feed silent"
+//     banner on almost every page load for 1-3s (false alarm — Polygon WS
+//     reconnects that quickly). Now waits 5 seconds before escalating to
+//     feed_warning, and immediately cancels if feed_status {ok:true} arrives.
+//
+//   HOP-3 FIXES (unchanged from prior version):
+//   HOP-3-A  rAF batching replaces 1000ms setInterval flush.
+//   HOP-3-B  feed_status + session_change handlers.
+//   HOP-3-C  client_ts reconnect handshake.
 
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { API_BASE } from "../../config.js";
 import { getMarketSession } from "./utils.js";
 import { normalizeTicker } from "./normalizer.js";
@@ -48,11 +57,8 @@ export function useTickerData() {
   const tickerCacheRef      = useRef(new Map());
   const tickerCacheDirtyRef = useRef(false);
   // BLUR-FIX: tracks client-side receive time per ticker (Date.now() at SSE arrival).
-  // Intentionally separate from row.ts (server epoch at REST fetch time) — row.ts
-  // is stale by definition on delivery so using it for blur caused the entire table
-  // to blur ~6s after every page load / snapshot fetch, even with a healthy feed.
   const tickerReceivedTsRef = useRef(new Map());
-  // TICKER-MAP: {symbol: intId} — stored for future flat-array decoding
+  // TICKER-MAP: {symbol: intId} — stored for flat-array decoding
   const tickerMapRef        = useRef({});
   const lastSessionRef      = useRef(getMarketSession());
   const sseRef              = useRef(null);
@@ -60,13 +66,14 @@ export function useTickerData() {
   const notifRef            = useRef([]);
   const notifCooldownRef    = useRef({});
 
+  // FEED-WARNING-DEBOUNCE: timer ref — prevents false alarm banner on brief bounces
+  const feedWarningTimerRef = useRef(null);
+
   // HOP-3-A: rAF ref — one pending flush per animation frame (~16ms).
-  // Replaces the 1000ms setInterval: renders fire only when data actually
-  // changed, at most once per frame. Zero renders during idle/AH/pre-market.
   const rafRef = useRef(null);
 
   const scheduleFlush = useCallback(() => {
-    if (rafRef.current) return; // already queued for this frame
+    if (rafRef.current) return;
     rafRef.current = requestAnimationFrame(() => {
       rafRef.current = null;
       if (!tickerCacheDirtyRef.current) return;
@@ -115,6 +122,11 @@ export function useTickerData() {
   }, []);
 
   // ── Market-open heartbeat ─────────────────────────────────────────────────
+  // MARKET-OPEN-FIX: no longer touches sseRef.current directly.
+  // Previously called .onopen=null / .close() which only work on EventSource,
+  // not SharedWorker — silently failed, left UI blank with no recovery.
+  // Now sends { type:'clear_cache' } to the worker, which flears its cache
+  // and forces a fresh SSE reconnect → backend sends new session snapshot.
   useEffect(() => {
     const schedule = () => {
       const now   = new Date();
@@ -126,15 +138,23 @@ export function useTickerData() {
       console.log(`[NexRadar] Market open reset in ${(msUntil/3_600_000).toFixed(2)}h`);
       return setTimeout(() => {
         console.log("[NexRadar] 🔔 Market Open — flushing stale session data");
-        if (sseRef.current) {
-          sseRef.current.onopen    = null;
-          sseRef.current.onmessage = null;
-          sseRef.current.onerror   = null;
-          sseRef.current.close();
+        // MARKET-OPEN-FIX: signal the worker to clear its cache.
+        // Worker handles this by clearing state.cache and reconnecting SSE.
+        const sse = sseRef.current;
+        if (sse && typeof sse.port?.postMessage === 'function') {
+          // SharedWorker path
+          sse.port.postMessage({ type: 'clear_cache' });
+        } else if (sse && typeof sse.close === 'function') {
+          // Direct EventSource fallback path — close and reconnect is handled
+          // by the onerror handler in connectDirect()
+          sse.close();
           sseRef.current = null;
         }
+        // Clear React-side cache too
+        tickerCacheRef.current      = new Map();
+        tickerCacheDirtyRef.current = true;
+        tickerReceivedTsRef.current = new Map();
         setTickers(new Map());
-        tickerReceivedTsRef.current = new Map(); // BLUR-FIX: reset receive timestamps on session change
         schedule();
       }, msUntil);
     };
@@ -145,185 +165,200 @@ export function useTickerData() {
 
   // ── SSE connection via SharedWorker (tab-switch & refresh safe) ───────────
   //
-  // SharedWorker path (all modern browsers except Safari <16 / FF private):
-  //   - worker holds ONE EventSource for the entire browser session
-  //   - tab mounts → port.postMessage('get_snapshot') → worker replies from
-  //     in-memory cache instantly — zero network call on refresh/tab-switch
-  //   - live SSE messages fan out from worker to all tab ports as pre-parsed
-  //     objects (JSON.parse runs in worker thread, not main thread)
-  //
-  // Direct EventSource fallback (Safari <16, Firefox private browsing):
-  //   - original prod behaviour preserved exactly
-  //   - client_ts passed on reconnect so backend skips snapshot when fresh
-  //
+  // T2-8: Service Worker registration (production only).
   useEffect(() => {
-    const SSE_URL      = API_BASE + '/api/stream'
-    const SNAPSHOT_URL = API_BASE + '/api/snapshot'
+    if (!import.meta.env.PROD) return;
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker
+        .register('/service-worker.js', { scope: '/' })
+        .then(reg => console.log('[NexRadar] Service Worker registered:', reg.scope))
+        .catch(err => console.debug('[NexRadar] Service Worker registration skipped:', err.message));
+    }
+  }, []);
 
-    // SharedWorker detection — typeof alone is insufficient on some mobile
-    // browsers (iOS Chrome, some Android WebViews) where the global exists
-    // in typeof but the constructor throws ReferenceError when called.
-    // Test by actually referencing the constructor inside try/catch.
+  // ── Main SSE / SharedWorker connection effect ─────────────────────────────
+  useEffect(() => {
+    const SSE_URL      = API_BASE + '/api/stream';
+    const SNAPSHOT_URL = API_BASE + '/api/snapshot';
+
     const supportsSharedWorker = (() => {
       try { return typeof SharedWorker !== 'undefined' && !!SharedWorker; }
       catch { return false; }
-    })()
+    })();
 
-    let cancelled     = false
-    let worker        = null   // SharedWorker instance
-    let source        = null   // fallback direct EventSource
-    let watchdogTimer = null
-    let lastSnapTs    = 0      // fallback path only — worker owns this for SharedWorker path
-    const WATCHDOG_MS = 20_000
+    let cancelled     = false;
+    let worker        = null;   // SharedWorker instance
+    let source        = null;   // fallback direct EventSource
+    let watchdogTimer = null;
+    let lastSnapTs    = 0;      // fallback path only
+    const WATCHDOG_MS = 20_000;
 
     const resetWatchdog = () => {
-      if (watchdogTimer) clearTimeout(watchdogTimer)
+      if (watchdogTimer) clearTimeout(watchdogTimer);
       watchdogTimer = setTimeout(() => {
-        if (cancelled) return
-        console.warn('[NexRadar] SSE silent for 20s — reconnecting')
-        if (source) { source.onopen=null; source.onmessage=null; source.onerror=null; source.close(); source=null }
-        connectDirect()
-      }, WATCHDOG_MS)
-    }
+        if (cancelled) return;
+        console.warn('[NexRadar] SSE silent for 20s — reconnecting');
+        if (source) { source.onopen=null; source.onmessage=null; source.onerror=null; source.close(); source=null; }
+        connectDirect();
+      }, WATCHDOG_MS);
+    };
 
-    const fetchSnapshot = async () => {
-      try {
-        const res  = await fetch(SNAPSHOT_URL)
-        if (!res.ok) return
-        const data = await res.json()
-        const rows = data.data ?? data ?? []
-        if (!Array.isArray(rows)) return
-        const m = new Map()
-        for (const row of rows) m.set(row.ticker, normalizeTicker(row))
-        tickerCacheRef.current      = m
-        tickerCacheDirtyRef.current = false
-        // BLUR-FIX: stamp client receive time so blur check uses fresh baseline
-        const _rt0 = Date.now()
-        m.forEach((_, tk) => tickerReceivedTsRef.current.set(tk, _rt0))
-        setTickers(new Map(m))
-      } catch (err) {
-        console.warn('[NexRadar] Snapshot fetch failed:', err)
+    const fetchSnapshot = async (retries = 4, delayMs = 2000) => {
+      for (let attempt = 0; attempt < retries; attempt++) {
+        try {
+          const res  = await fetch(SNAPSHOT_URL);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          const rows = data.data ?? data ?? [];
+          if (!Array.isArray(rows) || rows.length === 0) {
+            if (attempt < retries - 1) {
+              console.info(`[NexRadar] Snapshot empty (attempt ${attempt + 1}/${retries}) — retrying in ${delayMs}ms`);
+              await new Promise(r => setTimeout(r, delayMs));
+              continue;
+            }
+            return;
+          }
+          const m = new Map();
+          for (const row of rows) m.set(row.ticker, normalizeTicker(row));
+          tickerCacheRef.current      = m;
+          tickerCacheDirtyRef.current = false;
+          const _rt0 = Date.now();
+          m.forEach((_, tk) => tickerReceivedTsRef.current.set(tk, _rt0));
+          setTickers(new Map(m));
+          return;
+        } catch (err) {
+          if (attempt < retries - 1) {
+            console.warn(`[NexRadar] Snapshot fetch error (attempt ${attempt + 1}/${retries}):`, err.message);
+            await new Promise(r => setTimeout(r, delayMs));
+          } else {
+            console.warn('[NexRadar] Snapshot fetch failed after all retries:', err);
+          }
+        }
       }
-    }
+    };
 
     // ── Shared message handler ─────────────────────────────────────────────
-    // Used by both the SharedWorker port and the direct EventSource path.
-    // Worker sends pre-parsed objects; direct path parses inline before calling.
     const handleMsg = (msg) => {
-      if (cancelled) return
+      if (cancelled) return;
 
-      if (msg.type === 'keepalive') return
-      if (msg.type === 'control')   return
-      // watchlist_update handled by useWatchlist which also listens on sseRef
-      if (msg.type === 'watchlist_update') return
+      if (msg.type === 'keepalive') return;
+      if (msg.type === 'control')   return;
+      if (msg.type === 'loading')   return;  // worker ack: cache empty, REST fetch triggered
+      if (msg.type === 'watchlist_update') return;  // handled by useWatchlist
 
       if (msg.type === 'reconnected') {
-        setWsStatus('connected')
-        return
+        setWsStatus('connected');
+        return;
       }
 
-      // feed_status — Polygon WS up/down (ws_engine FIX-5)
       if (msg.type === 'feed_warning') {
-        setWsStatus(msg.ok ? 'connected' : 'feed_warning')
-        return
+        setWsStatus(msg.ok ? 'connected' : 'feed_warning');
+        return;
       }
 
       if (msg.type === 'feed_status') {
-        setWsStatus(msg.ok ? 'connected' : 'connecting')
-        return
+        if (msg.ok) {
+          // Clear any pending debounce — feed is back up
+          if (feedWarningTimerRef.current) {
+            clearTimeout(feedWarningTimerRef.current);
+            feedWarningTimerRef.current = null;
+          }
+          setWsStatus('connected');
+        } else {
+          // FEED-WARNING-DEBOUNCE: Polygon WS reconnects in <3s on normal bounces.
+          // Wait 5s before showing the warning banner — eliminates false alarms
+          // on every page load / tab switch that triggers an SSE reconnect cycle.
+          if (feedWarningTimerRef.current) return; // already counting
+          feedWarningTimerRef.current = setTimeout(() => {
+            feedWarningTimerRef.current = null;
+            if (!cancelled) {
+              setWsStatus(tickerCacheRef.current.size > 0 ? 'feed_warning' : 'connecting');
+            }
+          }, 5_000);
+        }
+        return;
       }
 
-      // session_change — AH/MH boundary instantly (ws_engine FIX-3)
-      // No longer waiting for the 30s clock-tick interval
       if (msg.type === 'session_change') {
-        const s = msg.session
-        if (s === 'market' || s === 'after' || s === 'pre') setMarketSession(s)
-        return
+        const s = msg.session;
+        if (s === 'market' || s === 'after' || s === 'pre') setMarketSession(s);
+        return;
       }
 
-      // Full snapshot — sent on true first connect, stale reconnect, or get_snapshot reply
       if (msg.type === 'snapshot') {
-        lastSnapTs = msg.ts ?? Date.now()   // track for fallback path client_ts
-        const m = new Map()
-        for (const row of msg.data ?? []) m.set(row.ticker, normalizeTicker(row))
-        tickerCacheRef.current      = m
-        tickerCacheDirtyRef.current = false
-        // BLUR-FIX: stamp client receive time for every ticker in snapshot
-        const _rt1 = Date.now()
-        m.forEach((_, tk) => tickerReceivedTsRef.current.set(tk, _rt1))
-        setTickers(new Map(m))
-        setWsStatus('connected')
-        return
+        const rows = msg.data ?? [];
+        // EMPTY-SNAPSHOT-FIX: don't wipe valid cache with an empty snapshot
+        if (rows.length === 0 && tickerCacheRef.current.size > 0) return;
+        lastSnapTs = msg.ts ?? Date.now();
+        const m = new Map();
+        for (const row of rows) m.set(row.ticker, normalizeTicker(row));
+        tickerCacheRef.current      = m;
+        tickerCacheDirtyRef.current = false;
+        const _rt1 = Date.now();
+        m.forEach((_, tk) => tickerReceivedTsRef.current.set(tk, _rt1));
+        setTickers(new Map(m));
+        setWsStatus('connected');
+        return;
       }
 
-      // snapshot_delta — ws_engine FIX-2: only changed rows (200-400 not 6200)
       if (msg.type === 'snapshot_delta') {
-        lastSnapTs = msg.ts ?? Date.now()
-        const cache = tickerCacheRef.current
-        const _rt2  = Date.now()
+        lastSnapTs = msg.ts ?? Date.now();
+        const cache = tickerCacheRef.current;
+        const _rt2  = Date.now();
         for (const row of msg.data ?? []) {
           if (row?.ticker) {
-            cache.set(row.ticker, normalizeTicker(row))
-            tickerReceivedTsRef.current.set(row.ticker, _rt2)  // BLUR-FIX
+            cache.set(row.ticker, normalizeTicker(row));
+            tickerReceivedTsRef.current.set(row.ticker, _rt2);
           }
         }
-        tickerCacheDirtyRef.current = true
-        scheduleFlush()
-        // RECONNECTING-FIX: after GAP-4b the first worker message is often
-        // snapshot_delta not snapshot — set connected so banner clears
-        setWsStatus('connected')
-        return
+        tickerCacheDirtyRef.current = true;
+        scheduleFlush();
+        return;
       }
 
       if (msg.type === 'tick') {
-        tickerCacheRef.current.set(msg.ticker, normalizeTicker(msg.data))
-        tickerCacheDirtyRef.current = true
-        scheduleFlush()
-        // Live notifications
-        const row = msg.data
+        tickerCacheRef.current.set(msg.ticker, normalizeTicker(msg.data));
+        tickerCacheDirtyRef.current = true;
+        tickerReceivedTsRef.current.set(msg.ticker, Date.now());
+        scheduleFlush();
+        const row = msg.data;
         if (row?.volume_spike)
-          _pushNotif({ type:'vol',  icon:'📡', color:'#00d4ff', ticker:row.ticker, title:`${row.ticker} VOL SPIKE`,   sub:`${(row.rvol||row.volume_ratio||1).toFixed(1)}× avg` })
+          _pushNotif({ type:'vol',  icon:'📡', color:'#00d4ff', ticker:row.ticker, title:`${row.ticker} VOL SPIKE`,   sub:`${(row.rvol||row.volume_ratio||1).toFixed(1)}× avg` });
         if (row?.ah_momentum)
-          _pushNotif({ type:'ah',   icon:'🌙', color:'#b388ff', ticker:row.ticker, title:`${row.ticker} AH MOMENTUM`, sub:`${(row.percent_change||0).toFixed(2)}% AH` })
+          _pushNotif({ type:'ah',   icon:'🌙', color:'#b388ff', ticker:row.ticker, title:`${row.ticker} AH MOMENTUM`, sub:`${(row.percent_change||0).toFixed(2)}% AH` });
         if (row?.is_gap_play)
-          _pushNotif({ type:'gap',  icon:'📊', color:'#ffc400', ticker:row.ticker, title:`${row.ticker} GAP PLAY`,    sub:`${(row.gap_percent||0).toFixed(1)}% gap` })
-        return
+          _pushNotif({ type:'gap',  icon:'📊', color:'#ffc400', ticker:row.ticker, title:`${row.ticker} GAP PLAY`,    sub:`${(row.gap_percent||0).toFixed(1)}% gap` });
+        return;
       }
 
       if (msg.type === 'ticker_map') {
-        // Store int↔symbol map for future flat-array decoding (optimization #2)
-        tickerMapRef.current = msg.map ?? {}
-        return
+        tickerMapRef.current = msg.map ?? {};
+        return;
       }
 
       if (msg.type === 'tick_batch') {
-        const cache = tickerCacheRef.current
-        const _rt3  = Date.now()  // BLUR-FIX: one timestamp for whole batch
+        const cache = tickerCacheRef.current;
+        const _rt3  = Date.now();
         for (const row of msg.data ?? []) {
-          // MERGE-FIX: merge slim delta (7 fields) into existing full cache entry.
-          // tick_batch only carries: ticker, price, change_cpt, percent_change,
-          // volume, rvol, ts — NOT change_value, prev_close, open_price etc.
-          // Replacing with normalizeTicker(row) wiped those fields every tick,
-          // causing change_value to show $0.00 in watchlist/portfolio while
-          // percent_change was correct (it IS in the delta).
-          const existing = cache.get(row.ticker)
+          // MERGE-FIX: merge slim delta into existing full cache entry.
+          // tick_batch only carries 7 fields — don't wipe change_value/prev_close/open_price.
+          const existing = cache.get(row.ticker);
           const merged   = existing
             ? normalizeTicker({ ...existing, ...row })
-            : normalizeTicker(row)
-          cache.set(row.ticker, merged)
-          tickerReceivedTsRef.current.set(row.ticker, _rt3)  // BLUR-FIX
+            : normalizeTicker(row);
+          cache.set(row.ticker, merged);
+          tickerReceivedTsRef.current.set(row.ticker, _rt3);
         }
-        tickerCacheDirtyRef.current = true
-        scheduleFlush()
-        // RECONNECTING-FIX: tick_batch = feed is live — clear banner
-        setWsStatus('connected')
-        return
+        tickerCacheDirtyRef.current = true;
+        scheduleFlush();
+        return;
       }
 
       if (msg.type === 'alert') {
-        window.dispatchEvent(new CustomEvent('nexradar_alert', { detail: msg.data }))
+        const detail = { ts: Date.now(), ...msg.data };
+        window.dispatchEvent(new CustomEvent('nexradar_alert', { detail }));
         if (msg.data) {
-          const a = msg.data
+          const a = msg.data;
           _pushNotif({
             type:   a.type,
             icon:   a.emoji,
@@ -335,16 +370,13 @@ export function useTickerData() {
             ticker: a.ticker,
             title:  a.title,
             sub:    a.message,
-          })
+          });
         }
-        return
+        return;
       }
 
       if (msg.type === 'halt_alert') {
-        // Dispatch to window so PageLiveTable / any subscriber can react
-        window.dispatchEvent(new CustomEvent('nexradar_halt', { detail: msg }))
-        // BUG-12 FIX: prefix 'luld_' so cooldown key never collides with
-        // a ticker literally named 'HALT' or 'RESUME'
+        window.dispatchEvent(new CustomEvent('nexradar_halt', { detail: msg }));
         _pushNotif(msg.is_halted ? {
           type:   'luld_halt',
           icon:   '⛔',
@@ -359,159 +391,201 @@ export function useTickerData() {
           ticker: msg.ticker,
           title:  `${msg.ticker} TRADING RESUMED`,
           sub:    'LULD halt lifted — trading active',
-        })
-        return
+        });
+        return;
       }
 
       if (msg.type === 'noi_update') {
-        // Dispatch for NOI imbalance meter (informational, no bell notification)
-        window.dispatchEvent(new CustomEvent('nexradar_noi', { detail: msg }))
-        return
+        window.dispatchEvent(new CustomEvent('nexradar_noi', { detail: msg }));
+        return;
       }
-    }
+
+      // ── Background poller alerts (news, edgar, earnings, fda) ──────────
+      if (msg.type === 'news_alert' || msg.type === 'edgar_alert' ||
+          msg.type === 'earnings_alert' || msg.type === 'fda_alert') {
+        const colorMap = {
+          green:  '#00e676',
+          red:    '#ff3d5a',
+          gold:   '#ffc400',
+          cyan:   '#00d4ff',
+          purple: '#b388ff',
+        };
+        const detail = {
+          type:    msg.type,
+          ticker:  msg.ticker || '',
+          title:   msg.title  || '',
+          sub:     msg.sub    || '',
+          icon:    msg.emoji  || (msg.type === 'news_alert' ? '📰' : msg.type === 'fda_alert' ? '💊' : '📋'),
+          color:   colorMap[msg.color] || '#00d4ff',
+          url:     msg.url    || '',
+          ts:      msg.ts ?? Date.now(),
+          emoji:   msg.emoji  || (msg.type === 'news_alert' ? '📰' : msg.type === 'fda_alert' ? '💊' : '📋'),
+          message: msg.sub    || msg.message || '',
+          signal:  msg.signal || '',
+          score:   msg.score  ?? null,
+        };
+        window.dispatchEvent(new CustomEvent('nexradar_alert', { detail }));
+        _pushNotif({
+          type:   msg.type,
+          icon:   detail.icon,
+          color:  detail.color,
+          ticker: detail.ticker,
+          title:  detail.title,
+          sub:    detail.sub,
+        });
+        return;
+      }
+    };
 
     // ── SharedWorker path ──────────────────────────────────────────────────
+    // SHAREDWORKER-LIFETIME-FIX: _mainHandler hoisted to useEffect scope
+    // so the cleanup return block can call removeEventListener without
+    // closing the port (which would terminate the SharedWorker).
+    let _mainHandler = null;
+
     const connectWorker = () => {
-      // Wrap constructor in try/catch — on some mobile browsers (iOS Chrome,
-      // Android WebView, Firefox private) SharedWorker passes the typeof check
-      // but throws ReferenceError or SecurityError on construction.
-      // worker.onerror only catches async errors, not constructor throws.
       try {
-        worker = new SharedWorker('/sseWorker.js', { name: 'nexradar-sse' })
+        worker = new SharedWorker('/sseWorker.js', { name: 'nexradar-sse' });
       } catch (constructErr) {
-        console.warn('[NexRadar] SharedWorker() constructor threw — falling back to direct SSE:', constructErr)
-        connectDirect()
-        return
+        console.warn('[NexRadar] SharedWorker() constructor threw — falling back to direct SSE:', constructErr);
+        connectDirect();
+        return;
       }
 
-      // sseRef exposed so useWatchlist / PageSignals / PagePortfolio can
-      // attach their own port.onmessage listeners to the same worker
-      sseRef.current = worker
+      sseRef.current = worker;
 
-      worker.port.onmessage = (e) => handleMsg(e.data)
+      _mainHandler = (e) => handleMsg(e.data);
+      worker.port.addEventListener('message', _mainHandler);
 
       worker.port.onmessageerror = (e) =>
-        console.warn('[NexRadar] Worker message error:', e)
+        console.warn('[NexRadar] Worker message error:', e);
 
       worker.onerror = (e) => {
-        console.error('[NexRadar] SharedWorker failed — falling back to direct SSE:', e)
-        worker        = null
-        sseRef.current = null
-        connectDirect()
-      }
+        console.error('[NexRadar] SharedWorker failed — falling back to direct SSE:', e);
+        worker.port.removeEventListener('message', _mainHandler);
+        worker         = null;
+        sseRef.current = null;
+        connectDirect();
+      };
 
-      // CRITICAL: send API_BASE first so the worker can build an absolute URL.
-      // Without this the worker has no URL, never opens EventSource, stays pending.
-      // Must be sent BEFORE get_snapshot so the connection is open when cache is requested.
-      worker.port.postMessage({ type: 'set_api_base', base: API_BASE })
-      worker.port.postMessage('get_snapshot')
-      worker.port.start()
-    }
+      // Send API_BASE FIRST so worker can open absolute EventSource URL.
+      // Then request snapshot — worker replies from cache or triggers REST fetch.
+      worker.port.postMessage({ type: 'set_api_base', base: API_BASE });
+      worker.port.postMessage('get_snapshot');
+      worker.port.start();
+    };
 
-    // ── Direct EventSource fallback ────────────────────────────────────────
+    // ── Direct EventSource fallback (Safari <16, Firefox private) ─────────
     const connectDirect = () => {
-      if (cancelled) return
-      fetchSnapshot()
-      // HOP-3-C: client_ts prevents 3MB snapshot blast on fresh reconnects
-      source = new EventSource(`${SSE_URL}?client_ts=${lastSnapTs}`)
-      sseRef.current = source
-      setWsStatus('connecting')
+      if (cancelled) return;
+      fetchSnapshot();
+      source = new EventSource(`${SSE_URL}?client_ts=${lastSnapTs}`);
+      sseRef.current = source;
+      setWsStatus('connecting');
       fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(8000) })
         .then(r => r.ok ? r.json() : null)
-        .then(h => { if (h?.warming_up) setWsStatus('warming_up') })
-        .catch(() => {})
-      source.onopen = () => {
-        setWsStatus('connected')
-        resetWatchdog()
-        fetchSnapshot()
-      }
+        .then(h => { if (h?.warming_up) setWsStatus('warming_up'); })
+        .catch(() => {});
 
-      let lastWatchdogReset = 0
+      source.onopen = () => {
+        setWsStatus('connected');
+        resetWatchdog();
+        fetchSnapshot();
+      };
+
+      let lastWatchdogReset = 0;
       source.onmessage = (event) => {
-        if (cancelled) return
-        const now = Date.now()
-        if (now - lastWatchdogReset > 1000) { resetWatchdog(); lastWatchdogReset = now }
-        try   { handleMsg(JSON.parse(event.data)) }
-        catch (err) { console.debug('[NexRadar] SSE parse error:', err) }
-      }
+        if (cancelled) return;
+        const now = Date.now();
+        if (now - lastWatchdogReset > 1000) { resetWatchdog(); lastWatchdogReset = now; }
+        try   { handleMsg(JSON.parse(event.data)); }
+        catch (err) { console.debug('[NexRadar] SSE parse error:', err); }
+      };
 
       source.onerror = () => {
-        setWsStatus('connecting')
+        setWsStatus('connecting');
         if (source.readyState === EventSource.CLOSED && !cancelled) {
-          console.log('[NexRadar] SSE closed — reconnecting …')
-          setTimeout(() => { if (!cancelled) connectDirect() }, 1500)
+          console.log('[NexRadar] SSE closed — reconnecting …');
+          setTimeout(() => { if (!cancelled) connectDirect(); }, 1500);
         }
-      }
-    }
+      };
+    };
 
     // ── Start ──────────────────────────────────────────────────────────────
     if (supportsSharedWorker) {
-      connectWorker()
+      connectWorker();
     } else {
-      console.info('[NexRadar] SharedWorker unavailable — using direct EventSource')
-      connectDirect()
+      console.info('[NexRadar] SharedWorker unavailable — using direct EventSource');
+      connectDirect();
     }
 
     // ── Midnight / market-open reset (ET 09:30) ────────────────────────────
-    // BUG-14 FIX: compute ET explicitly — never use browser local timezone.
+    // MIDNIGHT-RESET-FIX: on SharedWorker path, send clear_cache to worker
+    // instead of calling fetchSnapshot() alone (which only seeds React state,
+    // not the worker's in-memory cache — stale data would persist for other tabs).
     const scheduleMidnight = () => {
-      const nowUtc  = new Date()
-      const etNow   = new Date(nowUtc.toLocaleString('en-US', { timeZone: 'America/New_York' }))
-      const etNext  = new Date(etNow)
-      etNext.setHours(9, 30, 0, 0)
-      if (etNext <= etNow) etNext.setDate(etNext.getDate() + 1)
-      const etOffsetMs  = nowUtc.getTime() - etNow.getTime()
-      const fireAtUtcMs = etNext.getTime() + etOffsetMs
-      const msUntil     = fireAtUtcMs - nowUtc.getTime()
+      const nowUtc  = new Date();
+      const etNow   = new Date(nowUtc.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+      const etNext  = new Date(etNow);
+      etNext.setHours(9, 30, 0, 0);
+      if (etNext <= etNow) etNext.setDate(etNext.getDate() + 1);
+      const etOffsetMs  = nowUtc.getTime() - etNow.getTime();
+      const fireAtUtcMs = etNext.getTime() + etOffsetMs;
+      const msUntil     = fireAtUtcMs - nowUtc.getTime();
       midnightTimerRef.current = setTimeout(() => {
-        if (cancelled) return
-        tickerCacheRef.current      = new Map()
-        tickerCacheDirtyRef.current = true
-        tickerReceivedTsRef.current = new Map() // BLUR-FIX: reset receive timestamps at midnight
-        setTickers(new Map())
-        fetchSnapshot()
-        scheduleMidnight()
-      }, Math.max(msUntil, 1000))
-    }
-    scheduleMidnight()
+        if (cancelled) return;
+        // Clear React-side cache
+        tickerCacheRef.current      = new Map();
+        tickerCacheDirtyRef.current = true;
+        tickerReceivedTsRef.current = new Map();
+        setTickers(new Map());
+        // Tell worker to also clear its cache & reconnect
+        if (worker) {
+          worker.port.postMessage({ type: 'clear_cache' });
+        } else {
+          // Direct path: also fetch fresh snapshot
+          fetchSnapshot();
+        }
+        scheduleMidnight();
+      }, Math.max(msUntil, 1000));
+    };
+    scheduleMidnight();
 
-    // BLUR-FIX: stale ticker check every 3s — market hours only.
-    // Threshold = 6000ms: backend force-pushes every quiet ticker at 5000ms
-    // (secs_since_sent >= 5 gate in ws_engine._handle_tick), plus 250ms
-    // tick_batch flush + 750ms headroom = 6000ms safe blur boundary.
-    // Uses tickerReceivedTsRef (client receive time) NOT row.ts (server epoch).
-    // row.ts is set at Polygon REST fetch time — already several seconds old
-    // by the time SSE delivers it to the client, causing the entire table to
-    // blur ~6s after every page load even with a perfectly healthy feed.
-    // tickerReceivedTsRef is stamped at Date.now() on SSE arrival, so blur
-    // only fires when the client genuinely hasn't received a tick for 6s.
-    // During pre/AH/weekend Polygon sends no ticks — clear flags to avoid
-    // blurring the whole table off-hours.
+    // ── Stale ticker check every 3s (market hours only) ───────────────────
     staleCheckRef.current = setInterval(() => {
-      const session = getMarketSession()
+      const session = getMarketSession();
       if (session !== 'market') {
-        setStaleTickers(new Set())
-        return
+        setStaleTickers(new Set());
+        return;
       }
-      const now   = Date.now()
-      const stale = new Set()
+      const now   = Date.now();
+      const stale = new Set();
       tickerReceivedTsRef.current.forEach((receivedAt, ticker) => {
-        if ((now - receivedAt) > 6_000) stale.add(ticker)
-      })
-      setStaleTickers(stale)
-    }, 3_000)
+        if ((now - receivedAt) > 6_000) stale.add(ticker);
+      });
+      setStaleTickers(stale);
+    }, 3_000);
 
     return () => {
-      cancelled = true
-      if (rafRef.current)           cancelAnimationFrame(rafRef.current)
-      if (watchdogTimer)            clearTimeout(watchdogTimer)
-      if (staleCheckRef.current)    clearInterval(staleCheckRef.current)
-      if (midnightTimerRef.current) clearTimeout(midnightTimerRef.current)
-      if (worker)                   worker.port.close()
-      if (source) { source.onopen=null; source.onmessage=null; source.onerror=null; source.close() }
-      sseRef.current = null
-    }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+      cancelled = true;
+      if (rafRef.current)             cancelAnimationFrame(rafRef.current);
+      if (watchdogTimer)              clearTimeout(watchdogTimer);
+      if (feedWarningTimerRef.current){ clearTimeout(feedWarningTimerRef.current); feedWarningTimerRef.current = null; }
+      if (staleCheckRef.current)      clearInterval(staleCheckRef.current);
+      if (midnightTimerRef.current)   clearTimeout(midnightTimerRef.current);
+      // SHAREDWORKER-LIFETIME-FIX: do NOT call worker.port.close() here.
+      // Closing the port while the tab is still open disconnects the last
+      // port reference, which terminates the SharedWorker entirely — losing
+      // state.snapTs, state.cache, and the live EventSource connection.
+      // The next connect() then starts with client_ts=0 (full snapshot blast).
+      // SharedWorker ports close automatically when the tab closes; explicit
+      // port.close() in React cleanup is what causes the ~60s reconnect cycle.
+      // We only need to stop listening — removeEventListener handles that.
+      if (worker)  worker.port.removeEventListener('message', _mainHandler);
+      if (source) { source.onopen=null; source.onmessage=null; source.onerror=null; source.close(); }
+      sseRef.current = null;
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return { tickers, wsStatus, marketSession, sseRef, notifications, unreadCount, clearNotifications, staleTickers };
 }

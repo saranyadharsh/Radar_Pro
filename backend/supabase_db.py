@@ -77,6 +77,7 @@ def _paginate(
     table: str,
     select: str,
     filters: list = None,
+    reconnect_fn=None,
 ) -> List[Dict]:
     """
     Generic offset-paginated full-table fetch.
@@ -95,6 +96,14 @@ def _paginate(
     offset = 0
     while True:
         # PATCH-SDB-1: retry loop per page ────────────────────────────────────
+        # WIN10035-PAGINATE-FIX: _paginate was retrying with the same broken socket.
+        # On Windows with ProactorEventLoop, WinError 10035 (EWOULDBLOCK) means
+        # the underlying socket is broken and needs to be replaced — simply waiting
+        # and retrying the same client object fails again immediately.
+        # Fix: detect transient errors and recreate the client before retrying,
+        # matching the pattern already used in get_signal_watchlist.
+        PAGINATE_TRANSIENT = ("WinError", "10035", "SSL", "ConnectionError",
+                              "RemoteProtocolError", "forcibly closed", "Connection reset")
         page_data = None
         for attempt in range(MAX_READ_RETRIES):
             try:
@@ -104,12 +113,25 @@ def _paginate(
                 page_data = q.range(offset, offset + _PAGE - 1).execute().data or []
                 break  # success — exit retry loop
             except Exception as e:
+                err_str = str(e)
                 wait = RETRY_BACKOFF_BASE * (2 ** attempt)
                 if attempt < MAX_READ_RETRIES - 1:
                     logger.warning(
                         f"_paginate {table} offset={offset} attempt={attempt+1} "
                         f"failed ({e}) — retrying in {wait:.0f}s"
                     )
+                    # WIN10035-RECONNECT-FIX: on transient socket error use
+                    # reconnect_fn() so self.client on the SupabaseDB instance is
+                    # also updated — not just the local variable. Without this, the
+                    # next call on the same instance gets the same broken socket again.
+                    if any(x in err_str for x in PAGINATE_TRANSIENT):
+                        try:
+                            if reconnect_fn is not None:
+                                client = reconnect_fn()   # updates self.client too
+                            else:
+                                client = _get_client()    # fallback: local only
+                        except Exception:
+                            pass
                     time.sleep(wait)
                 else:
                     logger.error(
@@ -136,6 +158,20 @@ class SupabaseDB:
         self.client: Client = _get_client()
         logger.info("✅ SupabaseDB connected")
         self._live_ticker_cols: set = self._discover_live_ticker_cols()
+
+    def _reconnect(self) -> 'Client':
+        """
+        WIN10035-RECONNECT-FIX: Creates a fresh Supabase client, updates
+        self.client, and returns it. Passed as reconnect_fn to _paginate()
+        so that a transient socket error on ANY method updates the shared
+        instance client — preventing the next call from reusing a dead socket.
+        """
+        try:
+            self.client = _get_client()
+            logger.info("SupabaseDB: reconnected client after transient socket error")
+        except Exception as e:
+            logger.error(f"SupabaseDB._reconnect failed: {e}")
+        return self.client
 
     def _discover_live_ticker_cols(self) -> set:
         """
@@ -174,6 +210,7 @@ class SupabaseDB:
             "stock_list",
             "ticker, company_name, sector",
             [("eq", "is_active", 1)],
+            reconnect_fn=self._reconnect,
         )
         tickers:     List[str]      = []
         company_map: Dict[str, str] = {}
@@ -200,6 +237,7 @@ class SupabaseDB:
         rows = _paginate(
             self.client, "stock_list", "ticker",
             [("eq", "is_active", 1)],
+            reconnect_fn=self._reconnect,
         )
         result = [r["ticker"] for r in rows if r.get("ticker")]
         logger.info(f"get_all_tickers: {len(result)} tickers")
@@ -210,6 +248,7 @@ class SupabaseDB:
         rows = _paginate(
             self.client, "stock_list", "ticker, company_name",
             [("eq", "is_active", 1)],
+            reconnect_fn=self._reconnect,
         )
         return {r["ticker"]: r.get("company_name") or ""
                 for r in rows if r.get("ticker")}
@@ -219,6 +258,7 @@ class SupabaseDB:
         rows = _paginate(
             self.client, "stock_list", "ticker, sector",
             [("eq", "is_active", 1)],
+            reconnect_fn=self._reconnect,
         )
         return {r["ticker"]: r.get("sector") or "Unknown"
                 for r in rows if r.get("ticker")}
@@ -373,7 +413,10 @@ class SupabaseDB:
         Caller (ws_engine._fetch_history) decides which rows are stale enough
         to need a Polygon refresh (> STALE_THRESHOLD_S seconds old).
         """
-        rows = _paginate(self.client, "live_tickers", "*")
+        rows = _paginate(
+            self.client, "live_tickers", "*",
+            reconnect_fn=self._reconnect,
+        )
         logger.info(f"get_snapshot_cache: loaded {len(rows)} rows from live_tickers")
         return rows
 
@@ -406,16 +449,28 @@ class SupabaseDB:
     def get_earnings_for_range(self, start: str, end: str) -> List[Dict]:
         """
         FIX #9 — paginated; earnings weeks can exceed 1 000 rows in peak season.
+
+        BUG-13 FIX: Added eps_estimate, revenue_estimate, report_date, when to
+        SELECT so _earnings_alert_loop and PageEarnings both receive the fields
+        they expect. Previously these were missing → eps showed '—', T-1/T-0
+        proximity alert used earn_date='' and never matched correctly.
+
+        COL-FIX: Changed explicit column list to '*' because the Supabase table
+        uses different column names in different environments (eps_estimate vs
+        eps_est, revenue_estimate vs rev_est). Selecting '*' avoids a 400 Bad
+        Request from unknown column names. main.py _norm_earnings_row() remaps
+        whichever variant the DB returns into the standard names downstream expects.
         """
         rows = _paginate(
             self.client,
             "earnings",
-            "ticker, company_name, earnings_date, earnings_time",
+            "*",
             [
                 ("gte", "earnings_date", start),
                 ("lte", "earnings_date", end),
                 ("order", "earnings_date"),
             ],
+            reconnect_fn=self._reconnect,
         )
         return rows
 
@@ -423,7 +478,10 @@ class SupabaseDB:
 
     def get_monitor(self) -> List[Dict]:
         """FIX #9 — was single .execute() call, capped at 1 000 rows."""
-        rows = _paginate(self.client, "monitor", "*")
+        rows = _paginate(
+            self.client, "monitor", "*",
+            reconnect_fn=self._reconnect,
+        )
         logger.debug(f"get_monitor: {len(rows)} rows")
         return rows
 
@@ -437,7 +495,10 @@ class SupabaseDB:
         []) and logs logger.error. The caller (_portfolio_loop) checks for empty
         result and skips broadcast rather than pushing an empty portfolio.
         """
-        rows = _paginate(self.client, "portfolio", "*")
+        rows = _paginate(
+            self.client, "portfolio", "*",
+            reconnect_fn=self._reconnect,
+        )
         logger.debug(f"get_portfolio: {len(rows)} rows")
         return rows
 
@@ -450,18 +511,39 @@ class SupabaseDB:
     #   );
 
     def get_signal_watchlist(self) -> List[Dict]:
-        """Return all starred tickers: [{"ticker": "AAPL"}, ...]"""
-        try:
-            res = (
-                self.client.table("signal_watchlist")
-                .select("ticker")
-                .order("added_at", desc=False)
-                .execute()
-            )
-            return res.data or []
-        except Exception as e:
-            logger.error(f"get_signal_watchlist: {e}")
-            return []
+        """Return all starred tickers: [{"ticker": "AAPL"}, ...]
+
+        WIN10035-FIX: On Windows with ProactorEventLoop the Supabase sync
+        client occasionally raises WinError 10035 (EWOULDBLOCK) during the
+        startup burst when many coroutines call this simultaneously via
+        asyncio.to_thread(). Retry up to 3 times with a short back-off and
+        reconnect the client on the first transient failure.
+        """
+        TRANSIENT = ("WinError", "SSL", "ConnectionError", "RemoteProtocolError",
+                     "forcibly closed", "Connection reset", "BrokenPipe", "10035")
+        for attempt in range(3):
+            try:
+                res = (
+                    self.client.table("signal_watchlist")
+                    .select("ticker")
+                    .order("added_at", desc=False)
+                    .execute()
+                )
+                return res.data or []
+            except Exception as e:
+                err_str = str(e)
+                is_transient = any(x in err_str for x in TRANSIENT)
+                if attempt < 2 and is_transient:
+                    logger.warning(f"get_signal_watchlist transient error (attempt {attempt+1}/3): {e} — retrying")
+                    time.sleep(0.5 * (attempt + 1))  # 0.5s, 1.0s
+                    try:
+                        self._reconnect()  # WIN10035-RECONNECT-FIX: updates self.client
+                    except Exception:
+                        pass
+                else:
+                    logger.error(f"get_signal_watchlist: {e}")
+                    return []
+        return []
 
     def add_signal_watchlist(self, ticker: str) -> None:
         """Upsert a ticker into signal_watchlist (safe to call for duplicates)."""

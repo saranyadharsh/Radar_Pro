@@ -6,26 +6,21 @@
 //
 // PRODUCTION INTEGRATION NOTES:
 //   - Place at: src/components/engines/DataEngine.js
-//   - Requires env var: VITE_POLYGON_API_KEY
-//   - Add to frontend Render env vars alongside VITE_API_BASE
+//   - All Polygon calls route through backend proxy /api/stock-data/{sym}
+//   - NO VITE_POLYGON_API_KEY needed — key lives only on the Render server
+//   - Add VITE_API_BASE to frontend Render env vars (already set)
 // ═══════════════════════════════════════════════════════════════
 
-const POLYGON_KEY = import.meta.env.VITE_POLYGON_API_KEY || "";
-// Backend API base — used for stock-data proxy (no frontend Polygon key needed)
+// API-KEY-FIX + WS-FIX: POLYGON_KEY removed entirely.
+//   VITE_* env vars are baked into the JS bundle at build time by Vite.
+//   Anyone with DevTools can see the key in the network tab or bundle source.
+//   All Polygon data now routes exclusively through the backend proxy:
+//     /api/stock-data/{sym}  — snapshot + technicals + levels + options (5-min cache)
+//     /api/news/{sym}        — Polygon news (already proxied)
+//     /api/edgar/{sym}       — EDGAR EFTS (already proxied, CORS-blocked direct)
+//   The Polygon API key is only on the Render server as POLYGON_API_KEY (no VITE_ prefix).
 const API_BASE = import.meta.env.VITE_API_BASE || "";
-const POLYGON_BASE = "https://api.polygon.io";
-// EDGAR routed through backend proxy — efts.sec.gov blocks browser CORS
 
-async function polyGet(path, params = {}) {
-  const url = new URL(POLYGON_BASE + path);
-  url.searchParams.set("apiKey", POLYGON_KEY);
-  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
-  const res = await fetch(url.toString());
-  if (!res.ok) throw new Error(`Polygon ${res.status}: ${path}`);
-  return res.json();
-}
-
-const edgarCache = {};
 
 async function edgarGet(symbol) {
   // Proxy through backend — efts.sec.gov blocks direct browser requests (CORS)
@@ -33,115 +28,17 @@ async function edgarGet(symbol) {
     .then(r => { if (!r.ok) throw new Error(`EDGAR proxy ${r.status}`); return r.json(); });
 }
 
-export async function getSnapshot(symbol) {
-  try {
-    const data = await polyGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${symbol}`);
-    const t = data.ticker || {};
-    const d = t.day || {};
-    const prev = t.prevDay || {};
-    return {
-      symbol,
-      price:     t.lastTrade?.p || d.c || 0,
-      open:      d.o || 0,
-      high:      d.h || 0,
-      low:       d.l || 0,
-      close:     d.c || 0,
-      volume:    d.v || 0,
-      vwap:      d.vw || 0,
-      prevClose: prev.c || 0,
-      change:    t.todaysChange || 0,
-      changePct: t.todaysChangePerc || 0,
-      avgVolume: prev.v || 0,
-    };
-  } catch (e) {
-    console.warn("getSnapshot failed:", e.message);
-    return null;
-  }
-}
-
-export async function getTechnicals(symbol) {
-  try {
-    const [rsi, macd, sma20, sma50, sma200, ema9] = await Promise.all([
-      polyGet(`/v1/indicators/rsi/${symbol}`,  { timespan:"day", window:14,  series_type:"close", limit:1 }),
-      polyGet(`/v1/indicators/macd/${symbol}`, { timespan:"day", short_window:12, long_window:26, signal_window:9, series_type:"close", limit:1 }),
-      polyGet(`/v1/indicators/sma/${symbol}`,  { timespan:"day", window:20,  series_type:"close", limit:1 }),
-      polyGet(`/v1/indicators/sma/${symbol}`,  { timespan:"day", window:50,  series_type:"close", limit:1 }),
-      polyGet(`/v1/indicators/sma/${symbol}`,  { timespan:"day", window:200, series_type:"close", limit:1 }),
-      polyGet(`/v1/indicators/ema/${symbol}`,  { timespan:"day", window:9,   series_type:"close", limit:1 }),
-    ]);
-    return {
-      rsi14:      rsi?.results?.values?.[0]?.value,
-      macd:       macd?.results?.values?.[0]?.value,
-      macdSignal: macd?.results?.values?.[0]?.signal,
-      macdHist:   macd?.results?.values?.[0]?.histogram,
-      sma20:      sma20?.results?.values?.[0]?.value,
-      sma50:      sma50?.results?.values?.[0]?.value,
-      sma200:     sma200?.results?.values?.[0]?.value,
-      ema9:       ema9?.results?.values?.[0]?.value,
-    };
-  } catch (e) {
-    console.warn("getTechnicals failed:", e.message);
-    return {};
-  }
-}
-
-export async function getSupportResistance(symbol) {
-  try {
-    const to   = new Date().toISOString().slice(0, 10);
-    const from = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
-    const data = await polyGet(`/v2/aggs/ticker/${symbol}/range/1/day/${from}/${to}`,
-      { adjusted:"true", sort:"asc", limit:90 });
-    const bars = data.results || [];
-    if (!bars.length) return { support:null, resistance:null };
-    const highs = bars.map(b => b.h).sort((a, b) => b - a);
-    const lows  = bars.map(b => b.l).sort((a, b) => a - b);
-    const resistance = highs.slice(0, 5).reduce((a, b) => a + b, 0) / 5;
-    const support    = lows.slice(0, 5).reduce((a, b) => a + b, 0) / 5;
-    const atrs = bars.slice(-14).map((b, i, arr) => {
-      if (i === 0) return b.h - b.l;
-      const prev = arr[i - 1];
-      return Math.max(b.h - b.l, Math.abs(b.h - prev.c), Math.abs(b.l - prev.c));
-    });
-    const atr = atrs.reduce((a, b) => a + b, 0) / atrs.length;
-    return {
-      support:    Math.round(support * 100) / 100,
-      resistance: Math.round(resistance * 100) / 100,
-      atr:        Math.round(atr * 100) / 100,
-      bars,
-    };
-  } catch (e) {
-    console.warn("getSupportResistance failed:", e.message);
-    return { support:null, resistance:null, atr:null, bars:[] };
-  }
-}
-
-export async function getOptions(symbol) {
-  try {
-    const data = await polyGet(`/v3/snapshot/options/${symbol}`, { limit:50 });
-    const results = data.results || [];
-    const snap  = await getSnapshot(symbol);
-    const price = snap?.price || 0;
-    const atm   = results.filter(o => {
-      const strike = o.details?.strike_price || 0;
-      return Math.abs(strike - price) / price < 0.05;
-    });
-    const avgIV = atm.length
-      ? atm.reduce((a, b) => a + (b.greeks?.implied_volatility || 0), 0) / atm.length
-      : 0;
-    const impliedMove    = avgIV * Math.sqrt(1 / 365) * price;
-    const impliedMovePct = price > 0 ? (impliedMove / price) * 100 : 0;
-    return {
-      impliedMovePct:   Math.round(impliedMovePct * 100) / 100,
-      impliedMoveDollar: Math.round(impliedMove * 100) / 100,
-      avgIV:            Math.round(avgIV * 10000) / 100,
-      optionCount:      results.length,
-      raw:              results.slice(0, 10),
-    };
-  } catch (e) {
-    console.warn("getOptions failed:", e.message);
-    return { impliedMovePct:null, avgIV:null };
-  }
-}
+// API-KEY-FIX: getSnapshot, getTechnicals, getSupportResistance, getOptions,
+// getEarningsEstimate, getFundamentals previously called polyGet() directly,
+// sending VITE_POLYGON_API_KEY as a URL param visible to anyone in DevTools.
+// All data is now fetched exclusively via the backend proxy /api/stock-data/{sym}
+// which handles all 7 Polygon calls server-side with the key in env (no VITE_ prefix).
+// These individual exports are preserved as thin wrappers over getFullStockData
+// so any callers that import them individually continue to work.
+export async function getSnapshot(symbol)          { return (await getFullStockData(symbol)) || null; }
+export async function getTechnicals(symbol)        { const d = await getFullStockData(symbol); return { rsi14:d?.rsi14, macd:d?.macd, macdSignal:d?.macdSignal, macdHist:d?.macdHist, sma20:d?.sma20, sma50:d?.sma50, sma200:d?.sma200, ema9:d?.ema9 }; }
+export async function getSupportResistance(symbol) { const d = await getFullStockData(symbol); return { support:d?.support, resistance:d?.resistance, atr:d?.atr, bars:d?.bars||[] }; }
+export async function getOptions(symbol)           { const d = await getFullStockData(symbol); return { impliedMovePct:d?.impliedMovePct, avgIV:d?.avgIV }; }
 
 export async function getNews(symbol) {
   try {
@@ -164,169 +61,62 @@ export async function getNews(symbol) {
 }
 
 export async function getEarningsEstimate(symbol) {
-  try {
-    const data = await polyGet(`/v1/meta/symbols/${symbol}/earnings`, { limit:8 });
-    return (data.results || []).map(e => ({
-      quarter:       e.quarter,
-      year:          e.year,
-      epsEst:        e.eps?.estimate,
-      epsActual:     e.eps?.actual,
-      epsSurprise:   e.eps?.surprise,
-      surprisePct:   e.eps?.surprisePercent,
-      revenueEst:    e.revenue?.estimate,
-      revenueActual: e.revenue?.actual,
-    }));
-  } catch (e) {
-    console.warn("getEarningsEstimate failed:", e.message);
-    return [];
-  }
+  const d = await getFullStockData(symbol);
+  return d?.earningsHistory || [];
 }
 
 export async function getFundamentals(symbol) {
-  try {
-    const [details, financials] = await Promise.all([
-      polyGet(`/v3/reference/tickers/${symbol}`),
-      polyGet(`/vX/reference/financials`, {
-        ticker:symbol, limit:1, sort:"period_of_report_date", order:"desc"
-      }),
-    ]);
-    const d  = details.results || {};
-    const f  = financials.results?.[0]?.financials || {};
-    const is = f.income_statement || {};
-    const bs = f.balance_sheet || {};
-    return {
-      companyName:      d.name,
-      description:      d.description,
-      sector:           d.sic_description,
-      marketCap:        d.market_cap,
-      employees:        d.total_employees,
-      homepage:         d.homepage_url,
-      revenue:          is.revenues?.value,
-      netIncome:        is.net_income_loss?.value,
-      eps:              is.basic_earnings_per_share?.value,
-      totalAssets:      bs.assets?.value,
-      totalLiabilities: bs.liabilities?.value,
-    };
-  } catch (e) {
-    console.warn("getFundamentals failed:", e.message);
-    return {};
-  }
+  const d = await getFullStockData(symbol);
+  return {
+    companyName: d?.companyName, description: d?.description,
+    sector: d?.sector, marketCap: d?.marketCap, employees: d?.employees,
+    homepage: d?.homepage, revenue: d?.revenue, netIncome: d?.netIncome, eps: d?.eps,
+  };
 }
 
 export async function getFullStockData(symbol) {
-  // PRIMARY: use backend proxy /api/stock-data/{symbol}
-  // - Polygon key stays on server (no VITE_POLYGON_API_KEY needed)
-  // - Results cached 5min in stock_data_cache table
-  // - All 7 Polygon calls run in parallel server-side (~300ms)
+  // All Polygon data fetched via backend proxy — API key never leaves the server.
+  // /api/stock-data/{sym} runs all 7 Polygon calls in parallel server-side
+  // with a 5-min cache in Supabase (stock_data_cache table).
   try {
     const res = await fetch(`${API_BASE}/api/stock-data/${symbol.toUpperCase()}`);
     if (res.ok) {
       const data = await res.json();
       return { ...data, bars: data.bars || [] };
     }
+    throw new Error(`Backend proxy returned ${res.status}`);
   } catch (e) {
-    console.warn("getFullStockData backend proxy failed, falling back:", e.message);
+    console.warn("[DataEngine] getFullStockData failed:", e.message);
+    return null;
   }
-
-  // FALLBACK: direct Polygon calls if backend proxy unavailable
-  const [snapshot, technicals, levels, options, news, earnings, fundamentals] = await Promise.all([
-    getSnapshot(symbol),
-    getTechnicals(symbol),
-    getSupportResistance(symbol),
-    getOptions(symbol),
-    getNews(symbol),
-    getEarningsEstimate(symbol),
-    getFundamentals(symbol),
-  ]);
-  return {
-    symbol,
-    price:           snapshot?.price,
-    change:          snapshot?.change,
-    changePct:       snapshot?.changePct,
-    open:            snapshot?.open,
-    high:            snapshot?.high,
-    low:             snapshot?.low,
-    close:           snapshot?.close,
-    volume:          snapshot?.volume,
-    vwap:            snapshot?.vwap,
-    avgVolume:       snapshot?.avgVolume,
-    prevClose:       snapshot?.prevClose,
-    rsi14:           technicals?.rsi14,
-    macd:            technicals?.macd,
-    macdSignal:      technicals?.macdSignal,
-    macdHist:        technicals?.macdHist,
-    sma20:           technicals?.sma20,
-    sma50:           technicals?.sma50,
-    sma200:          technicals?.sma200,
-    ema9:            technicals?.ema9,
-    support:         levels?.support,
-    resistance:      levels?.resistance,
-    atr:             levels?.atr,
-    bars:            levels?.bars || [],
-    impliedMovePct:  options?.impliedMovePct,
-    avgIV:           options?.avgIV,
-    news:            news || [],
-    earningsHistory: earnings || [],
-    companyName:     fundamentals?.companyName,
-    description:     fundamentals?.description,
-    sector:          fundamentals?.sector,
-    marketCap:       fundamentals?.marketCap,
-    employees:       fundamentals?.employees,
-    revenue:         fundamentals?.revenue,
-    netIncome:       fundamentals?.netIncome,
-    eps:             fundamentals?.eps,
-  };
 }
 
 // ── WebSocket live price push ─────────────────────────────────
-let wsInstance  = null;
-const wsCallbacks = new Map();
+// WS-FIX: Direct client-side Polygon WebSocket is DISABLED.
+//
+// Why: ws_engine.py on the Render backend holds the ONE permanent
+// Polygon WS connection (Standard/Advanced tiers enforce a strict 1-connection
+// limit). Opening a second connection from the browser would trigger an endless
+// reconnect war — each side kicks the other off, dropping the live feed entirely.
+//
+// All live tick data flows through:
+//   backend Polygon WS → ws_engine.py cache → SSE broadcaster → useTickerData.js
+//
+// Callers that previously used connectWebSocket for live prices should instead
+// read from the `tickers` Map provided by useTickerData's SSE connection.
+// The SSE stream carries tick_batch, snapshot_delta, and snapshot messages
+// which already contain all the fields (price, open, high, low, volume, vwap).
 
 export function connectWebSocket(symbols, onPriceUpdate) {
-  symbols.forEach(sym => {
-    if (!wsCallbacks.has(sym)) wsCallbacks.set(sym, []);
-    wsCallbacks.get(sym).push(onPriceUpdate);
-  });
-  if (wsInstance && wsInstance.readyState === WebSocket.OPEN) {
-    wsInstance.send(JSON.stringify({
-      action:"subscribe",
-      params: symbols.map(s => `A.${s}`).join(","),
-    }));
-    return wsInstance;
-  }
-  wsInstance = new WebSocket("wss://socket.polygon.io/stocks");
-  wsInstance.onopen = () => {
-    wsInstance.send(JSON.stringify({ action:"auth", params:POLYGON_KEY }));
-  };
-  wsInstance.onmessage = (event) => {
-    const messages = JSON.parse(event.data);
-    messages.forEach(msg => {
-      if (msg.ev === "auth_success") {
-        wsInstance.send(JSON.stringify({
-          action:"subscribe",
-          params:[...wsCallbacks.keys()].map(s => `A.${s}`).join(","),
-        }));
-      }
-      if (msg.ev === "A") {
-        const update = { symbol:msg.sym, price:msg.c, open:msg.o,
-          high:msg.h, low:msg.l, volume:msg.av, vwap:msg.vw, timestamp:msg.e };
-        wsCallbacks.get(msg.sym)?.forEach(cb => cb(update));
-      }
-    });
-  };
-  wsInstance.onerror  = (e) => console.warn("DataEngine WS error:", e);
-  wsInstance.onclose  = () => {
-    setTimeout(() => {
-      if (wsCallbacks.size > 0) connectWebSocket([...wsCallbacks.keys()], onPriceUpdate);
-    }, 3000);
-  };
-  return wsInstance;
+  console.warn(
+    "[DataEngine] connectWebSocket() is disabled — direct Polygon WS would conflict " +
+    "with ws_engine.py's single backend connection. Use useTickerData SSE instead."
+  );
+  return null;
 }
 
 export function disconnectWebSocket() {
-  wsCallbacks.clear();
-  wsInstance?.close();
-  wsInstance = null;
+  // No-op — nothing to disconnect.
 }
 
 // ── EDGAR event detection ─────────────────────────────────────
@@ -383,22 +173,31 @@ export function startNewsPoll(symbols, onNewsAlert, intervalMs = 120000) {
       } catch {}
     }));
   };
+  // POLL-OVERLAP-FIX: inflight guard prevents overlapping fetches if a batch
+  // takes longer than intervalMs (e.g. backend outage, 429 rate limiting).
+  let inflight = false;
   const poll = async () => {
-    await Promise.all(symbols.map(async sym => {
-      try {
-        const items  = await getNews(sym);
-        if (!items?.length) return;
-        const latest = items[0];
-        const cached = newsCache[sym];
-        if (cached && latest.headline !== cached) {
-          newsCache[sym] = latest.headline;
-          onNewsAlert({ symbol:sym, headline:latest.headline, source:latest.source,
-            url:latest.url, published:latest.published,
-            sentiment:latest.sentiment, summary:latest.summary, isNew:true });
-        }
-        if (!cached) newsCache[sym] = latest.headline;
-      } catch {}
-    }));
+    if (inflight) return;
+    inflight = true;
+    try {
+      await Promise.all(symbols.map(async sym => {
+        try {
+          const items  = await getNews(sym);
+          if (!items?.length) return;
+          const latest = items[0];
+          const cached = newsCache[sym];
+          if (cached && latest.headline !== cached) {
+            newsCache[sym] = latest.headline;
+            onNewsAlert({ symbol:sym, headline:latest.headline, source:latest.source,
+              url:latest.url, published:latest.published,
+              sentiment:latest.sentiment, summary:latest.summary, isNew:true });
+          }
+          if (!cached) newsCache[sym] = latest.headline;
+        } catch {}
+      }));
+    } finally {
+      inflight = false;
+    }
   };
   seed().then(() => { newsPollers[pollerId] = setInterval(poll, intervalMs); });
   return pollerId;

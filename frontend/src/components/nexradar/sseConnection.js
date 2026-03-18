@@ -31,13 +31,24 @@ export const isSharedWorker = (x) =>
 //
 //   const cleanup = attachSSEListener(sseRef.current, payload => { ... });
 //   return cleanup; // in useEffect
+//
+// SHARED-WORKER-HIJACK-FIX: Previously used sse.port.onmessage = handler which
+// is a single-slot assignment. Multiple React callers chaining on the same port
+// would save/restore the previous handler on cleanup. If caller A unmounted
+// before B, A's cleanup restored .onmessage to null, wiping B's handler.
+//
+// Fix: use port.addEventListener('message', ...) — a multi-subscriber list where
+// each caller independently adds/removes its own handler with no chaining risk.
+// port.start() is already called in connectWorker so messages flow immediately.
+// The EventSource path was already safe (always used addEventListener).
 export function attachSSEListener(sse, onPayload) {
   if (!sse || typeof onPayload !== 'function') return () => {};
 
   if (isSharedWorker(sse)) {
-    const prev = sse.port.onmessage;
-    sse.port.onmessage = (e) => { if (prev) prev(e); onPayload(e.data); };
-    return () => { if (sse.port) sse.port.onmessage = prev; };
+    // addEventListener is multi-subscriber safe — no .onmessage slot mutation.
+    const handler = (e) => { onPayload(e.data); };
+    sse.port.addEventListener('message', handler);
+    return () => { if (sse.port) sse.port.removeEventListener('message', handler); };
   }
 
   if (sse instanceof EventSource) {

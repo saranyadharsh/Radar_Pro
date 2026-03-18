@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>NexRadar Pro — Offline</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0a0e1a;
+      color: #8ba3b8;
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      display: flex; align-items: center; justify-content: center;
+      min-height: 100vh; flex-direction: column; gap: 18px;
+      text-align: center; padding: 24px;
+    }
+    .logo { font-size: 28px; font-weight: 800; color: #22d3ee; letter-spacing: 2px; }
+    .badge {
+      background: rgba(255,61,90,0.12); border: 1px solid #ff3d5a40;
+      color: #ff3d5a; border-radius: 8px; padding: 10px 20px;
+      font-size: 13px; font-weight: 600; letter-spacing: 1px;
+    }
+    p { font-size: 12px; max-width: 360px; line-height: 1.7; opacity: 0.7; }
+    button {
+      margin-top: 8px; background: rgba(34,211,238,0.1);
+      border: 1px solid #22d3ee40; color: #22d3ee;
+      padding: 10px 24px; border-radius: 6px; cursor: pointer;
+      font-family: inherit; font-size: 12px; font-weight: 700;
+      letter-spacing: 1px; transition: background 0.2s;
+    }
+    button:hover { background: rgba(34,211,238,0.2); }
+  </style>
+</head>
+<body>
+  <div class="logo">⬡ NEXRADAR PRO</div>
+  <div class="badge">⚡ DISCONNECTED</div>
+  <p>Network connection lost. The live feed is unavailable.<br/>Last known data is cached — reconnecting automatically.</p>
+  <button onclick="window.location.reload()">↺ RETRY CONNECTION</button>
+</body>
+</html>

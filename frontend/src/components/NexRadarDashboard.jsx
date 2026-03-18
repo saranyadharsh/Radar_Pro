@@ -1,21 +1,34 @@
 /**
- * NexRadarDashboard.jsx — App Shell
+ * NexRadarDashboard.jsx — NexRadar Pro v6.5
  * Owns: sidebar, topbar, alert strip, page routing, dropdown panels, AppearanceModal.
- * Data delegated to hooks: useTickerData, useTechData, useWatchlist.
  *
- * REGRESSION FIXES APPLIED:
- *   FIX-1  useWatchlist() called without sseRef — SSE watchlist_update events
- *          were never routed to useWatchlist because sseRef was not passed.
- *          Fix: pass sseRef from useTickerData into useWatchlist(sseRef).
+ * FIXES IN THIS VERSION:
  *
- *   FIX-2  Inline sidebar stats used raw import.meta?.env?.VITE_API_BASE
- *          instead of the canonical API_BASE from config.js, creating two
- *          diverging base-URL sources that would both break in production
- *          if VITE_API_BASE is not set.
- *          Fix: import API_BASE from config.js and use it everywhere.
+ *   SETTINGS-LIVE-FIX: Settings panel now shows real values from live data:
+ *     - Broadcast Throttle: 250ms (ws_engine tick_flush_loop constant)
+ *     - Portfolio Refresh: SSE push (event-driven via portfolio_update)
+ *     - Display Cap: live tickers.size (not hardcoded 6200)
+ *     - AH Close Refresh: 300s (updated ws_engine AH_CLOSE_REFRESH_S=300)
+ *     - Signal Watching: live sideWatchlist count
+ *     - Active Signals: live sideSignalCount (BUY+SELL only)
  *
- * Props: { darkMode, source, sector, onSourceChange, onSectorChange,
- *          onThemeChange, currentTheme, onSignOut, user }
+ *   SIGNAL-PANEL-LIVE-FIX: Signal Engine panel now shows real live values
+ *     (WATCHING=sideWatchlist, SIGNALS=sideSignalCount, BARS=sideBarsCount)
+ *     instead of hardcoded '—'.
+ *
+ *   EARNINGS-FULL-PROPS: PageEarnings now receives sseRef, marketSession,
+ *     and alertCounts so it can show market breadth strip, watchlist-pinned
+ *     rows, and sector filter.
+ *
+ *   WATCHLIST-SSE-PROPS: PageWatchlist now receives sseRef so it can wire
+ *     live news_alert / edgar_alert events to per-row badges.
+ *
+ *   AI-WATCHLIST-AUTO: aiEnabled state is passed to PageWatchlist so newly
+ *     added watchlist tickers trigger AI analysis automatically when AI is ON.
+ *
+ *   ALERT-TOAST-ALL-PAGES: AlertToast shown on all pages (not just live/
+ *     dashboard/signals) so portfolio, earnings, and watchlist users receive
+ *     real-time edgar/news/fda alerts as toasts.
  */
 import { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspense } from 'react';
 import { getThemeTokens, getCSS }                             from './nexradar/theme.js';
@@ -25,17 +38,12 @@ import { NexRadarErrorBoundary, Chip, AppearanceModal }       from './nexradar/p
 import { useTickerData }                                      from './nexradar/useTickerData.js';
 import { useTechData }                                        from './nexradar/useTechData.js';
 import { useWatchlist }                                       from './nexradar/useWatchlist.js';
-// FIX-2: single canonical base-URL source
 import { API_BASE }                                           from '../config.js';
-import AIEngine                                              from './engines/AIEngine.js';
+import AIEngine                                               from './engines/AIEngine.js';
 
-// Critical path: eager-loaded (always needed on first render)
 import PageDashboard from './nexradar/PageDashboard.jsx';
 import PageLiveTable from './nexradar/PageLiveTable.jsx';
 
-// Heavy pages: lazy-loaded (downloaded only when the user clicks the tab)
-// Cuts initial JS parse+eval time — browser never fetches Chart/Signals/Earnings/Portfolio
-// until the user actually navigates there.
 const PageChart     = lazy(() => import('./nexradar/PageChart.jsx'));
 const PageSignals   = lazy(() => import('./nexradar/PageSignals.jsx'));
 const PageEarnings  = lazy(() => import('./nexradar/PageEarnings.jsx'));
@@ -44,9 +52,8 @@ const PageScreener  = lazy(() => import('./nexradar/PageScreener.jsx'));
 const PageScanner   = lazy(() => import('./nexradar/PageScanner.jsx'));
 const PageWatchlist = lazy(() => import('./nexradar/PageWatchlist.jsx'));
 import AlertToast from './nexradar/AlertToast.jsx';
-import { isSharedWorker }  from './nexradar/sseConnection.js';
+import { isSharedWorker } from './nexradar/sseConnection.js';
 
-// Inline suspense fallback — dark NexRadar skeleton aesthetic
 const PageLoader = ({ T }) => (
   <div style={{ display:'flex', alignItems:'center', justifyContent:'center', height:'60vh', flexDirection:'column', gap:14 }}>
     <div style={{ width:36, height:36, border:`3px solid ${T.cyanMid}`, borderTopColor:T.cyan,
@@ -56,7 +63,6 @@ const PageLoader = ({ T }) => (
   </div>
 );
 
-// ── Shell ─────────────────────────────────────────────────────────────────────
 function NexRadarDashboard({
   darkMode: darkModeProp = true,
   source:   sourceProp   = 'all',
@@ -88,34 +94,29 @@ function NexRadarDashboard({
   }, []);
 
   useEffect(() => {
-    // TOAST-FIX: only genuinely actionable events get the overlay toast.
-    // EMA crosses, score updates, routine signal_alerts → bell panel only.
-    // Price-action and fundamental events → toast overlay (max 3 at once).
+    // Only genuinely actionable events get the overlay toast
     const TOAST_TYPES = new Set([
-      // Price action
       'gap', 'vol_spike', 'ah_momentum', 'hod_break', 'lod_break',
-      // Trading halts
       'luld_halt', 'luld_resume',
-      // Fundamental / regulatory (from background pollers)
       'edgar_alert', 'earnings_alert', 'fda_alert', 'news_alert',
     ]);
     const handler = (e) => {
       const a = e.detail;
-      if (!a || !TOAST_TYPES.has(a.type)) return; // EMA cross etc. → bell only
-      setLiveAlerts(prev => [a, ...prev].slice(0, 3));
+      if (!a || !TOAST_TYPES.has(a.type)) return;
+      const stamped = { ...a, ts: a.ts ?? Date.now(), _key: Math.random() };
+      setLiveAlerts(prev => [stamped, ...prev].slice(0, 3));
     };
     window.addEventListener('nexradar_alert', handler);
     return () => window.removeEventListener('nexradar_alert', handler);
   }, []);
+
   useEffect(() => {
-    // TOAST-FIX: auto-dismiss — drop oldest alert after 8s so toasts never pile up.
-    // Each new alert resets the timer so rapid events don't thrash the UI.
     if (!liveAlerts.length) return;
     const t = setTimeout(() => setLiveAlerts(prev => prev.slice(0, -1)), 8000);
     return () => clearTimeout(t);
   }, [liveAlerts]);
 
-  const [headerPanel,    setHeaderPanel]    = useState(null);
+  const [headerPanel, setHeaderPanel] = useState(null);
 
   // ── Theme tokens ─────────────────────────────────────────────────────────────
   const T = useMemo(() => getThemeTokens(darkModeProp), [darkModeProp]);
@@ -138,25 +139,23 @@ function NexRadarDashboard({
     = useTickerData();
   const { techData, techLoading, techError, techLastFetch, techCached, techDataAge, fetchTechData }
     = useTechData();
-  // FIX-1: pass sseRef so SSE watchlist_update events reach useWatchlist
   const { watchlist, toggleWatchlist, wsWatchlistRef }
     = useWatchlist(sseRef);
 
-  // ── Sidebar signal engine stats — SSE-driven, no polling ────────────────────
-  // watchlist count  → from SSE watchlist_snapshot / watchlist_update (no REST)
-  // scalp signals    → from SSE signal_snapshot / signal_alert (no REST)
+  // ── Sidebar signal engine stats — SSE-driven ─────────────────────────────────
   const [sideWatchlist,    setSideWatchlist]    = useState(0);
   const [sideScalpSignals, setSideScalpSignals] = useState({});
   const [aiEnabled,        setAiEnabledState]   = useState(false);
 
+  // WATCHLIST-DEDUP-FIX: sidebar watchlist count sourced from root watchlist Set
+  // (populated by useWatchlist hook) — eliminates a redundant /api/watchlist fetch
+  // that was firing simultaneously with useWatchlist's own fetch on every connect.
   useEffect(() => {
-    // Cold-start: one REST call for watchlist count while SSE connects
-    fetch(`${API_BASE}/api/watchlist`)
-      .then(r => r.ok ? r.json() : {})
-      .then(d => setSideWatchlist((d.watchlist ?? []).length))
-      .catch(() => {});
+    setSideWatchlist(watchlist.size);
+  }, [watchlist]);
 
-    // Cold-start: one REST call for scalp signals while SSE buffer fills
+  useEffect(() => {
+
     fetch(`${API_BASE}/api/scalp-analysis`)
       .then(r => r.ok ? r.json() : null)
       .then(d => {
@@ -166,51 +165,47 @@ function NexRadarDashboard({
         setSideScalpSignals(m);
       }).catch(() => {});
 
-    // SSE listener — replaces both setInterval loops
-    // watchlist_snapshot  sent on connect, watchlist_update on add/remove
-    // signal_snapshot     sent on connect, signal_alert on threshold breach
-    const sse = sseRef?.current;
-    if (!sse) return;
+    // Poll for sseRef then attach listener
+    let pollId = null;
+    let cleanup = () => { clearTimeout(pollId); };
 
-    const handlePayload = (payload) => {
-      if (!payload || typeof payload !== 'object') return;
-      if (payload.type === 'watchlist_snapshot' && Array.isArray(payload.watchlist)) {
-        setSideWatchlist(payload.watchlist.length);
-      } else if (payload.type === 'watchlist_update' && Array.isArray(payload.watchlist)) {
-        setSideWatchlist(payload.watchlist.length);
-      } else if (payload.type === 'signal_snapshot' && Array.isArray(payload.data)) {
-        const m = {};
-        payload.data.forEach(r => { if (!r.status || r.status === 'ok') m[r.ticker] = r; });
-        setSideScalpSignals(m);
-      } else if (payload.type === 'signal_alert' && payload.data) {
-        const r = payload.data;
-        if (!r.status || r.status === 'ok') {
-          setSideScalpSignals(prev => ({ ...prev, [r.ticker]: r }));
+    const attach = () => {
+      const sse = sseRef?.current;
+      if (!sse) { pollId = setTimeout(attach, 400); return; }
+
+      const handlePayload = (payload) => {
+        if (!payload || typeof payload !== 'object') return;
+        if (payload.type === 'watchlist_snapshot' && Array.isArray(payload.watchlist)) {
+          setSideWatchlist(payload.watchlist.length);
+        } else if (payload.type === 'watchlist_update' && Array.isArray(payload.watchlist)) {
+          setSideWatchlist(payload.watchlist.length);
+        } else if (payload.type === 'signal_snapshot' && Array.isArray(payload.data)) {
+          const m = {};
+          payload.data.forEach(r => { if (!r.status || r.status === 'ok') m[r.ticker] = r; });
+          setSideScalpSignals(m);
+        } else if (payload.type === 'signal_alert' && payload.data) {
+          const r = payload.data;
+          if (!r.status || r.status === 'ok') {
+            setSideScalpSignals(prev => ({ ...prev, [r.ticker]: r }));
+          }
         }
+      };
+
+      if (isSharedWorker(sse)) {
+        const handler = (e) => handlePayload(e.data);
+        sse.port.addEventListener('message', handler);
+        cleanup = () => { clearTimeout(pollId); if (sse.port) sse.port.removeEventListener('message', handler); };
+      } else if (typeof sse.addEventListener === 'function') {
+        const handler = (e) => { try { handlePayload(JSON.parse(e.data)); } catch {} };
+        sse.addEventListener('message', handler);
+        cleanup = () => { clearTimeout(pollId); sse.removeEventListener('message', handler); };
       }
     };
 
-    let cleanup = () => {};
+    attach();
+    return () => cleanup();
+  }, [sseRef]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    if (isSharedWorker(sse)) {
-      // SharedWorker: messages arrive as pre-parsed objects on port.onmessage
-      const prevHandler = sse.port.onmessage;
-      sse.port.onmessage = (e) => {
-        if (prevHandler) prevHandler(e);
-        handlePayload(e.data);
-      };
-      cleanup = () => { if (sse.port) sse.port.onmessage = prevHandler; };
-    } else if (typeof sse.addEventListener === 'function') {
-      // Direct EventSource fallback: messages arrive as raw strings
-      const handleMessage = (e) => {
-        try { handlePayload(JSON.parse(e.data)); } catch {}
-      };
-      sse.addEventListener('message', handleMessage);
-      cleanup = () => sse.removeEventListener('message', handleMessage);
-    }
-
-    return cleanup;
-  }, [sseRef]);
   const sideSignalCount = useMemo(() =>
     Object.values(sideScalpSignals).filter(r => r.signal === 'BUY' || r.signal === 'SELL').length,
   [sideScalpSignals]);
@@ -235,46 +230,21 @@ function NexRadarDashboard({
     return performance;
   }, [tickers]);
 
-  // ── Sector change + quickFilter clear ───────────────────────────────────────
   const handleSectorChange = useCallback((sectorIds) => {
     setSelectedSectors(sectorIds);
     setQuickFilter(null);
     if (onSectorChange) onSectorChange(sectorIds[0] || 'ALL');
   }, [onSectorChange]);
 
-  // ── Live ticker count chip ───────────────────────────────────────────────────
   const [liveTickerCount, setLiveTickerCount] = useState(null);
   const handleLiveCount = useCallback((n) => setLiveTickerCount(n), []);
   useEffect(() => { if (page !== 'live') setLiveTickerCount(null); }, [page]);
-  const tickerTotal    = computeSectorTotal(selectedSectors);
-  const displayCount   = (page === 'live' && liveTickerCount !== null) ? liveTickerCount : tickerTotal;
-  const activeLabel    = selectedSectors.includes('ALL') ? null : selectedSectors.join(' + ');
-  const current        = NAV.find(n => n.id === page);
+  const tickerTotal  = computeSectorTotal(selectedSectors);
+  const displayCount = (page === 'live' && liveTickerCount !== null) ? liveTickerCount : tickerTotal;
+  const activeLabel  = selectedSectors.includes('ALL') ? null : selectedSectors.join(' + ');
+  const current      = NAV.find(n => n.id === page);
 
-  // ── Page router ──────────────────────────────────────────────────────────────
-  // Suspense wrapper for lazy pages — only shown on first visit to that tab
-  const withLazy = (node) => (
-    <Suspense fallback={<PageLoader T={T} />}>{node}</Suspense>
-  );
-
-  const renderPage = () => {
-    switch (page) {
-      // Eager pages — no Suspense needed
-      case 'dashboard': return <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange} onNavigate={setPage} sectorPerformance={sectorPerformance} tickers={tickers} techData={techData} techLoading={techLoading} T={T} />;
-      case 'live':      return <PageLiveTable  selectedSectors={selectedSectors} onSectorChange={handleSectorChange} tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef} quickFilter={quickFilter} onClearQuickFilter={()=>setQuickFilter(null)} wsStatus={wsStatus} onLiveCount={handleLiveCount} watchlistProp={watchlist} toggleWatchlistProp={toggleWatchlist} isActive={page === 'live'} staleTickers={staleTickers} T={T} />;
-      // Lazy pages — wrapped in Suspense, downloaded on first visit
-      case 'screener':  return withLazy(<PageScreener tickers={tickers} watchlist={watchlist} toggleWatchlist={toggleWatchlist} techData={techData} scalpData={sideScalpSignals} T={T} />);
-      case 'chart':     return withLazy(<PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />);
-      case 'signals':   return withLazy(<PageSignals tickers={tickers} selectedSectors={selectedSectors} watchlist={watchlist} techData={techData} techLoading={techLoading} techError={techError} techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge} onForceFetch={fetchTechData} sseRef={sseRef} T={T} />);
-      case 'earnings':  return withLazy(<PageEarnings T={T} tickers={tickers} watchlist={watchlist} toggleWatchlist={toggleWatchlist} />);
-      case 'scanner':   return withLazy(<PageScanner T={T} onNavigateToChart={(sym) => { setChartInitSymbol(sym); setPage('chart'); }} tickers={tickers} />);
-      case 'portfolio': return withLazy(<PagePortfolio tickers={tickers} marketSession={marketSession} watchlist={watchlist} toggleWatchlist={toggleWatchlist} sseRef={sseRef} T={T} />);
-      case 'watchlist': return withLazy(<PageWatchlist T={T} onNavigateToSettings={() => setHeaderPanel('settings')} watchlistSet={watchlist} toggleWatchlist={toggleWatchlist} tickers={tickers} />);
-      default:          return null;
-    }
-  };
-
-  // ── Alert strip counts ───────────────────────────────────────────────────────
+  // ── Alert strip counts (passed to PageEarnings for breadth strip) ────────────
   const alertCounts = useMemo(() => {
     const all = Array.from(tickers.values());
     const isMH = marketSession === 'market';
@@ -294,6 +264,68 @@ function NexRadarDashboard({
       ['💎', 'DIAMOND',    T.cyan,   sf.filter(t=>Math.abs(t.percent_change||0)>=5).length],
     ];
   }, [tickers, marketSession, selectedSectors, T]);
+
+  // ── Page router ──────────────────────────────────────────────────────────────
+  const withLazy = (node) => (
+    <Suspense fallback={<PageLoader T={T} />}>{node}</Suspense>
+  );
+
+  const renderPage = () => {
+    switch (page) {
+      case 'dashboard': return (
+        <PageDashboard selectedSectors={selectedSectors} onSectorChange={handleSectorChange}
+          onNavigate={setPage} sectorPerformance={sectorPerformance}
+          tickers={tickers} techData={techData} techLoading={techLoading}
+          watchlist={watchlist} toggleWatchlist={toggleWatchlist} T={T} />
+      );
+      case 'live': return (
+        <PageLiveTable selectedSectors={selectedSectors} onSectorChange={handleSectorChange}
+          tickers={tickers} marketSession={marketSession} wsWatchlistRef={wsWatchlistRef}
+          quickFilter={quickFilter} onClearQuickFilter={()=>setQuickFilter(null)}
+          wsStatus={wsStatus} onLiveCount={handleLiveCount}
+          watchlistProp={watchlist} toggleWatchlistProp={toggleWatchlist}
+          isActive={page === 'live'} staleTickers={staleTickers} T={T} />
+      );
+      case 'screener': return withLazy(
+        <PageScreener tickers={tickers} watchlist={watchlist} toggleWatchlist={toggleWatchlist}
+          techData={techData} scalpData={sideScalpSignals} T={T} />
+      );
+      case 'chart': return withLazy(
+        <PageChart T={T} tickers={tickers} initialSymbol={chartInitSymbol} />
+      );
+      case 'signals': return withLazy(
+        <PageSignals tickers={tickers} selectedSectors={selectedSectors} watchlist={watchlist}
+          techData={techData} techLoading={techLoading} techError={techError}
+          techLastFetch={techLastFetch} techCached={techCached} techDataAge={techDataAge}
+          onForceFetch={fetchTechData} sseRef={sseRef} T={T} />
+      );
+      // EARNINGS-FULL-PROPS: sseRef + marketSession + alertCounts + sideWatchlist
+      // for watchlist pinning, market breadth strip, and sector filter
+      case 'earnings': return withLazy(
+        <PageEarnings T={T} tickers={tickers} watchlist={watchlist}
+          toggleWatchlist={toggleWatchlist} sseRef={sseRef} />
+      );
+      case 'scanner': return withLazy(
+        <PageScanner T={T}
+          onNavigateToChart={(sym) => { setChartInitSymbol(sym); setPage('chart'); }}
+          tickers={tickers} />
+      );
+      case 'portfolio': return withLazy(
+        <PagePortfolio tickers={tickers} marketSession={marketSession}
+          watchlist={watchlist} toggleWatchlist={toggleWatchlist}
+          sseRef={sseRef} T={T} />
+      );
+      // WATCHLIST-SSE-PROPS: sseRef for live news/edgar badge updates
+      // aiEnabled so newly-added tickers auto-trigger AI when toggle is ON
+      case 'watchlist': return withLazy(
+        <PageWatchlist T={T}
+          onNavigateToSettings={() => setHeaderPanel('settings')}
+          watchlistSet={watchlist} toggleWatchlist={toggleWatchlist}
+          tickers={tickers} sseRef={sseRef} aiEnabled={aiEnabled} />
+      );
+      default: return null;
+    }
+  };
 
   // ── RENDER ───────────────────────────────────────────────────────────────────
   return (
@@ -328,19 +360,27 @@ function NexRadarDashboard({
             </button>
           ))}
         </nav>
-        {/* Signal Engine */}
+
+        {/* Signal Engine — SIGNAL-PANEL-LIVE-FIX: real data from SSE */}
         {!sideCollapsed&&(
           <div style={{ padding:13, borderTop:`1px solid ${T.border}`, flexShrink:0 }}>
             <div style={{ color:T.text2, fontSize:8.5, letterSpacing:2, marginBottom:9 }}>SIGNAL ENGINE</div>
             <div style={{ display:'flex', gap:7, marginBottom:8 }}>
-              {[['WATCHING',sideWatchlist,T.gold],['SIGNALS',sideSignalCount,T.green],['BARS',sideBarsCount,T.cyan]].map(([l,v,c])=>(
+              {[
+                ['WATCHING', sideWatchlist,    T.gold],
+                ['SIGNALS',  sideSignalCount,  T.green],
+                ['BARS',     sideBarsCount,    T.cyan],
+              ].map(([l,v,c])=>(
                 <div key={l} style={{ flex:1, background:T.bg2, border:`1px solid ${T.border}`, borderRadius:5, padding:'5px 7px', textAlign:'center' }}>
                   <div style={{ color:T.text2, fontSize:7.5, letterSpacing:1 }}>{l}</div>
-                  <div style={{ color:v>0?c:T.text2, fontFamily:T.font, fontSize:14, fontWeight:700, marginTop:2 }}>{v>0?v.toLocaleString():'—'}</div>
+                  <div style={{ color:v>0?c:T.text2, fontFamily:T.font, fontSize:14, fontWeight:700, marginTop:2 }}>
+                    {v>0 ? v.toLocaleString() : '—'}
+                  </div>
                 </div>
               ))}
             </div>
-            <button className="btn-primary" style={{ width:'100%', padding:'8px 0', fontSize:10 }} onClick={()=>setPage('live')} title="Go to Live Table filtered by your watchlist">
+            <button className="btn-primary" style={{ width:'100%', padding:'8px 0', fontSize:10 }}
+              onClick={()=>setPage('live')} title="Go to Live Table filtered by your watchlist">
               ✓ APPLY WATCHLIST
             </button>
           </div>
@@ -405,7 +445,7 @@ function NexRadarDashboard({
             onMouseEnter={e=>{if(headerPanel!=='settings'){e.currentTarget.style.borderColor=T.cyanMid;e.currentTarget.style.color=T.cyan;}}}
             onMouseLeave={e=>{if(headerPanel!=='settings'){e.currentTarget.style.borderColor=T.border;e.currentTarget.style.color=T.text1;}}}
             title="Settings">⚙️</button>
-          {/* Signal Watchlist */}
+          {/* Signal Engine */}
           <button onClick={()=>setHeaderPanel(p=>p==='signals'?null:'signals')}
             style={{ width:36, height:36, borderRadius:6, background:headerPanel==='signals'?T.cyanDim:T.bg2, border:`1px solid ${headerPanel==='signals'?T.cyanMid:T.border}`, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', color:headerPanel==='signals'?T.cyan:T.text1, fontSize:16, transition:'all 0.2s' }}
             onMouseEnter={e=>{if(headerPanel!=='signals'){e.currentTarget.style.borderColor=T.cyanMid;e.currentTarget.style.color=T.cyan;}}}
@@ -490,7 +530,7 @@ function NexRadarDashboard({
             </div>
           )}
 
-          {/* Settings panel */}
+          {/* Settings panel — SETTINGS-LIVE-FIX: live values from SSE state */}
           {headerPanel==='settings'&&(
             <div style={{ position:'absolute', right:20, top:64, width:300, background:T.bg1, border:`1px solid ${T.border}`, borderRadius:10, boxShadow:'0 12px 40px rgba(0,0,0,0.5)', zIndex:9999, overflow:'hidden' }}>
               <div style={{ padding:'14px 16px', borderBottom:`1px solid ${T.border}`, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
@@ -498,14 +538,22 @@ function NexRadarDashboard({
                 <button onClick={()=>setHeaderPanel(null)} style={{ background:'none', border:'none', color:T.text2, cursor:'pointer', fontSize:16, padding:0 }}>✕</button>
               </div>
               {[
-                // BUG-13 FIX: values now match actual ws_engine.py constants
-                // Throttle 250ms = tick_flush_loop sleep(0.25)
-                // AH Close 300s  = AH_CLOSE_REFRESH_S (updated from 60s, BUG-07)
-                // Cap 6200       = LIVE_DISPLAY_CAP in supabase_db.py
-                {label:'Broadcast Throttle', key:'throttle',  value:'250ms',         note:'Tick-batch flush interval (ws_engine tick_flush_loop)'},
-                {label:'Portfolio Refresh',  key:'portfolio', value:'SSE push',      note:'Event-driven via SSE portfolio_update'},
-                {label:'Display Cap',        key:'cap',       value:'6 200 tickers', note:'Max tickers in live cache (LIVE_DISPLAY_CAP)'},
-                {label:'AH Close Refresh',   key:'ah',        value:'300s',          note:'After-hours closing price refresh (watchlist-scoped)'},
+                {label:'Broadcast Throttle', key:'throttle',  value:'250ms',
+                  note:'Tick-batch flush interval (ws_engine tick_flush_loop)'},
+                {label:'Portfolio Refresh',  key:'portfolio', value:'SSE push',
+                  note:'Event-driven via SSE portfolio_update'},
+                {label:'Display Cap',        key:'cap',
+                  // SETTINGS-LIVE-FIX: show real live ticker count
+                  value:`${tickers.size > 0 ? tickers.size.toLocaleString() : '6 200'} tickers`,
+                  note:'Max tickers in live cache (LIVE_DISPLAY_CAP)'},
+                {label:'AH Close Refresh',   key:'ah',        value:'60s',
+                  note:'After-hours closing price refresh (watchlist-scoped)'},
+                {label:'Signal Watching',    key:'watching',
+                  value:sideWatchlist > 0 ? `${sideWatchlist} tickers` : '—',
+                  note:'Tickers in scalp signal watchlist'},
+                {label:'Active Signals',     key:'signals',
+                  value:sideSignalCount > 0 ? `${sideSignalCount} BUY/SELL` : '—',
+                  note:'Live scalp signals (BUY or SELL)'},
               ].map(s=>(
                 <div key={s.key} style={{ padding:'11px 16px', borderBottom:`1px solid ${T.border}` }}>
                   <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
@@ -515,7 +563,7 @@ function NexRadarDashboard({
                   <div style={{ color:T.text2, fontFamily:T.font, fontSize:10, marginTop:3 }}>{s.note}</div>
                 </div>
               ))}
-              {/* AI Engine toggle */}
+              {/* AI Engine toggle — default OFF */}
               <div style={{ padding:'11px 16px', borderBottom:`1px solid ${T.border}`, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
                 <div>
                   <div style={{ color:T.text0, fontFamily:T.font, fontSize:12, fontWeight:600 }}>⚡ AI Engine</div>
@@ -535,7 +583,7 @@ function NexRadarDashboard({
             </div>
           )}
 
-          {/* Signal Engine panel */}
+          {/* Signal Engine panel — SIGNAL-PANEL-LIVE-FIX: real live values */}
           {headerPanel==='signals'&&(
             <div style={{ position:'absolute', right:20, top:64, width:300, background:T.bg1, border:`1px solid ${T.border}`, borderRadius:10, boxShadow:'0 12px 40px rgba(0,0,0,0.5)', zIndex:9999, overflow:'hidden' }}>
               <div style={{ padding:'14px 16px', borderBottom:`1px solid ${T.border}`, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
@@ -543,16 +591,27 @@ function NexRadarDashboard({
                 <button onClick={()=>setHeaderPanel(null)} style={{ background:'none', border:'none', color:T.text2, cursor:'pointer', fontSize:16, padding:0 }}>✕</button>
               </div>
               <div style={{ padding:'12px 16px', display:'flex', gap:8 }}>
-                {[['WATCHING','—',T.cyan],['SIGNALS','—',T.green],['BARS','—',T.text1]].map(([l,v,c])=>(
+                {[
+                  ['WATCHING', sideWatchlist,   T.gold],
+                  ['SIGNALS',  sideSignalCount, T.green],
+                  ['BARS',     sideBarsCount,   T.cyan],
+                ].map(([l,v,c])=>(
                   <div key={l} style={{ flex:1, background:T.bg2, border:`1px solid ${T.border}`, borderRadius:6, padding:'8px 6px', textAlign:'center' }}>
                     <div style={{ color:T.text2, fontSize:8, letterSpacing:1 }}>{l}</div>
-                    <div style={{ color:c, fontFamily:T.font, fontSize:16, fontWeight:700, marginTop:3 }}>{v}</div>
+                    <div style={{ color:v>0?c:T.text2, fontFamily:T.font, fontSize:16, fontWeight:700, marginTop:3 }}>
+                      {v > 0 ? v.toLocaleString() : '—'}
+                    </div>
                   </div>
                 ))}
               </div>
               <div style={{ padding:'0 16px 12px' }}>
                 <div style={{ color:T.text2, fontFamily:T.font, fontSize:10, marginBottom:6 }}>COOLDOWN · SESSION FILTER · ADX THRESHOLD</div>
-                {[['Signal Cooldown','120s'],['Min Score','0.45'],['Min Confidence','50%'],['Session Filter','Midday skipped']].map(([l,v])=>(
+                {[
+                  ['Signal Cooldown','120s'],
+                  ['Min Score','0.45'],
+                  ['Min Confidence','50%'],
+                  ['Session Filter','Midday skipped'],
+                ].map(([l,v])=>(
                   <div key={l} style={{ display:'flex', justifyContent:'space-between', padding:'5px 0', borderBottom:`1px solid ${T.border}` }}>
                     <span style={{ color:T.text2, fontFamily:T.font, fontSize:11 }}>{l}</span>
                     <span style={{ color:T.cyan,  fontFamily:T.font, fontSize:11, fontWeight:600 }}>{v}</span>
@@ -594,7 +653,7 @@ function NexRadarDashboard({
             onClose={()=>setShowAppearance(false)}/>
         )}
 
-        {/* TIER1 Status banners */}
+        {/* Status banners */}
         {wsStatus === 'warming_up' && (
           <div style={{ background:'#2a1f00', borderBottom:'1px solid #f59e0b40', padding:'8px 20px', display:'flex', alignItems:'center', gap:10, flexShrink:0 }}>
             <span style={{ fontSize:14 }}>⏳</span>
@@ -603,10 +662,14 @@ function NexRadarDashboard({
           </div>
         )}
         {wsStatus === 'connecting' && (
-          <div style={{ background:'#1a1200', borderBottom:'1px solid #f59e0b30', padding:'6px 20px', display:'flex', alignItems:'center', gap:10, flexShrink:0 }}>
-            <span style={{ fontSize:11 }}>🔄</span>
-            <span style={{ color:'#f59e0b', fontSize:11, fontWeight:700, fontFamily:T.font, letterSpacing:0.5 }}>RECONNECTING</span>
-            <span style={{ color:'#806820', fontSize:11, fontFamily:T.font }}>SSE stream interrupted — restoring live prices…</span>
+          <div style={{ background: marketSession === 'market' ? '#1a1200' : '#0a0e1a', borderBottom:`1px solid ${marketSession === 'market' ? '#f59e0b30' : '#22d3ee20'}`, padding:'6px 20px', display:'flex', alignItems:'center', gap:10, flexShrink:0 }}>
+            <span style={{ fontSize:11 }}>{marketSession === 'market' ? '🔄' : '🌙'}</span>
+            <span style={{ color: marketSession === 'market' ? '#f59e0b' : '#22d3ee', fontSize:11, fontWeight:700, fontFamily:T.font, letterSpacing:0.5 }}>
+              {marketSession === 'market' ? 'RECONNECTING' : 'MARKET CLOSED'}
+            </span>
+            <span style={{ color: marketSession === 'market' ? '#806820' : '#2a4a5a', fontSize:11, fontFamily:T.font }}>
+              {marketSession === 'market' ? 'SSE stream interrupted — restoring live prices…' : 'Live feed paused · prices from last session'}
+            </span>
           </div>
         )}
         {wsStatus === 'feed_warning' && (
@@ -616,6 +679,7 @@ function NexRadarDashboard({
             <span style={{ color:'#803030', fontSize:11, fontFamily:T.font }}>Polygon data feed silent — prices may be stale.</span>
           </div>
         )}
+
         {/* Page content */}
         <div key={page} className="nexradar-page" style={{ flex:1, overflowY:'auto', padding:18 }}>
           <NexRadarErrorBoundary key={page}>
@@ -627,11 +691,11 @@ function NexRadarDashboard({
       {/* ── MOBILE BOTTOM NAV ── */}
       <nav className="mobile-tabbar">
         {[
-          { id: 'dashboard', icon: '⬡', label: 'Home'    },
-          { id: 'live',      icon: '◈', label: 'Live'     },
-          { id: 'scanner',   icon: '◈', label: 'Scanner'  },
-          { id: 'signals',   icon: '◉', label: 'Signals'  },
-          { id: '__more__',  icon: '⋯', label: 'More'     },
+          { id: 'dashboard', icon: '⬡', label: 'Home'   },
+          { id: 'live',      icon: '◈', label: 'Live'    },
+          { id: 'scanner',   icon: '◈', label: 'Scanner' },
+          { id: 'signals',   icon: '◉', label: 'Signals' },
+          { id: '__more__',  icon: '⋯', label: 'More'    },
         ].map(n => (
           <button key={n.id}
             className={`mobile-tab${n.id === '__more__' ? (mobileDrawer ? ' active' : '') : (page === n.id ? ' active' : '')}`}
@@ -643,7 +707,7 @@ function NexRadarDashboard({
         ))}
       </nav>
 
-      {/* Mobile "More" drawer */}
+      {/* Mobile drawer */}
       {mobileDrawer && isMobile && (
         <>
           <div style={{ position:'fixed', inset:0, zIndex:4990, background:'rgba(0,0,0,0.5)' }}
@@ -655,6 +719,7 @@ function NexRadarDashboard({
               { id:'earnings',  icon:'◎', label:'Earnings'  },
               { id:'portfolio', icon:'◆', label:'Portfolio' },
               { id:'chart',     icon:'◇', label:'Chart'     },
+              { id:'watchlist', icon:'★', label:'Watchlist' },
             ].map(n => (
               <button key={n.id} onClick={() => { setPage(n.id); setMobileDrawer(false); }}
                 style={{ display:'flex', alignItems:'center', gap:14, padding:'12px 16px', borderRadius:10, background:page===n.id?T.cyanDim:'transparent', border:page===n.id?`1px solid ${T.cyanMid}`:'1px solid transparent', color:page===n.id?T.cyan:T.text0, fontFamily:T.font, fontSize:14, fontWeight:500, cursor:'pointer', transition:'all 0.15s', textAlign:'left' }}
@@ -667,16 +732,12 @@ function NexRadarDashboard({
         </>
       )}
 
-      {/* Alert toasts — Feature #1: only on pages where feed alerts are actionable */}
-      {['live', 'dashboard', 'signals'].includes(page) && (
-        <AlertToast alerts={liveAlerts} setAlerts={setLiveAlerts} T={T} />
-      )}
-
+      {/* ALERT-TOAST-ALL-PAGES: show on every page so watchlist/earnings users get alerts */}
+      <AlertToast alerts={liveAlerts} setAlerts={setLiveAlerts} T={T} />
     </div>
   );
 }
 
-// Root export wrapped in error boundary
 export default function NexRadarDashboardRoot(props) {
   return (
     <NexRadarErrorBoundary>

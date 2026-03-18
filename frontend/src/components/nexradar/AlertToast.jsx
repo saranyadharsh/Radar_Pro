@@ -26,6 +26,9 @@ function Toast({ alert, onDismiss, T }) {
   const [show, setShow]    = useState(false);
   const [exit, setExit]    = useState(false);
   const c = COLOR_MAP[alert.color] || COLOR_MAP.cyan;
+  // ALERT-TS-FIX: ts may be missing from older alert paths — default to now
+  // so the composite key and time display are always valid.
+  const alertTs = alert.ts ?? Date.now();
 
   useEffect(() => {
     requestAnimationFrame(() => setShow(true));
@@ -35,8 +38,8 @@ function Toast({ alert, onDismiss, T }) {
 
   function dismiss() {
     setExit(true);
-    // BUG-09 FIX: pass composite key so filter works even when ts is shared
-    setTimeout(() => onDismiss(`${alert.ts}_${alert.type}_${alert.ticker}`), 300);
+    // ALERT-TS-FIX: use alertTs (never undefined) for the composite key
+    setTimeout(() => onDismiss(`${alertTs}_${alert.type}_${alert.ticker}`), 300);
   }
 
   return (
@@ -60,18 +63,25 @@ function Toast({ alert, onDismiss, T }) {
           <div style={{ display:'flex', justifyContent:'space-between', gap:6 }}>
             <span style={{ color:c.text, fontSize:11.5, fontWeight:700 }}>{alert.title}</span>
             <span style={{ color:T.text2, fontSize:9, flexShrink:0, marginTop:1 }}>
-              {new Date(alert.ts).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}
+              {new Date(alertTs).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}
             </span>
           </div>
           <div style={{ color:T.text1, fontSize:11, marginTop:3, lineHeight:1.4 }}>{alert.message}</div>
-          <div style={{ display:'flex', gap:10, marginTop:4 }}>
-            <span style={{ color:T.text2, fontSize:9 }}>
-              Score&nbsp;<span style={{ color:c.text }}>{alert.score >= 0 ? '+' : ''}{alert.score?.toFixed(3)}</span>
-            </span>
-            <span style={{ color:T.text2, fontSize:9 }}>
-              Signal&nbsp;<span style={{ color:c.text }}>{alert.signal}</span>
-            </span>
-          </div>
+          {/* ALERT-TS-FIX: only render score/signal row when values are present */}
+          {(alert.score != null || alert.signal) && (
+            <div style={{ display:'flex', gap:10, marginTop:4 }}>
+              {alert.score != null && (
+                <span style={{ color:T.text2, fontSize:9 }}>
+                  Score&nbsp;<span style={{ color:c.text }}>{alert.score >= 0 ? '+' : ''}{alert.score?.toFixed(3)}</span>
+                </span>
+              )}
+              {alert.signal && (
+                <span style={{ color:T.text2, fontSize:9 }}>
+                  Signal&nbsp;<span style={{ color:c.text }}>{alert.signal}</span>
+                </span>
+              )}
+            </div>
+          )}
         </div>
       </div>
       {/* auto-dismiss progress bar */}
@@ -116,7 +126,7 @@ export function AlertHistoryPanel({ T }) {
       </div>
       {history.map((a, i) => {
         const c = COLOR_MAP[a.color] || COLOR_MAP.cyan;
-        const elapsed = Math.floor((Date.now() - a.ts) / 1000);
+        const elapsed = Math.floor((Date.now() - (a.ts ?? Date.now())) / 1000);
         const timeStr = elapsed < 60 ? `${elapsed}s ago` : elapsed < 3600 ? `${Math.floor(elapsed/60)}m ago` : `${Math.floor(elapsed/3600)}h ago`;
         return (
           <div key={i} style={{ padding:'9px 14px', borderBottom:`1px solid ${T.border}`, display:'flex', gap:10, alignItems:'flex-start', transition:'background 0.12s' }}
@@ -145,15 +155,15 @@ export default function AlertToast({ alerts, setAlerts, T }) {
         display:'flex', flexDirection:'column-reverse', gap:8,
         pointerEvents:'none',
       }}>
-        {alerts.slice(0, 5).map(a => (
-          // BUG-09 FIX: key={a.ts} caused duplicate-key crash when two alerts
-          // fired in the same millisecond (e.g. EMA_BULL_CROSS + RVOL_SPIKE on
-          // same ticker in one 10s poll). React warned and silently dropped one.
-          // Fix: composite key = ts + type + ticker — guaranteed unique per event.
-          <div key={`${a.ts}_${a.type}_${a.ticker}`} style={{ pointerEvents:'all' }}>
+        {alerts.slice(0, 5).map((a, i) => (
+          // ALERT-TS-FIX: use (a.ts ?? a._key) for key — a.ts may be undefined
+          // for news/edgar/earnings/fda alerts from background pollers.
+          // Stamp a stable _key on each alert when it enters liveAlerts state
+          // (done in NexRadarDashboard handler), or fall back to index-based key.
+          <div key={`${a.ts ?? a._key ?? i}_${a.type}_${a.ticker}`} style={{ pointerEvents:'all' }}>
             <Toast alert={a}
               onDismiss={(key) => setAlerts(prev => prev.filter(
-                x => `${x.ts}_${x.type}_${x.ticker}` !== key
+                x => `${x.ts ?? x._key ?? ''}_${x.type}_${x.ticker}` !== key
               ))} T={T} />
           </div>
         ))}

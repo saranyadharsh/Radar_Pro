@@ -1,6 +1,29 @@
 // PageLiveTable.jsx — NexRadar Pro
 // Live stock data table with sector filter, sub-mode (MH/AH), matrix view,
-// inline chart panel, pagination, and two-tier sort throttling.
+// inline chart panel, virtual scrolling (zero external deps), and Web Worker sort.
+//
+// FIXES IN THIS VERSION:
+//
+//   BUG-3 FIX  AH $ CHG / % CHG no longer falls back to MH change_value.
+//              When today_close = 0 (e.g. before _ah_close_loop has run),
+//              the fallback is now null — the cell shows "—" explicitly
+//              rather than silently displaying the wrong (MH day-change) number.
+//              Root cause (BUG-2 in ws_engine.py) is fixed separately;
+//              this is the defensive guard ensuring stale data is never shown.
+//
+//   BUG-4 FIX  useInlineVirtualizer useEffect dep array added.
+//              The effect ran after every render (no deps), re-attaching scroll
+//              and resize listeners on each render. In fast-mount/unmount cycles
+//              (mobile, route changes) this could add duplicate listeners. Fix:
+//              stable deps [count, estimateSize] ensure the effect only fires
+//              when the virtualizer inputs change.
+//
+//   BUG-7 FIX  Sort worker dispatch is debounced 150ms.
+//              tickers Map changes on every rAF flush (~60/s during trading).
+//              Each change triggered a 6,000-object structured clone postMessage
+//              to the sort worker — ~180 MB/s of inter-thread traffic and
+//              continuous main-thread GC pressure.  150ms debounce cuts
+//              invocations from ~60/s to ~6/s while keeping the table live.
 
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from "react";
 import { API_BASE } from "../../config.js";
@@ -8,18 +31,179 @@ import { SESSION_META } from "./constants.js";
 import { fmt2, pct, fmtVol, normalizeSector } from "./utils.js";
 import { SectionHeader, SectorPills, TVChart, MatrixCell } from "./primitives.jsx";
 
+// ── Inline virtualizer hook — zero external deps, no React version conflicts ──
+// Replaces @tanstack/react-virtual. Renders only visible rows using
+// scroll position + row height. ~50 lines, no imports needed.
+//
+// BUG-4 FIX: useEffect now has a stable dep array [count, estimateSize].
+// Previously had no dep array so it ran after every render, re-attaching scroll
+// and resize listeners every ~16ms during live trading (= thousands of event
+// listeners accumulating). The attachedRef guard prevented true duplicates for
+// the same element, but on route change / remount cycles this still caused
+// a race where a fresh element was attached twice before the cleanup fired.
+function useInlineVirtualizer({ count, getScrollElement, estimateSize, overscan = 5 }) {
+  const rowHeight    = estimateSize();
+  const [scrollTop,  setScrollTop] = useState(0);
+  const [height,     setHeight]    = useState(600);
+  const attachedRef  = useRef(null); // track which element we're listening to
+
+  // BUG-4 FIX: stable dep array [count, estimateSize].
+  // We want the effect to run when these structural inputs change (different
+  // list size → possibly different container), or on first mount. We do NOT
+  // want it to re-run on every scroll/resize — that's handled by the listeners
+  // themselves. The attachedRef guard is kept as a secondary safety net.
+  useEffect(() => {
+    const el = getScrollElement();
+    if (!el || el === attachedRef.current) return; // already attached to this element
+    attachedRef.current = el;
+    const onScroll = () => setScrollTop(el.scrollTop);
+    const onResize = () => setHeight(el.clientHeight || 600);
+    onResize();
+    el.addEventListener('scroll', onScroll, { passive: true });
+    const ro = typeof ResizeObserver !== 'undefined'
+      ? new ResizeObserver(onResize) : null;
+    if (ro) ro.observe(el);
+    return () => {
+      attachedRef.current = null;
+      el.removeEventListener('scroll', onScroll);
+      if (ro) ro.disconnect();
+    };
+  }, [count, estimateSize]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const visCount   = Math.ceil(height / rowHeight) + overscan * 2;
+  const endIndex   = Math.min(count - 1, startIndex + visCount);
+
+  const virtualItems = [];
+  for (let i = startIndex; i <= endIndex; i++) {
+    virtualItems.push({ index: i, key: i, start: i * rowHeight, size: rowHeight });
+  }
+
+  return {
+    getTotalSize:    () => count * rowHeight,
+    getVirtualItems: () => virtualItems,
+  };
+}
+
+// ── NOIBar component — proportional imbalance meter ─────────────────────────
+//
+// NOI-FIX: replaces the old hardcoded 70%/30% split with a proportional bar
+// driven by imbalance_size from the Polygon "I" event.
+//
+// Visual design:
+//   The bar is a horizontal track (48px wide × 4px tall).
+//   Center = equilibrium. Bar grows LEFT for buy imbalance (green),
+//   RIGHT for sell imbalance (red). Width is proportional to imbalance_size
+//   capped at 100K shares for the full-width extreme.
+//
+//   Examples:
+//     imbalance_size=5000  → 5% width (tiny imbalance, near center)
+//     imbalance_size=50000 → 50% width (significant)
+//     imbalance_size=100000+ → 100% (max bar)
+//
+// Shown below the signal badge when a non-neutral imbalance exists.
+// Also shown in AH mode rows (standalone, no signal required) because
+// imbalances are most meaningful during pre/after-hours auctions.
+
+const NOI_MAX_SHARES = 100_000  // 100K shares = full bar width
+
+function NOIBar({ noi, T }) {
+  if (!noi || noi.imbalance_side === 'N') return null
+
+  const isBuy   = noi.imbalance_side === 'B'
+  const color   = isBuy ? '#00e676' : '#ff3d5a'
+  const dimClr  = isBuy ? '#00e67620' : '#ff3d5a20'
+  const label   = isBuy ? 'BUY IMBAL' : 'SELL IMBAL'
+  const size    = noi.imbalance_size ?? 0
+
+  // Proportional fill: 0..NOI_MAX_SHARES → 0..100%
+  const fillPct = Math.min(100, Math.round((size / NOI_MAX_SHARES) * 100))
+  // Format size for display: "12.5K", "1.2M"
+  const sizeStr = size >= 1_000_000
+    ? `${(size/1_000_000).toFixed(1)}M`
+    : size >= 1_000
+    ? `${(size/1_000).toFixed(0)}K`
+    : String(size)
+
+  return (
+    <div style={{ display:'flex', alignItems:'center', gap:5, marginTop:3 }}>
+      {/* Track */}
+      <div style={{
+        position:'relative', width:48, height:4,
+        background: T?.bg3 || '#172438',
+        borderRadius:2, overflow:'hidden', flexShrink:0,
+      }}>
+        {/* Fill — grows from center outward */}
+        <div style={{
+          position:'absolute',
+          top:0,
+          height:'100%',
+          width: `${fillPct / 2}%`,  // half-track: center = 50%, max = 50% of track
+          // Buy: anchored at center, grows left
+          // Sell: anchored at center, grows right
+          left:  isBuy  ? `${50 - fillPct / 2}%` : '50%',
+          background: color,
+          borderRadius:2,
+          transition: 'width 0.3s ease, left 0.3s ease',
+        }}/>
+        {/* Center marker */}
+        <div style={{
+          position:'absolute', top:0, left:'50%',
+          width:1, height:'100%',
+          background: T?.border || '#172438',
+          transform:'translateX(-50%)',
+        }}/>
+      </div>
+      {/* Label + size */}
+      <div style={{ display:'flex', flexDirection:'column', gap:0 }}>
+        <span style={{
+          color, fontSize:7.5, fontWeight:700,
+          fontFamily: T?.font || 'inherit',
+          letterSpacing:0.3, lineHeight:1.2,
+        }}>{label}</span>
+        {size > 0 && (
+          <span style={{
+            color: T?.text2 || '#4a6278',
+            fontSize:7, fontFamily: T?.font || 'inherit', lineHeight:1.2,
+          }}>{sizeStr}</span>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ─── Memoized table row — skips re-render when visible data unchanged ─────────
 const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatchlist, subMode, gridCols, scalpSignals, setSelectedSymbol, haltedTickers, noiBySym, isStale = false, T }) {
   // MH: use day-over-day change_value / percent_change
   // AH: use ah_dollar / ah_pct (live_price vs today_close)
-  const ahDollar    = ticker.ah_dollar    ?? (ticker.today_close > 0 ? ticker.live_price - ticker.today_close : ticker.change_value) ?? 0;
-  const ahPct       = ticker.ah_pct       ?? (ticker.today_close > 0 ? (ticker.live_price - ticker.today_close) / ticker.today_close * 100 : ticker.percent_change) ?? 0;
+  //
+  // BUG-3 FIX: AH $ CHG fallback is now null (renders "—"), NOT ticker.change_value.
+  // Previously: when today_close = 0 (before _ah_close_loop runs, BUG-2),
+  // the fallback silently showed the MH day-change labeled as AH change — wrong data.
+  // Now: null → "—" makes the missing state explicit rather than misleadingly showing
+  // a value that belongs to a different session.
+  // Once BUG-2 (ws_engine.py) is deployed, today_close will be populated from
+  // the first AH refresh cycle and these cells will show correct values.
+  const ahDollar = ticker.ah_dollar != null
+    ? ticker.ah_dollar
+    : (ticker.today_close > 0 ? ticker.live_price - ticker.today_close : null);
+  const ahPct = ticker.ah_pct != null
+    ? ticker.ah_pct
+    : (ticker.today_close > 0
+        ? (ticker.live_price - ticker.today_close) / ticker.today_close * 100
+        : null);
+
   const displayChg  = subMode === 'AH' ? ahDollar : (ticker.change_value || 0);
   const displayPct  = subMode === 'AH' ? ahPct    : (ticker.percent_change || 0);
-  const isPositive  = displayChg >= 0;
+  const isPositive  = (displayChg ?? 0) >= 0;
   const changeColor = isPositive ? T.green : T.red;
   const isHalted    = haltedTickers?.has(ticker.ticker) ?? ticker.is_halted ?? false;
   const noi         = noiBySym?.[ticker.ticker] ?? null;
+
+  // Helper: format a nullable $ change value — shows "—" when null (AH before today_close populated)
+  const fmtChg = (v) => v == null ? "—" : `${v >= 0 ? "+" : ""}${fmt2(v)}`;
+  const fmtPct_ = (v) => v == null ? "—" : pct(v);
+
   return (
     <div className={`tr-hover${isHalted ? ' halt-row' : ''}`} style={{ display:"grid", gridTemplateColumns:gridCols, borderBottom:`1px solid ${T.border}` }}>
       {subMode === "MH" ? (
@@ -60,18 +244,7 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
                   </span>
                   <span style={{ color:T.text2, fontSize:9, fontFamily:T.font }}>{sig.strength} · {sig.prediction}%</span>
                   {noi && noi.imbalance_side !== 'N' && (
-                    <div style={{ display:'flex', alignItems:'center', gap:4, marginTop:2 }}>
-                      <div className="noi-bar-wrap">
-                        <div className="noi-bar-fill" style={{
-                          background: noi.imbalance_side==='B' ? '#00e676' : '#ff3d5a',
-                          width: noi.imbalance_side==='B' ? '70%' : '30%',
-                          left: noi.imbalance_side==='B' ? '30%' : '0%',
-                        }}/>
-                      </div>
-                      <span style={{ color:noi.imbalance_side==='B'?'#00e676':'#ff3d5a', fontSize:8, fontWeight:700 }}>
-                        {noi.imbalance_side==='B'?'BUY IMBAL':'SELL IMBAL'}
-                      </span>
-                    </div>
+                    <NOIBar noi={noi} T={T} />
                   )}
                 </div>
               );
@@ -97,27 +270,42 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
           </div>
           <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{ticker.prev_close>0?`$${fmt2(ticker.prev_close)}`:"—"}</div>
           <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{ticker.today_close>0?`$${fmt2(ticker.today_close)}`:"—"}</div>
-          <div style={{ padding:"10px 14px", color:T.cyan, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{fmt2(ticker.live_price||0)}</div>
-          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{isPositive?"+":" "}{fmt2(displayChg)}</div>
-          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{pct(displayPct)}</div>
+          <div style={{ padding:"10px 14px", color:T.cyan, fontFamily:T.font, fontSize:13, display:"flex", flexDirection:"column", alignItems:"flex-start", justifyContent:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>
+            <span>{fmt2(ticker.live_price||0)}</span>
+            {/* NOI-FIX: show imbalance bar in AH mode — most critical during auctions */}
+            {noi && noi.imbalance_side !== 'N' && <NOIBar noi={noi} T={T} />}
+          </div>
+          {/* BUG-3 FIX: fmtChg / fmtPct_ return "—" when value is null (today_close not yet populated) */}
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{fmtChg(displayChg)}</div>
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{fmtPct_(displayPct)}</div>
         </>
       )}
     </div>
   );
 }, (prev, next) => (
-  prev.ticker.live_price   === next.ticker.live_price &&
-  prev.ticker.change_value === next.ticker.change_value &&
-  prev.ticker.ah_dollar    === next.ticker.ah_dollar    &&
+  prev.ticker.live_price    === next.ticker.live_price &&
+  prev.ticker.change_value  === next.ticker.change_value &&
+  prev.ticker.ah_dollar     === next.ticker.ah_dollar    &&
   prev.ticker.percent_change === next.ticker.percent_change &&
-  prev.ticker.volume       === next.ticker.volume &&
-  prev.ticker.volume_spike === next.ticker.volume_spike &&
-  prev.isWatched           === next.isWatched &&
-  prev.isStale             === next.isStale    &&
-  prev.subMode             === next.subMode &&
-  prev.gridCols            === next.gridCols &&
-  prev.scalpSignals?.[prev.ticker.ticker]?.signal === next.scalpSignals?.[next.ticker.ticker]?.signal &&
+  prev.ticker.volume        === next.ticker.volume &&
+  prev.ticker.volume_spike  === next.ticker.volume_spike &&
+  // MEMO-FIX: today_close and prev_close were missing — AH mode rows
+  // (lines 98-99) would not re-render when these arrive at 4PM ET.
+  prev.ticker.today_close   === next.ticker.today_close &&
+  prev.ticker.prev_close    === next.ticker.prev_close &&
+  prev.isWatched            === next.isWatched &&
+  prev.isStale              === next.isStale    &&
+  prev.subMode              === next.subMode &&
+  prev.gridCols             === next.gridCols &&
+  // MEMO-FIX: was only checking .signal — prediction% and strength are also
+  // rendered (line 61). A signal updating from 60%→95% confidence with the
+  // same direction would silently skip the re-render.
+  prev.scalpSignals?.[prev.ticker.ticker]?.signal     === next.scalpSignals?.[next.ticker.ticker]?.signal &&
+  prev.scalpSignals?.[prev.ticker.ticker]?.prediction === next.scalpSignals?.[next.ticker.ticker]?.prediction &&
+  prev.scalpSignals?.[prev.ticker.ticker]?.strength   === next.scalpSignals?.[next.ticker.ticker]?.strength &&
   prev.haltedTickers?.has(prev.ticker.ticker) === next.haltedTickers?.has(next.ticker.ticker) &&
-  (prev.noiBySym?.[prev.ticker.ticker]?.imbalance_side) === (next.noiBySym?.[next.ticker.ticker]?.imbalance_side)
+  (prev.noiBySym?.[prev.ticker.ticker]?.imbalance_side) === (next.noiBySym?.[next.ticker.ticker]?.imbalance_side) &&
+  (prev.noiBySym?.[prev.ticker.ticker]?.imbalance_size)  === (next.noiBySym?.[next.ticker.ticker]?.imbalance_size)
 ));
 
 export default function PageLiveTable({ selectedSectors, onSectorChange, tickers = new Map(), marketSession = "market", wsWatchlistRef = null, quickFilter = null, onClearQuickFilter = null, wsStatus = 'connected', onLiveCount = null, watchlistProp = null, toggleWatchlistProp = null, isActive = true, staleTickers = new Set(), T }) {
@@ -126,7 +314,6 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
   const [minDelta,     setMinDelta]     = useState(0);
   const [extLink,      setExtLink]      = useState("Yahoo Finance");
   const [matrixCount,  setMatrixCount]  = useState(50);
-  const [currentPage,  setCurrentPage]  = useState(1);
   const [selectedSymbol, setSelectedSymbol] = useState(null);
   const [chartPanelTF,   setChartPanelTF]   = useState("5");
   const [chartOpenCount, setChartOpenCount] = useState(5);
@@ -144,27 +331,65 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
   const [subModeOverride, setSubModeOverride] = useState(null);
   const [matrixInterval,  setMatrixInterval]  = useState("5");
 
+  // T2-6: Virtual scrolling — replaces pagination. sortedSymbols is the full
+  // sorted list; useInlineVirtualizer renders only the visible ~20 rows at a time.
+  const [sortedSymbols, setSortedSymbols] = useState([]);
+
   const tableScrollRef  = useRef(null);
   const tickerArrayRef  = useRef([]);
   const noiBySymRef     = useRef({});   // BUG-10 FIX: raw mutable map, avoids spread copy on every NOI event
   const noiFlushTimerRef = useRef(null);
-  const ITEMS_PER_PAGE = 50;
+  // T2-7: Sort Web Worker — offloads O(N log N) sort from the main thread.
+  // Terminated and re-created on component unmount to avoid memory leaks.
+  const sortWorkerRef   = useRef(null);
+  // BUG-7 FIX: debounce ref — prevents 180 MB/s structured clone traffic to sort worker.
+  const sortDebounceRef = useRef(null);
 
   // Fallback local watchlist when not provided from root
   const [_localWatchlist, _setLocalWatchlist] = useState(new Set());
-  const watchlist    = watchlistProp ?? _localWatchlist;
-  const toggleWatchlist = toggleWatchlistProp ?? useCallback(async (symbol) => {
+  const watchlist = watchlistProp ?? _localWatchlist;
+  // HOOKS-FIX: useCallback must ALWAYS be called (Rules of Hooks).
+  // `toggleWatchlistProp ?? useCallback(...)` skips the hook when prop is provided
+  // → hook count changes between renders → React throws "rendered more hooks".
+  // Fix: always define the fallback, then pick which to expose.
+  const _fallbackToggle = useCallback(async (symbol) => {
     const isWatched = _localWatchlist.has(symbol);
     _setLocalWatchlist(prev => { const n=new Set(prev); isWatched?n.delete(symbol):n.add(symbol); return n; });
     try {
       await fetch(`${API_BASE}/api/watchlist/${isWatched?"remove":"add"}`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ticker:symbol}) });
     } catch { _setLocalWatchlist(prev => { const n=new Set(prev); isWatched?n.add(symbol):n.delete(symbol); return n; }); }
   }, [_localWatchlist]);
+  const toggleWatchlist = toggleWatchlistProp ?? _fallbackToggle;
 
   const autoSubMode = SESSION_META[marketSession]?.subMode ?? "MH";
   const subMode     = subModeOverride ?? autoSubMode;
   const setSubMode  = (id) => setSubModeOverride(id === autoSubMode ? null : id);
   useEffect(() => { setSubModeOverride(null); }, [autoSubMode]);
+
+  // T2-7: Sort Web Worker lifecycle — create once on mount, terminate on unmount.
+  // The worker is long-lived and reused for every sort request.
+  useEffect(() => {
+    let w;
+    try {
+      w = new Worker('/sortWorker.js');
+      w.onmessage = (e) => {
+        if (e.data?.type === 'result') setSortedSymbols(e.data.symbols);
+        if (e.data?.type === 'error')  console.warn('[SortWorker]', e.data.message);
+      };
+      w.onerror = (err) => console.warn('[SortWorker] Worker error:', err);
+      sortWorkerRef.current = w;
+    } catch {
+      // Web Worker unavailable (some sandboxed environments) — sortedSymbols
+      // will be computed synchronously via the fallback useMemo below.
+      sortWorkerRef.current = null;
+    }
+    return () => {
+      w?.terminate();
+      sortWorkerRef.current = null;
+      // BUG-7 FIX: cancel any pending debounce on unmount
+      if (sortDebounceRef.current) clearTimeout(sortDebounceRef.current);
+    };
+  }, []);
 
   // Esc closes chart panel
   useEffect(() => {
@@ -186,12 +411,28 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
   // Old: polled every 30s unconditionally = 120 Render HTTP requests/hr even
   // when user is on Portfolio/Signals/Scanner tab.
   // New: stops polling on tab switch, resumes + immediate fetch on return.
+  // ABORT-FIX: AbortController cancels inflight fetch on cleanup so a slow
+  // request from before a tab switch cannot resolve last and overwrite the
+  // fresher response that arrived after tab return.
   useEffect(() => {
-    if (!isActive) return;  // don't poll when tab is not visible
-    const poll = () => fetch(`${API_BASE}/api/scalp-analysis`).then(r=>r.ok?r.json():null).then(d=>{ if(!d?.data)return; const m={}; d.data.forEach(r=>{if(!r.status||r.status==="ok")m[r.ticker]=r;}); setScalpSignals(m); }).catch(()=>{});
+    if (!isActive) return;
+    let controller = new AbortController();
+    const poll = () => {
+      controller.abort();
+      controller = new AbortController();
+      fetch(`${API_BASE}/api/scalp-analysis`, { signal: controller.signal })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+          if (!d?.data) return;
+          const m = {};
+          d.data.forEach(r => { if (!r.status || r.status === 'ok') m[r.ticker] = r; });
+          setScalpSignals(m);
+        })
+        .catch(err => { if (err.name !== 'AbortError') console.debug('[NexRadar] scalp-analysis fetch:', err); });
+    };
     poll();  // immediate fetch on tab activation
     const id = setInterval(poll, 30_000);
-    return () => clearInterval(id);
+    return () => { clearInterval(id); controller.abort(); };
   }, [isActive]);
 
   // LULD halt tracking
@@ -261,87 +502,153 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
     fetch(`${API_BASE}/api/watchlist`).then(r=>r.ok?r.json():Promise.reject()).then(d=>_setLocalWatchlist(new Set(d.watchlist??[]))).catch(()=>{});
   }, [watchlistProp]);
 
+  // NOI-FIX: pre-populate noiBySym on mount from /api/noi snapshot.
+  // Polygon "I" events only fire when a new imbalance occurs — on page load
+  // or tab switch, the bars would be empty until the next event (could be minutes).
+  // Fetching the snapshot on mount means bars are immediately populated with
+  // the current imbalance state for all active tickers.
+  // Only runs once on mount (isActive guard avoids re-fetching on every tab switch).
+  useEffect(() => {
+    if (!isActive) return;
+    fetch(`${API_BASE}/api/noi`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (!d?.data?.length) return;
+        d.data.forEach(r => {
+          if (r.ticker && r.imbalance_side !== 'N') {
+            noiBySymRef.current[r.ticker] = {
+              imbalance_side: r.imbalance_side,
+              imbalance_size: r.imbalance_size ?? 0,
+            };
+          }
+        });
+        setNoiBySym({ ...noiBySymRef.current });
+      })
+      .catch(() => {}); // Non-critical — bars populate on next I event if fetch fails
+  }, [isActive]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Column sort
   const handleColSort = (key) => {
     setSortKey(prev => { if(prev===key){setSortDir(d=>d==="desc"?"asc":"desc");return key;} setSortDir("desc"); return key; });
-    setCurrentPage(1);
   };
 
-  // SORT-FIX: drive sort from tickers Map size + ts instead of 1s setInterval.
-  // Old: setInterval 1000ms = 3600 forced re-renders/hr regardless of data changes.
-  // New: only increments when tickers actually update — zero renders during idle.
-  const [sortTrigger, setSortTrigger] = useState(0);
-  const prevTickersSizeRef = useRef(0);
-  useEffect(() => {
-    const size = tickers.size;
-    if (size !== prevTickersSizeRef.current) {
-      prevTickersSizeRef.current = size;
-      setSortTrigger(t => t + 1);
-    }
-  }, [tickers]);
-
-  const [userFilterVersion, setUserFilterVersion] = useState(0);
-  useEffect(() => { setUserFilterVersion(v=>v+1); }, [selectedSectors, source, watchlist, earningsTickers, quickFilter]);
+  // T2-7: Sort pipeline — tickerArray useMemo feeds the sort worker.
+  //
+  // Stage 1 — tickerArray (O(N) filter, main thread):
+  //   Returns plain Array snapshot — serialisable across worker boundary.
+  //   Re-runs when live Map or filter inputs change.
+  //
+  // Stage 2 — sort worker (off main thread):
+  //   Receives snapshot, runs O(N log N) sort + quickFilters off-thread.
+  //   Posts { symbols: string[] } back. setSortedSymbols updates state.
+  //   Fallback: synchronous sort if Worker unavailable.
+  //
+  // Stage 3 — virtual render (T2-6):
+  //   useInlineVirtualizer renders only visible rows (~20 of 6,000+).
+  //   Each row does O(1) tickers.get(sym) for freshest data.
 
   const tickerArray = useMemo(() => {
     let arr = Array.from(tickers.values());
-    if (source==="WATCHLIST") arr = arr.filter(t=>watchlist.has(t.ticker));
-    if (!selectedSectors.includes("ALL")) {
+    if (source === 'WATCHLIST') arr = arr.filter(t => watchlist.has(t.ticker));
+    if (!selectedSectors.includes('ALL')) {
       arr = arr.filter(t => {
-        if (selectedSectors.includes("EARNINGS") && (t.is_earnings_gap_play||earningsTickers.has(t.ticker))) return true;
+        if (selectedSectors.includes('EARNINGS') && (t.is_earnings_gap_play || earningsTickers.has(t.ticker))) return true;
         const s = normalizeSector(t.sector);
-        return s && selectedSectors.some(sel=>s===sel&&sel!=="EARNINGS");
+        return s && selectedSectors.some(sel => s === sel && sel !== 'EARNINGS');
       });
     }
     tickerArrayRef.current = arr;
     return arr;
   }, [tickers, selectedSectors, source, watchlist, earningsTickers]);
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const filteredTickers = useMemo(() => {
-    let arr = tickerArrayRef.current.filter(t=>Math.abs(t.change_value||0)>=minDelta);
-    if (quickFilter==="VOL_SPIKES")  arr=arr.filter(t=>t.volume_spike);
-    if (quickFilter==="GAP_PLAYS")   arr=arr.filter(t=>t.is_gap_play);
-    if (quickFilter==="AH_MOMT")     arr=arr.filter(t=>t.ah_momentum);
-    if (quickFilter==="EARN_GAPS")   arr=arr.filter(t=>t.is_earnings_gap_play);
-    if (quickFilter==="DIAMOND")     arr=arr.filter(t=>Math.abs(t.percent_change||0)>=5);
-    const dir = sortDir==="desc"?-1:1;
-    return arr.slice().sort((a,b) => {
-      let va,vb;
-      switch(sortKey){
-        case "symbol":     return dir*(a.ticker||"").localeCompare(b.ticker||"");
-        case "open":       va=a.open||0;       vb=b.open||0;       break;
-        case "price":      va=a.live_price||0; vb=b.live_price||0; break;
-        case "change":     va=a.change_value||0; vb=b.change_value||0; break;
-        case "pct":        va=a.percent_change||0; vb=b.percent_change||0; break;
-        case "volume":     va=a.volume||0;     vb=b.volume||0;     break;
-        case "prev_close": va=a.prev_close||0; vb=b.prev_close||0; break;
-        case "today_close":va=a.today_close||0;vb=b.today_close||0;break;
-        case "live_price": va=a.live_price||0; vb=b.live_price||0; break;
-        default:           va=a.change_value||0; vb=b.change_value||0;
-      }
-      return dir*(va-vb);
-    });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sortTrigger, userFilterVersion, minDelta, quickFilter, sortKey, sortDir]);
+  // Dispatch to sort worker (or synchronous fallback) whenever inputs change.
+  // NOTE: tickerArray is already sector+source+watchlist filtered by useMemo above.
+  // We pass selectedSectors=['ALL'] and source='ALL' to the worker so it doesn't
+  // double-filter — the worker only needs to handle minDelta and quickFilter.
+  //
+  // BUG-7 FIX: 150ms debounce prevents 6,000-object postMessage on every rAF flush.
+  // During live trading tickers Map changes ~60/s (every rAF) → tickerArray recomputes
+  // → useEffect fires → 6,000-object structured clone → sort worker → setSortedSymbols.
+  // 150ms debounce: ~6 dispatches/s instead of ~60, cuts structured-clone traffic by 90%.
+  // The 150ms delay is imperceptible in sort responsiveness but eliminates the CPU spike.
+  useEffect(() => {
+    const arr = tickerArray;
 
-  useEffect(() => { setCurrentPage(1); }, [selectedSectors, minDelta]);
+    const dispatch = () => {
+      if (sortWorkerRef.current) {
+        sortWorkerRef.current.postMessage({
+          type: 'sort',
+          payload: {
+            tickers:         arr,
+            sortKey,
+            sortDir,
+            minDelta,
+            quickFilter,
+            source:          'ALL',          // already filtered in tickerArray useMemo
+            watchlist:       [],             // already filtered in tickerArray useMemo
+            selectedSectors: ['ALL'],        // already filtered in tickerArray useMemo
+            earningsTickers: [],             // already filtered in tickerArray useMemo
+            subMode,
+          },
+        });
+      } else {
+        // Synchronous fallback (Worker unavailable — sandboxed environments)
+        let fa = arr.filter(t => Math.abs(t.change_value || 0) >= minDelta);
+        if (quickFilter === 'VOL_SPIKES') fa = fa.filter(t => t.volume_spike);
+        if (quickFilter === 'GAP_PLAYS')  fa = fa.filter(t => t.is_gap_play);
+        if (quickFilter === 'AH_MOMT')    fa = fa.filter(t => t.ah_momentum);
+        if (quickFilter === 'EARN_GAPS')  fa = fa.filter(t => t.is_earnings_gap_play);
+        if (quickFilter === 'DIAMOND')    fa = fa.filter(t => Math.abs(t.percent_change || 0) >= 5);
+        const dir = sortDir === 'desc' ? -1 : 1;
+        fa = fa.slice().sort((a, b) => {
+          if (sortKey === 'symbol') return dir * (a.ticker || '').localeCompare(b.ticker || '');
+          const kmap = { open:'open', price:'live_price', change:'change_value', pct:'percent_change', volume:'volume', prev_close:'prev_close', today_close:'today_close', live_price:'live_price' };
+          const k = kmap[sortKey] ?? 'change_value';
+          return dir * ((a[k] || 0) - (b[k] || 0));
+        });
+        setSortedSymbols(fa.map(t => t.ticker));
+      }
+    };
+
+    // BUG-7 FIX: debounce — cancel any pending dispatch and reschedule
+    if (sortDebounceRef.current) clearTimeout(sortDebounceRef.current);
+    sortDebounceRef.current = setTimeout(() => {
+      sortDebounceRef.current = null;
+      dispatch();
+    }, 150);
+
+    // Cleanup: cancel debounce if deps change before it fires
+    return () => {
+      if (sortDebounceRef.current) {
+        clearTimeout(sortDebounceRef.current);
+        sortDebounceRef.current = null;
+      }
+    };
+  }, [tickerArray, sortKey, sortDir, minDelta, quickFilter, subMode]); // eslint-disable-line
+
   useEffect(() => { if(onLiveCount) onLiveCount(tickerArray.length); }, [tickerArray.length]); // eslint-disable-line
 
-  const totalPages = Math.ceil(filteredTickers.length / ITEMS_PER_PAGE);
-  const startIndex = (currentPage-1)*ITEMS_PER_PAGE;
-  const paginatedTickers = filteredTickers.slice(startIndex, startIndex+ITEMS_PER_PAGE);
+  // T2-6: Inline virtual scrolling — zero external dependencies.
+  // Renders only visible rows (~20 of 6,000+). No @tanstack/react-virtual needed.
+  const ROW_HEIGHT = 45;
+  const virtualizer = useInlineVirtualizer({
+    count:            sortedSymbols.length,
+    getScrollElement: () => tableScrollRef.current,
+    estimateSize:     () => ROW_HEIGHT,
+    overscan:         5,
+  });
 
   const matrixSymbols = useMemo(() => {
-    if (filteredTickers.length>0) return filteredTickers.slice(0,matrixCount).map(t=>t.ticker);
-    return ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","JPM","V","MA","UNH","LLY","XOM","PG","HD","BAC","ABBV","NFLX","AMD"].slice(0,matrixCount);
-  }, [filteredTickers, matrixCount]);
+    if (sortedSymbols.length > 0) return sortedSymbols.slice(0, matrixCount);
+    return ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","JPM","V","MA","UNH","LLY","XOM","PG","HD","BAC","ABBV","NFLX","AMD"].slice(0, matrixCount);
+  }, [sortedSymbols, matrixCount]);
 
   const openExternalCharts = () => {
-    filteredTickers.slice(0,chartOpenCount).forEach(t => {
-      window.open(extLink==="TradingView"?`https://www.tradingview.com/chart/?symbol=${t.ticker}`:`https://finance.yahoo.com/quote/${t.ticker}`,"_blank");
+    sortedSymbols.slice(0, chartOpenCount).forEach(sym => {
+      window.open(extLink === "TradingView" ? `https://www.tradingview.com/chart/?symbol=${sym}` : `https://finance.yahoo.com/quote/${sym}`, "_blank");
     });
   };
+
 
   const MH_COLS = [
     {key:"symbol",w:"260px",label:"SYMBOL"},{key:"open",w:"1fr",label:"OPEN"},{key:"price",w:"1fr",label:"PRICE"},
@@ -414,8 +721,8 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
           <div className="card" style={{ flex:selectedSymbol?"1 1 58%":"1 1 100%", minWidth:0, transition:"flex 0.3s ease", overflow:"hidden" }}>
             <SectionHeader title={`Live Stock Data · ${subMode==="MH"?"Market Hours":"After Hours"}${!selectedSectors.includes("ALL")?" · "+activeLabel:""}`} T={T}>
               <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-                <span style={{ color:T.text2, fontSize:12, fontFamily:T.font, fontWeight:500 }}>{filteredTickers.length.toLocaleString()} tickers</span>
-                {tickers.size>0?(<><span className="live-dot"/><span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:600 }}>LIVE</span></>):wsStatus==='connecting'?(<span style={{ color:T.gold, fontSize:12, fontFamily:T.font }}>🔄 RECONNECTING…</span>):(<span style={{ color:T.cyan, fontSize:12, fontFamily:T.font }}>⏳ AWAITING…</span>)}
+                <span style={{ color:T.text2, fontSize:12, fontFamily:T.font, fontWeight:500 }}>{sortedSymbols.length.toLocaleString()} tickers</span>
+                {tickers.size>0?(<><span className="live-dot"/><span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:600 }}>LIVE</span></>):wsStatus==='connecting'?(<span style={{ color:T.gold, fontSize:12, fontFamily:T.font }}>🔄 RECONNECTING…</span>):wsStatus==='feed_warning'?(<span style={{ color:T.gold, fontSize:12, fontFamily:T.font }}>⚠ FEED RECONNECTING…</span>):(<span style={{ color:T.cyan, fontSize:12, fontFamily:T.font }}>⏳ AWAITING…</span>)}
               </div>
             </SectionHeader>
 
@@ -431,26 +738,42 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
               })}
             </div>
 
-            <div ref={tableScrollRef} style={{ maxHeight:"calc(100vh - 420px)", minHeight:"300px", overflowY:"auto", overflowX:"hidden", position:"relative" }}>
+            {/* T2-6: Virtual scroll container — only ~20 DOM nodes at a time regardless of 6,000+ tickers */}
+            <div ref={tableScrollRef} style={{ height:"calc(100vh - 420px)", minHeight:"300px", overflowY:"auto", overflowX:"hidden", position:"relative" }}>
               {tickers.size===0&&wsStatus==='connecting'&&<div style={{ padding:40, textAlign:"center", color:T.gold, fontSize:13, fontFamily:T.font }}>🔄 Reconnecting to live feed…</div>}
               {tickers.size===0&&wsStatus==='connected'&&<div style={{ padding:40, textAlign:"center", color:T.cyan, fontSize:13, fontFamily:T.font }}>⏳ Connected — waiting for snapshot…</div>}
               {tickers.size===0&&wsStatus==='disconnected'&&<div style={{ padding:40, textAlign:"center", color:T.red, fontSize:13, fontFamily:T.font }}>❌ WebSocket disconnected — reconnecting</div>}
-              {paginatedTickers.length===0&&tickers.size>0&&<div style={{ padding:40, textAlign:"center", color:T.text2, fontSize:13, fontFamily:T.font }}>No tickers match the current filter</div>}
-              {paginatedTickers.map((ticker,i) => (
-                <LiveTableRow key={ticker.ticker||i} ticker={ticker} isWatched={watchlist.has(ticker.ticker)} toggleWatchlist={toggleWatchlist} subMode={subMode} gridCols={gridCols} scalpSignals={scalpSignals} setSelectedSymbol={setSelectedSymbol} haltedTickers={haltedTickers} noiBySym={noiBySym} T={T} isStale={staleTickers.has(ticker.ticker)} />
-              ))}
-              {paginatedTickers.length>=10&&<div style={{ position:"sticky", bottom:0, left:0, right:0, height:40, background:`linear-gradient(to bottom,transparent,${T.bg1})`, pointerEvents:"none" }}/>}
+              {/* RECONNECT-BANNER-FIX: when feed drops but tickers are cached, show a
+                  slim amber banner instead of blanking the table. Last-known prices stay
+                  visible — far more useful than an empty screen during a brief reconnect. */}
+              {tickers.size>0&&wsStatus==='feed_warning'&&(
+                <div style={{ padding:"5px 14px", background:T.gold+"18", borderBottom:`1px solid ${T.gold}33`,
+                  color:T.gold, fontSize:10, fontFamily:T.font, textAlign:"center", letterSpacing:0.5 }}>
+                  ⚠ Feed reconnecting — prices shown are last known
+                </div>
+              )}
+              {sortedSymbols.length===0&&tickers.size>0&&<div style={{ padding:40, textAlign:"center", color:T.text2, fontSize:13, fontFamily:T.font }}>No tickers match the current filter</div>}
+              {sortedSymbols.length > 0 && (
+                <div style={{ height: virtualizer.getTotalSize(), width:"100%", position:"relative" }}>
+                  {virtualizer.getVirtualItems().map(virtualRow => {
+                    const sym    = sortedSymbols[virtualRow.index];
+                    const ticker = tickers.get(sym);
+                    if (!ticker) return null;
+                    return (
+                      <div key={virtualRow.key} data-index={virtualRow.index} style={{ position:"absolute", top:0, left:0, width:"100%", height:`${virtualRow.size}px`, transform:`translateY(${virtualRow.start}px)` }}>
+                        <LiveTableRow ticker={ticker} isWatched={watchlist.has(sym)} toggleWatchlist={toggleWatchlist} subMode={subMode} gridCols={gridCols} scalpSignals={scalpSignals} setSelectedSymbol={setSelectedSymbol} haltedTickers={haltedTickers} noiBySym={noiBySym} T={T} isStale={staleTickers.has(sym)} />
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
 
-            <div style={{ padding:"14px 18px", borderTop:`2px solid ${T.border}`, display:"flex", justifyContent:"space-between", alignItems:"center", background:T.bg1, position:"sticky", bottom:0, zIndex:10 }}>
+            <div style={{ padding:"10px 18px", borderTop:`2px solid ${T.border}`, display:"flex", justifyContent:"space-between", alignItems:"center", background:T.bg1, position:"sticky", bottom:0, zIndex:10 }}>
               <span style={{ color:T.text1, fontSize:13, fontFamily:T.font, fontWeight:600 }}>
-                {paginatedTickers.length>0?`Showing ${startIndex+1}-${Math.min(startIndex+ITEMS_PER_PAGE,filteredTickers.length)} of ${filteredTickers.length.toLocaleString()} stocks`:"No stocks to display"}
+                {sortedSymbols.length > 0 ? `${sortedSymbols.length.toLocaleString()} stocks · scroll to browse` : "No stocks to display"}
               </span>
-              <div style={{ display:"flex", gap:10, alignItems:"center" }}>
-                <span style={{ color:T.text1, fontSize:13, fontFamily:T.font, fontWeight:600 }}>Page {currentPage} of {totalPages||1}</span>
-                <button className="btn-ghost" style={{ fontSize:12, padding:"6px 12px" }} onClick={()=>{setCurrentPage(p=>Math.max(1,p-1));tableScrollRef.current&&(tableScrollRef.current.scrollTop=0);}} disabled={currentPage===1}>← PREV</button>
-                <button className="btn-ghost" style={{ fontSize:12, padding:"6px 12px" }} onClick={()=>{setCurrentPage(p=>Math.min(totalPages,p+1));tableScrollRef.current&&(tableScrollRef.current.scrollTop=0);}} disabled={currentPage>=totalPages}>NEXT →</button>
-              </div>
+              <span style={{ color:T.text2, fontSize:11, fontFamily:T.font }}>Virtual scroll · {virtualizer.getVirtualItems().length} rows rendered</span>
             </div>
           </div>
 

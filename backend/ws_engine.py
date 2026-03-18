@@ -22,6 +22,23 @@ FIXES IN THIS VERSION:
                                    never poisoned by Fix-20a)
                    2. last_trade.p (only AH  -  intraday would re-poison Fix-20a)
                    3. Only push to failed[] if Polygon has ZERO data for ticker
+
+  BUG-1 FIX  open / open_price added to _DELTA_FIELDS.
+              These fields were missing from slim tick_batch deltas, meaning
+              after a market-open cache clear the OPEN column in MH mode
+              showed $0.00 for up to 15s (the snapshot_delta window).
+              Now ticks carry open so the column is always populated.
+
+  BUG-2 FIX  _watchlist_tickers seeded at start() time.
+              _ah_close_loop calls _refresh_ah_closes() which iterates
+              self._watchlist_tickers to decide which tickers need today_close
+              refreshed. That list was only populated via set_watchlist_tickers()
+              which is only called on watchlist add/remove — never on startup.
+              Result: today_close stayed 0 for the entire AH session unless
+              the user edited the watchlist. AH $ CHG and AH % CHG both
+              fell back to MH change_value (BUG-3). Fix: seed
+              self._watchlist_tickers = watchlist in start() immediately after
+              the watchlist is loaded from DB.
 """
 
 from __future__ import annotations
@@ -59,7 +76,7 @@ POLYGON_WS_URL   = "wss://socket.polygon.io/stocks"
 POLYGON_REST_URL = "https://api.polygon.io/v2"
 SNAPSHOT_INTERVAL_S  = 15     # check for dirty tickers every 15s
 PORTFOLIO_REFRESH_S  = 60   # PORTFIX-1: safety-net poll only; instant updates via /api/portfolio/sync
-AH_CLOSE_REFRESH_S   = 60   # 1 min  -  refresh AH closes during extended hours
+AH_CLOSE_REFRESH_S   = 60  # 5 min  -  refresh AH closes during extended hours
 DB_WRITE_INTERVAL_S  = 300
 HIST_FETCH_WORKERS   = 8
 TICK_BATCH_SIZE      = 100    # ticks buffered before a flush
@@ -86,6 +103,7 @@ def _get_session(now: datetime | None = None) -> str:
 
 def _market_open_today() -> bool:
     return _get_session() in ("pre", "market", "after")
+
 
 
 # ── WSEngine ───────────────────────────────────────────────────────────────────
@@ -161,11 +179,26 @@ class WSEngine:
         self._feed_warned: bool = False  # TIER1-1.2
 
         # _watchlist_tickers: subset of all tickers — signal + AH scope
+        # BUG-2 FIX: seeded at start() from DB, not lazily on first watchlist edit.
         self._watchlist_tickers: List[str] = []
 
         # WS reconnect counter — initialised here (not lazily in _ws_run) to
         # eliminate the hasattr read/write race between _on_open and _ws_run.
         self._ws_retry_count: int = 0
+
+        # TIER3-9: freshness tracking — per-ticker last_tick_ts (monotonic)
+        # Used by snapshot_loop to stamp last_tick_ts and flag stale:True
+        # for tickers silent > STALE_TICK_S during market hours.
+        self._last_tick_mono: Dict[str, float] = {}  # ticker → time.monotonic()
+        self._tick_mono_lock = threading.Lock()
+
+        # TIER3-10: Polygon WS message-rate monitor
+        # Counts T/A messages per 10s window. If rate drops to 0 during market
+        # hours for > FEED_SILENCE_S, broadcasts feed_warning (distinct from
+        # the existing 60s ws_engine warning that only fires on snapshot cycle).
+        self._poly_msg_count: int = 0          # incremented on every T/A message
+        self._poly_msg_lock  = threading.Lock()
+        self._poly_rate_warned: bool = False   # suppress repeat broadcasts
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -180,9 +213,16 @@ class WSEngine:
         self._sector_map  = sector_map
 
         # Signal watcher
-        # Signal watcher - Corrected method name and ticker extraction
         raw_watchlist = self._db.get_signal_watchlist()
         watchlist = [row['ticker'] for row in raw_watchlist if 'ticker' in row]
+
+        # BUG-2 FIX: seed _watchlist_tickers at startup so _ah_close_loop has
+        # valid targets from the very first AH refresh cycle.  Previously this
+        # list was only populated via set_watchlist_tickers() which is called
+        # on add/remove — never on startup — causing today_close = 0 all session
+        # and making AH $ CHG / % CHG silently fall back to MH day change.
+        self._watchlist_tickers = list(watchlist)
+        logger.info(f"WSEngine.start: seeded _watchlist_tickers with {len(self._watchlist_tickers)} tickers")
 
         self._signal_watcher = ScalpingSignalWatcher(
             db=self._db,
@@ -226,6 +266,17 @@ class WSEngine:
 
         # Tick batch flush — coalesces per-tick broadcasts into 250ms batches
         t = threading.Thread(target=self._tick_flush_loop, daemon=True, name="tick-flush")
+        t.start()
+        self._threads.append(t)
+
+        # TIER3-10: Polygon message-rate monitor
+        t = threading.Thread(target=self._feed_rate_monitor_loop, daemon=True, name="feed-rate-monitor")
+        t.start()
+        self._threads.append(t)
+
+        # NOI-PLAN-FIX: REST-based imbalance poll (WS I.* requires Business plan)
+        self._imbalance_cache: Dict[str, dict] = {}
+        t = threading.Thread(target=self._noi_poll_loop, daemon=True, name="noi-poll")
         t.start()
         self._threads.append(t)
 
@@ -461,6 +512,7 @@ class WSEngine:
                 "company":       self._company_map.get(ticker, ""),
                 "sector":        self._sector_map.get(ticker, ""),
                 # "open" alias: frontend MH table renders ticker.open (not open_price)
+                # BUG-1 FIX: also kept here so the full cache entry always has both.
                 "open":          open_price,
                 "ts":            msg.get("t") or int(time.time() * 1000),
             }
@@ -468,6 +520,14 @@ class WSEngine:
             # GAP-5: mark ticker dirty for snapshot_delta + metrics
             self._dirty_tickers.add(ticker)
             self._last_tick_processed_ts = time.monotonic()
+
+            # TIER3-9: stamp per-ticker monotonic time for freshness tracking
+            with self._tick_mono_lock:
+                self._last_tick_mono[ticker] = time.monotonic()
+
+            # TIER3-10: count every T/A message for rate monitoring
+            with self._poly_msg_lock:
+                self._poly_msg_count += 1
 
             # TIER1-1.6: Cache size guard
             if len(self._cache) > 10_000:
@@ -478,9 +538,19 @@ class WSEngine:
                     self._dirty_tickers.discard(k)
                 logger.info(f"Cache eviction: removed {len(evict)} unknown tickers")
 
-        # Feed to signal watcher
+        # Feed to signal watcher — pass imbalance data if available
         if self._signal_watcher:
-            self._signal_watcher.on_tick(ticker, price, msg.get("t"))
+            # NOI-FIX: look up current imbalance for this ticker so Scalping_Signal
+            # on_tick() can apply the NOI institutional filter during AH sessions.
+            # _imbalance_cache is written by _noi_poll_loop (REST poll thread).
+            _imb = getattr(self, "_imbalance_cache", {}).get(ticker, {})
+            self._signal_watcher.on_tick(
+                ticker,
+                price,
+                msg.get("t"),
+                imbalance_side=_imb.get("side", "N"),
+                imbalance_size=_imb.get("size", 0),
+            )
 
         # Buffer for DB write  -  capped to prevent unbounded growth during DB outage
         with self._pending_lock:
@@ -511,17 +581,156 @@ class WSEngine:
             with self._batch_lock:
                 self._tick_batch[ticker] = updated
 
+    # ── NOI Imbalance REST poll loop ──────────────────────────────────────────
+    #
+    # NOI-PLAN-FIX: Polygon "I" (Imbalance) WS events require the Business plan
+    # ($199/mo). The current plan (Starter/Advanced) covers T.* and A.* only —
+    # subscribing to I.* returns ev="status" status="error" "not authorized".
+    #
+    # Alternative: poll Polygon REST /v2/snapshot for watchlist tickers every 30s
+    # during pre-market and market-open window (7:00–10:00 AM ET) when opening
+    # imbalances are most active. The snapshot response includes:
+    #   todaysChangePerc, todaysChange, day.o/h/l/c/v, fmv (fair market value)
+    # We derive a synthetic imbalance from price vs FMV:
+    #   price > fmv → buy pressure (market bid above fair value)
+    #   price < fmv → sell pressure
+    # This is not as precise as the "I" event but is free, accurate enough for
+    # the visual bar, and feeds the NOI institutional filter in Scalping_Signal.py.
+    #
+    # During AH (4–8 PM ET), the same poll runs every 60s using the watchlist
+    # tickers that are already being refreshed by _ah_close_loop.
+
+    def _noi_from_snapshot(self, item: dict, ticker: str) -> dict:
+        """
+        Derive synthetic imbalance from Polygon REST snapshot item.
+        Returns {side: "B"/"S"/"N", size: int, ts: ms}.
+
+        Logic:
+          last_price vs fmv (fair market value):
+            > fmv by ≥0.1% → buy pressure (B)
+            < fmv by ≥0.1% → sell pressure (S)
+            within 0.1%    → neutral (N)
+          size = abs(last_price - fmv) / fmv * 100_000  (synthetic shares proxy)
+        """
+        last_trade = item.get("lastTrade") or {}
+        day        = item.get("day") or {}
+        fmv        = float(item.get("fmv") or 0)
+        price      = float(last_trade.get("p") or day.get("c") or 0)
+
+        if fmv <= 0 or price <= 0:
+            return {"side": "N", "size": 0, "ts": int(time.time() * 1000)}
+
+        diff_pct = (price - fmv) / fmv * 100
+        if diff_pct >= 0.1:
+            side = "B"
+        elif diff_pct <= -0.1:
+            side = "S"
+        else:
+            return {"side": "N", "size": 0, "ts": int(time.time() * 1000)}
+
+        # Synthetic size: 0.1% diff = 100 shares, 1% diff = 1000, 5% = 5000
+        size = int(abs(diff_pct) * 1000)
+        return {"side": side, "size": size, "ts": int(time.time() * 1000)}
+
+    def _noi_poll_loop(self) -> None:
+        """
+        Polls Polygon REST snapshot for watchlist tickers to derive NOI imbalance.
+        Runs during pre-market (4–9:30 AM ET) and market-open window (9:30–10:00 AM)
+        and after-hours (4–8 PM ET) — the periods when imbalances matter most.
+        Interval: 30s during opening window, 60s otherwise.
+        """
+        if not hasattr(self, "_imbalance_cache"):
+            self._imbalance_cache: Dict[str, dict] = {}
+
+        while not self._shutdown.is_set():
+            session = _get_session()
+            active  = session in ("pre", "after", "market")
+
+            if not active:
+                # Market closed/weekend — check every 5 min, do nothing
+                for _ in range(300):
+                    if self._shutdown.is_set(): return
+                    time.sleep(1)
+                continue
+
+            interval_s = 30  # 30s during active sessions
+
+            try:
+                with self._cache_lock:
+                    target = list(self._watchlist_tickers)
+
+                if not target:
+                    time.sleep(interval_s)
+                    continue
+
+                params = {"tickers": ",".join(target), "apiKey": self._api_key}
+                resp = requests.get(
+                    f"{POLYGON_REST_URL}/snapshot/locale/us/markets/stocks/tickers",
+                    params=params, timeout=15
+                )
+                resp.raise_for_status()
+                items = resp.json().get("tickers", [])
+
+                changed = []
+                for item in items:
+                    tk = item.get("ticker", "")
+                    if not tk:
+                        continue
+                    noi = self._noi_from_snapshot(item, tk)
+                    prev = self._imbalance_cache.get(tk, {})
+                    # Only broadcast if side changed or size moved >10%
+                    size_moved = abs(noi["size"] - prev.get("size", 0)) > max(prev.get("size", 0) * 0.1, 100)
+                    if noi["side"] != prev.get("side") or (noi["side"] != "N" and size_moved):
+                        self._imbalance_cache[tk] = noi
+                        if noi["side"] != "N":
+                            self._broadcast({
+                                "type":           "noi_update",
+                                "ticker":         tk,
+                                "imbalance_side": noi["side"],
+                                "imbalance_size": noi["size"],
+                                "ts":             noi["ts"],
+                            })
+                            changed.append(tk)
+
+                if changed:
+                    logger.debug(f"NOI-POLL: {len(changed)} imbalance updates: {changed[:5]}")
+
+            except Exception as e:
+                logger.debug(f"NOI poll error: {e}")
+
+            for _ in range(interval_s):
+                if self._shutdown.is_set(): return
+                time.sleep(1)
+
     # ── Tick flush loop ────────────────────────────────────────────────────────
 
-    # DELTA-FIX: 7-field slim delta per tick_batch (~100B vs ~500B full entry)
-    _DELTA_FIELDS = ("ticker", "price", "change_pct", "percent_change", "volume", "rvol", "ts")
+    # BUG-1 FIX: "open" and "open_price" added to _DELTA_FIELDS.
+    # Previously these were absent from the slim tick_batch delta, so after
+    # a market-open cache clear the MH OPEN column showed $0.00 for up to 15s
+    # (the snapshot_delta broadcast window).  With both fields included, the
+    # very first tick for each ticker after reconnect carries the open price.
+    #
+    # DELTA-FIX: slim delta per tick_batch
+    # change_value and live_price added so $ CHG / PRICE columns are always
+    # live — without them the table shows stale snapshot values for $ CHG
+    # even when % CHG is correct (percent_change IS in the delta).
+    _DELTA_FIELDS = (
+        "ticker", "price", "live_price", "change_value",
+        "change_pct", "percent_change",
+        "volume", "rvol", "ts",
+        # BUG-1 FIX: open + open_price included so MH OPEN column is always current.
+        "open", "open_price",
+    )
+
+    # TIER3-9: ticker silent > this many seconds during market hours → stale
+    _STALE_TICK_S = 60
 
     def _make_delta(self, entry: dict) -> dict:
         return {f: entry[f] for f in self._DELTA_FIELDS if f in entry}
 
     def _tick_flush_loop(self) -> None:
         """
-        DELTA-FIX: batch_data now sends slim 7-field delta instead of full entry.
+        DELTA-FIX: batch_data now sends slim 12-field delta instead of full entry.
         Reduces tick_batch from ~1.3 GB/hr to ~0.27 GB/hr per client.
         Frontend must merge delta via Object.assign(priceMap[t], delta).
         Full row available from snapshot (every 5min) or on SSE connect.
@@ -568,8 +777,26 @@ class WSEngine:
                 delta_rows = [self._cache[t] for t in dirty if t in self._cache]
 
             if delta_rows:
+                # TIER3-9: stamp last_tick_ts on every delta row and flag stale
+                # A ticker not ticked in > STALE_TICK_S during market hours gets
+                # stale:True so the frontend can dim/blur its price cells.
+                session_now = _get_session()
+                now_mono    = time.monotonic()
+                now_ms      = int(time.time() * 1000)
+                if session_now == "market":
+                    with self._tick_mono_lock:
+                        mono_snap = dict(self._last_tick_mono)
+                    for row in delta_rows:
+                        t  = row.get("ticker", "")
+                        lm = mono_snap.get(t, now_mono)
+                        row["last_tick_ts"] = now_ms - int((now_mono - lm) * 1000)
+                        row["stale"]        = (now_mono - lm) > self._STALE_TICK_S
+                else:
+                    for row in delta_rows:
+                        row["stale"] = False
+
                 self._broadcast({"type": "snapshot_delta", "data": delta_rows,
-                                 "ts": int(time.time() * 1000)})
+                                 "ts": now_ms})
 
             # TIER1-1.2: Feed health check
             _silence_s = time.monotonic() - self._last_tick_processed_ts
@@ -582,6 +809,58 @@ class WSEngine:
                 elif _silence_s < 30 and self._feed_warned:
                     self._feed_warned = False
                     self._broadcast({"type": "feed_warning", "ok": True, "msg": "Feed restored"})
+
+    # TIER3-10: Polygon WS message-rate monitor
+    # ──────────────────────────────────────────────────────────────────────────
+    # Checks the raw T/A message count every 10s.
+    # If the count stays at 0 for > FEED_SILENCE_S during market hours,
+    # broadcasts feed_warning (Polygon silently stopped sending).
+    # Separate from the existing 60s snapshot-loop check because:
+    #   - snapshot_loop only fires every 15s and checks _last_tick_processed_ts
+    #   - this loop measures the RAW wire count before any filtering,
+    #     catching cases where Polygon sends messages but all are filtered out
+    #     (e.g. non-watchlist symbols) vs. actually silent.
+
+    _FEED_SILENCE_S  = 30   # 3 × 10s windows with 0 messages → warn
+    _FEED_RATE_POLL  = 10   # sample every 10 seconds
+
+    def _feed_rate_monitor_loop(self) -> None:
+        consecutive_zero = 0
+        while not self._shutdown.is_set():
+            time.sleep(self._FEED_RATE_POLL)
+            session = _get_session()
+
+            with self._poly_msg_lock:
+                count              = self._poly_msg_count
+                self._poly_msg_count = 0   # reset counter each window
+
+            if session != "market":
+                # Pre/AH/closed: Polygon legitimately sends fewer messages — reset
+                consecutive_zero   = 0
+                if self._poly_rate_warned:
+                    self._poly_rate_warned = False
+                    self._broadcast({"type": "feed_warning", "ok": True,
+                                     "msg": "Feed rate restored (non-market hours)"})
+                continue
+
+            if count == 0:
+                consecutive_zero += 1
+                silence_s = consecutive_zero * self._FEED_RATE_POLL
+                if silence_s >= self._FEED_SILENCE_S and not self._poly_rate_warned:
+                    self._poly_rate_warned = True
+                    self._broadcast({"type": "feed_warning", "ok": False,
+                                     "msg": f"Polygon WS silent for {silence_s}s — no T/A messages received"})
+                    logger.warning(
+                        f"TIER3-10 FEED RATE: 0 Polygon T/A messages in {silence_s}s "
+                        f"during market hours — possible silent drop"
+                    )
+            else:
+                consecutive_zero = 0
+                if self._poly_rate_warned:
+                    self._poly_rate_warned = False
+                    self._broadcast({"type": "feed_warning", "ok": True,
+                                     "msg": f"Feed restored — {count} messages in last {self._FEED_RATE_POLL}s"})
+                    logger.info(f"TIER3-10 FEED RATE: restored — {count} msgs/10s")
 
     # ── Historical / snapshot fetch from Polygon REST ─────────────────────────
 
@@ -607,11 +886,23 @@ class WSEngine:
         stale: list[str] = []
         now_ts = int(time.time())
 
-        try:
-            cached_rows = self._db.get_snapshot_cache()
-        except Exception as e:
-            logger.error(f"get_snapshot_cache failed: {e} — falling back to Polygon")
-            cached_rows = []
+        # SSL-RETRY-FIX: Supabase SSL connections sometimes fail with
+        # "sslv3 alert bad record mac" on first attempt (transient TLS issue).
+        # Without a retry, get_snapshot_cache() returns [] → triggers full
+        # Polygon REST fetch (25+ batches, 30-60s) → SSE snapshot_ready event
+        # fires too late → clients time out and receive empty snapshot → 0 tickers.
+        cached_rows = []
+        for _attempt in range(3):
+            try:
+                cached_rows = self._db.get_snapshot_cache()
+                if cached_rows:
+                    break
+            except Exception as e:
+                logger.warning(f"get_snapshot_cache attempt {_attempt+1}/3 failed: {e}")
+                if _attempt < 2:
+                    time.sleep(2)
+                else:
+                    logger.error("get_snapshot_cache all retries failed — falling back to Polygon")
 
         if cached_rows:
             loaded = 0
@@ -704,9 +995,8 @@ class WSEngine:
 
         target_tickers = tickers_override if tickers_override is not None else self._tickers
         session_now = _get_session()
-        batch_size  = 100  # OOM-FIX: reduced from 250 — limits per-batch JSON to ~150KB
+        batch_size  = 100   # OOM-FIX: was 250 — 100 limits per-batch JSON to ~150KB
         failed: List[str] = []
-        import gc
 
         for i in range(0, len(target_tickers), batch_size):
             batch   = target_tickers[i:i + batch_size]
@@ -825,7 +1115,9 @@ class WSEngine:
                         "company_name":   self._company_map.get(ticker, ""),
                         "company":        self._company_map.get(ticker, ""),
                         "sector":         self._sector_map.get(ticker, ""),
-                        "open":           open_price,  # frontend MH col reads .open
+                        # BUG-1 FIX: both "open" and "open_price" stored so every
+                        # code path reading either alias finds the correct value.
+                        "open":           open_price,
                         "ts":             int(time.time() * 1000),
                     }
 
@@ -894,7 +1186,8 @@ class WSEngine:
                         "company_name":   self._company_map.get(ticker, ""),
                         "company":        self._company_map.get(ticker, ""),
                         "sector":         self._sector_map.get(ticker, ""),
-                        "open":           open_price,  # frontend MH col reads .open
+                        # BUG-1 FIX: "open" alias always present.
+                        "open":           open_price,
                         "ts":             int(time.time() * 1000),
                         "source":         "yfinance",
                     }
@@ -916,13 +1209,71 @@ class WSEngine:
     # ── Portfolio refresh loop ─────────────────────────────────────────────────
 
     def _portfolio_loop(self) -> None:
+        # PORTFOLIO-FIRST-FAST: broadcast within 5s on startup so newly-opened
+        # tabs see portfolio data immediately without waiting 60s for the normal
+        # interval. After the first broadcast, resume the standard 60s cadence.
+        _first = True
         while not self._shutdown.is_set():
             try:
                 portfolio = self._db.get_portfolio()
-                self._broadcast({"type": "portfolio_update", "data": portfolio})
+                # PORTFIX-2: enrich each row with live price + computed P&L fields
+                # from the live cache. DB rows only have shares/avg_cost/open_price;
+                # live_price, change_value, day_pl, total_pl must be computed here
+                # so the Portfolio tab always shows live data rather than $0.00.
+                enriched = []
+                with self._cache_lock:
+                    for row in portfolio:
+                        tk = row.get("ticker", "")
+                        live = self._cache.get(tk, {})
+                        shares    = float(row.get("shares", 0) or 0)
+                        avg_cost  = float(row.get("avg_cost", 0) or 0)
+                        live_price = (
+                            float(live.get("live_price") or live.get("price") or
+                                  row.get("live_price") or row.get("price") or 0)
+                        )
+                        open_price = float(
+                            live.get("open_price") or live.get("open") or
+                            row.get("open_price") or row.get("open") or 0
+                        )
+                        prev_close = float(
+                            live.get("prev_close") or row.get("prev_close") or 0
+                        )
+                        # PORTFIX-3: always compute change directly from live_price vs prev_close.
+                        if prev_close > 0 and live_price > 0:
+                            change_value   = round(live_price - prev_close, 4)
+                            percent_change = round((live_price - prev_close) / prev_close * 100, 4)
+                        else:
+                            change_value   = float(live.get("change_value") or row.get("change_value") or 0)
+                            percent_change = float(live.get("percent_change") or live.get("change_cpt") or
+                                                   row.get("percent_change") or 0)
+                        # Day P&L: (live_price - open_price) x shares
+                        day_pl   = round((live_price - open_price) * shares, 2) if open_price > 0 else 0.0
+                        # Total P&L: (live_price - avg_cost) x shares
+                        total_pl = round((live_price - avg_cost) * shares, 2) if avg_cost > 0 else 0.0
+                        # Current market value
+                        value    = round(live_price * shares, 2)
+                        enriched.append({
+                            **row,
+                            "live_price":     live_price,
+                            "open_price":     open_price,
+                            "prev_close":     prev_close,
+                            "change_value":   round(change_value, 4),
+                            "percent_change": round(percent_change, 4),
+                            "day_pl":         day_pl,
+                            "total_pl":       total_pl,
+                            "value":          value,
+                            # Aliases used by different frontend versions
+                            "price":          live_price,
+                            "open":           open_price,
+                            "change_pct":     round(percent_change, 4),
+                        })
+                import time as _time_mod
+                self._broadcast({"type": "portfolio_update", "data": enriched, "server_ts": int(_time_mod.time() * 1000)})
             except Exception as e:
                 logger.warning(f"Portfolio refresh error: {e}")
-            for _ in range(PORTFOLIO_REFRESH_S):
+            _interval = 5 if _first else PORTFOLIO_REFRESH_S
+            _first = False
+            for _ in range(_interval):
                 if self._shutdown.is_set():
                     return
                 time.sleep(1)
@@ -934,6 +1285,10 @@ class WSEngine:
         During after-hours, periodically refresh today_close for all cached
         tickers so the AH change% is always relative to the correct EOD close.
         Skips entirely during market hours (Fix-20a: today_close stays 0.0).
+
+        BUG-2 FIX: _watchlist_tickers is now seeded at start() so this loop
+        has valid targets from the very first refresh cycle, not just after the
+        user edits the watchlist.
         """
         while not self._shutdown.is_set():
             for _ in range(AH_CLOSE_REFRESH_S):
@@ -950,18 +1305,51 @@ class WSEngine:
         """
         OOM-FIX: was iterating ALL 5,544 cached tickers (22 batches × 375KB = 8MB/run).
         Now only refreshes watchlist tickers (30 tickers = 1 batch = ~150KB/run).
-        This is sufficient — AH % only needs to be live for tickers the user watches.
-        Interval stays 60s (safe with 1-batch scope). Batch size 100 not 250.
+        AH % only needs to be live for tickers the user is watching.
+        Interval stays 300s (safe at 1-batch scope). Batch size 100.
         gc.collect() + sleep(0.5) between batches yields GIL so tick processing
-        isn't blocked, eliminating the 30s live-table freeze during AH.
+        is never blocked, eliminating the 30s live-table freeze during AH.
+
+        DIRTY-TICKERS-FIX: removed `active |= self._dirty_tickers`.
+        _dirty_tickers holds every ticker that printed a trade since the last
+        snapshot_delta broadcast (resets every 15s). During AH, hundreds of
+        tickers trade actively — merging dirty into the AH close target caused
+        500-ticker Polygon fetches instead of the intended 30-ticker watchlist
+        fetch. _dirty_tickers is for snapshot_delta routing only, not for
+        determining which closing prices to refresh. AH % change is only
+        displayed for watchlist tickers in the Portfolio and Watchlist pages.
         """
         import gc
+        from datetime import date as _date
+
         with self._cache_lock:
-            active = set(self._watchlist_tickers)
-            active |= self._dirty_tickers
-            target = list(active)[:500]
+            target = list(self._watchlist_tickers)
+
+        # EARNINGS-AH-FIX: include tickers reporting earnings today so their
+        # AH move (e.g. NVDA +12% post-earnings) shows correct ah_dollar / ah_pct
+        # even when the user hasn't starred them.
+        # today_close is required to compute ah_dollar = live_price - today_close.
+        # Without this, earnings tickers not in the watchlist show "—" in AH mode
+        # for the entire post-earnings session — the most critical number of the day.
+        # Network cost: typically 5-30 extra tickers — stays well within 1 REST batch.
+        try:
+            today = _date.today().isoformat()
+            earn_rows = self._db.get_earnings_for_range(today, today)
+            earn_tickers = [r.get("ticker", "") for r in (earn_rows or []) if r.get("ticker")]
+            if earn_tickers:
+                with self._cache_lock:
+                    cached_set = set(self._cache.keys())
+                # Union watchlist + today's earnings tickers, capped to those in cache
+                target = list(set(target) | {t for t in earn_tickers if t in cached_set})
+                logger.info(
+                    f"EARNINGS-AH-FIX: {len(earn_tickers)} earnings tickers merged "
+                    f"into AH close scope (total target: {len(target)})"
+                )
+        except Exception as e:
+            logger.debug(f"EARNINGS-AH-FIX: earnings fetch skipped: {e}")
 
         if not target:
+            logger.debug("_refresh_ah_closes: target empty — skipping")
             return
 
         batch_size = 100
@@ -1016,20 +1404,43 @@ class WSEngine:
             if self._shutdown.is_set():
                 return
 
-            logger.info("9:30 AM ET  -  session reset: clearing AH cache prices")
+            logger.info("9:30 AM ET  -  session reset: promoting today_close → prev_close, clearing AH fields")
             # OOM-FIX: replaced _fetch_polygon_snapshot_bulk() (22 batches, 8MB peak)
-            # with in-memory field clear. Polygon WS feed updates live prices within
-            # seconds of market open — no REST fetch needed here.
+            # with in-memory field clear. The Polygon WS feed updates live prices
+            # within seconds of market open — no REST fetch needed here.
+            #
+            # BUG-10 FIX: prev_close is set once at boot from Polygon prevDay.c.
+            # After market close, today_close holds yesterday's EOD (set by
+            # _refresh_ah_closes reading day.c).  But nothing ever promotes
+            # today_close → prev_close, so after any overnight restart the cache
+            # still carries the PREVIOUS session's prev_close — making every
+            # $CHG / %CHG calculation wrong all next day.
+            #
+            # Fix: at 9:30 AM, before zeroing AH fields, copy today_close into
+            # prev_close for every ticker that has a valid today_close.
+            # The 9:30 AM timer is already ET-aware and skips weekends.
+            # _db_write_loop will persist the updated rows to Supabase within
+            # DB_WRITE_INTERVAL_S seconds, so any subsequent restart reads the
+            # correct prev_close from the cache.
             try:
                 import gc
+                promoted = 0
                 with self._cache_lock:
                     for row in self._cache.values():
+                        # Promote today's EOD close as tomorrow's prev_close baseline
+                        tc = float(row.get("today_close", 0) or 0)
+                        if tc > 0:
+                            row["prev_close"] = tc
+                            promoted += 1
                         row["today_close"] = 0.0
                         row["ah_dollar"]   = 0.0
                         row["ah_pct"]      = 0.0
                         row["ah_momentum"] = False
                 gc.collect()
-                logger.info("Session reset complete — AH fields cleared in-memory")
+                logger.info(
+                    f"Session reset complete — prev_close promoted for {promoted} tickers, "
+                    f"AH fields cleared in-memory"
+                )
             except Exception as e:
                 logger.error(f"Session reset clear failed: {e}")
 

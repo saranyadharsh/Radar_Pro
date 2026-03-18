@@ -9,20 +9,35 @@
  *
  * Canonical fields guaranteed after normalization:
  *   ticker, company_name, sector, live_price, change_value, percent_change,
- *   open, prev_close, today_close, volume, rvol, volume_ratio,
+ *   open, open_price, prev_close, today_close, volume, rvol, volume_ratio,
  *   is_gap_play, gap_percent, ah_momentum, volume_spike, volume_spike_level,
  *   is_earnings_gap_play, went_positive, hwm, day_high, day_low,
  *   update_count, session, pullback_state, gap_direction, gap_magnitude,
  *   last_update
+ *
+ * BUG-1 FIX: open / open_price alias resolution added.
+ *   ws_engine now includes both "open" and "open_price" in _DELTA_FIELDS, but
+ *   older Supabase-cached rows or REST fallback rows may only have one or the
+ *   other. The normalizer ensures both are always present after this call.
+ *   PageLiveTable renders ticker.open for the MH OPEN column — if this field
+ *   is absent (e.g. after a cache clear + REST snapshot before the first
+ *   snapshot_delta arrives), the column shows $0.00.
+ *   Defensive chain: open → open_price → 0; open_price → open → 0.
  */
 export function normalizeTicker(raw) {
   if (!raw) return raw;
+  // BUG-1 FIX: resolve open / open_price bidirectionally before spreading.
+  // Priority: explicit "open" field first (set by _handle_tick and snapshot routes),
+  // then "open_price" alias, then 0. Same logic for open_price in reverse.
+  const resolvedOpen      = raw.open      ?? raw.open_price ?? 0;
+  const resolvedOpenPrice = raw.open_price ?? raw.open      ?? 0;
   return {
     ...raw,
+    // BUG-1 FIX: both aliases always present after normalization
+    open:          resolvedOpen,
+    open_price:    resolvedOpenPrice,
     // Company name (alias: company vs company_name)
     company_name:  raw.company_name  || raw.company  || raw.name || "",
-    // Open price (alias: open vs open_price)
-    open:          raw.open          ?? raw.open_price ?? 0,
     // Volume ratio (alias: rvol vs volume_ratio)
     rvol:          raw.rvol          ?? raw.volume_ratio ?? 1,
     volume_ratio:  raw.volume_ratio  ?? raw.rvol ?? 1,
