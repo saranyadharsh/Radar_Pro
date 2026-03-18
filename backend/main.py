@@ -1871,6 +1871,42 @@ async def get_alerts(limit: int = Query(50, ge=1, le=200)):
 
 
 # ── Feature #4: Multi-Timeframe Scanner ──────────────────────────────────────
+
+# ── Feature #3: NOI Imbalance Snapshot ───────────────────────────────────────
+@app.get("/api/noi")
+async def get_noi_snapshot(limit: int = Query(50, ge=1, le=200)):
+    """
+    Returns current imbalance snapshot from ws_engine._imbalance_cache.
+
+    NOI-FIX: Provides the frontend with the current imbalance state for all
+    tickers on SSE connect / page load — so the NOI bars are populated
+    immediately rather than waiting for the next Polygon REST poll cycle.
+
+    Returns only non-neutral imbalances (side != "N"), sorted by size desc.
+    Currently populated by ws_engine._noi_poll_loop (REST-based, 30s cadence).
+    """
+    eng = getattr(app.state, "engine", None)
+    if not eng:
+        return {"data": [], "count": 0}
+
+    imb_cache = getattr(eng, "_imbalance_cache", {})
+    if not imb_cache:
+        return {"data": [], "count": 0}
+
+    rows = [
+        {
+            "ticker":          tk,
+            "imbalance_side":  v["side"],
+            "imbalance_size":  v["size"],
+            "ts":              v["ts"],
+        }
+        for tk, v in imb_cache.items()
+        if v.get("side") in ("B", "S")
+    ]
+    rows.sort(key=lambda r: r["imbalance_size"], reverse=True)
+    return {"data": rows[:limit], "count": len(rows)}
+
+
 @app.get("/api/mtf-scanner")
 async def get_mtf_scanner():
     """1m + 5m + 15m trend confluence scanner for watchlist symbols."""
