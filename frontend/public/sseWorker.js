@@ -302,6 +302,12 @@ function connect() {
         for (const arr of rawData) {
           const sym = state.tickerMapRev[arr[0]]
           if (!sym) continue
+          // OPEN-PRICE-PRESERVE-FIX: the compact array format carries only 7 fields.
+          // open / open_price are NOT in the array — preserve them from the cached
+          // full row so the MH Open column never shows $0.00 after a tick update.
+          // Without this, every tick in array format silently wipes open_price to
+          // undefined, even though _DELTA_FIELDS in ws_engine includes "open".
+          const cached = state.cache[sym] ?? {}
           batchData.push({
             ticker:         sym,
             price:          arr[1],
@@ -312,6 +318,10 @@ function connect() {
             volume:         arr[4],
             rvol:           arr[5],
             ts:             arr[6],
+            // Carry open fields from cache — never overwrite with undefined
+            open:           cached.open       ?? cached.open_price ?? 0,
+            open_price:     cached.open_price ?? cached.open       ?? 0,
+            prev_close:     cached.prev_close  ?? 0,
           })
         }
       } else {

@@ -654,3 +654,98 @@ class SupabaseDB:
             }).execute()
         except Exception as e:
             logger.warning(f"log_error insert failed: {e}")
+
+    # ── News / Alert dedup persistence ────────────────────────────────────────
+    # NEWS-RESTART-FIX: These methods persist seen article URLs and alert keys
+    # so background pollers don't re-fire alerts after a Render cold start.
+    #
+    # TABLE-OPTIONAL: These tables are optional. If they don't exist in Supabase
+    # the methods return empty / do nothing with zero log noise and zero retries.
+    # The pollers fall back to in-memory dedup — safe, just means one duplicate
+    # alert burst on a cold restart until you create the tables.
+    #
+    # To enable persistence, run once in Supabase SQL editor:
+    #
+    #   CREATE TABLE IF NOT EXISTS news_seen_urls (
+    #     url TEXT PRIMARY KEY,
+    #     seen_date DATE NOT NULL DEFAULT CURRENT_DATE
+    #   );
+    #   CREATE TABLE IF NOT EXISTS alert_seen_keys (
+    #     category TEXT NOT NULL,
+    #     key      TEXT NOT NULL,
+    #     seen_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    #     PRIMARY KEY (category, key)
+    #   );
+
+    # Internal flag — set True the first time we confirm a table is missing
+    # so we skip all future DB calls for that table (zero 404s after first check).
+    _news_urls_table_ok   : bool = True   # optimistic; set False on first 404
+    _alert_keys_table_ok  : bool = True
+
+    def get_seen_news_urls(self) -> list:
+        """Returns list of article URLs seen in last 2 days. Empty list if table missing."""
+        if not self._news_urls_table_ok:
+            return []
+        try:
+            from datetime import date, timedelta
+            cutoff = (date.today() - timedelta(days=2)).isoformat()
+            res = (
+                self.client.table("news_seen_urls")
+                .select("url")
+                .gte("seen_date", cutoff)
+                .execute()
+            )
+            return [r["url"] for r in (res.data or [])]
+        except Exception as e:
+            if "404" in str(e) or "does not exist" in str(e).lower() or "relation" in str(e).lower():
+                self.__class__._news_urls_table_ok = False  # suppress all future calls
+            return []
+
+    def save_seen_news_urls(self, urls: list) -> None:
+        """Persist newly-seen article URLs. No-op if table missing or urls empty."""
+        if not urls or not self._news_urls_table_ok:
+            return
+        try:
+            from datetime import date
+            today = date.today().isoformat()
+            self.client.table("news_seen_urls").upsert(
+                [{"url": u, "seen_date": today} for u in urls if u],
+                on_conflict="url"
+            ).execute()
+        except Exception as e:
+            if "404" in str(e) or "does not exist" in str(e).lower() or "relation" in str(e).lower():
+                self.__class__._news_urls_table_ok = False
+
+    def get_seen_alert_keys(self, category: str) -> list:
+        """Returns list of alert keys already fired. Empty list if table missing."""
+        if not self._alert_keys_table_ok:
+            return []
+        try:
+            from datetime import date, timedelta
+            cutoff = (date.today() - timedelta(days=2)).isoformat()
+            res = (
+                self.client.table("alert_seen_keys")
+                .select("key")
+                .eq("category", category)
+                .gte("seen_date", cutoff)
+                .execute()
+            )
+            return [r["key"] for r in (res.data or [])]
+        except Exception as e:
+            if "404" in str(e) or "does not exist" in str(e).lower() or "relation" in str(e).lower():
+                self.__class__._alert_keys_table_ok = False
+            return []
+
+    def save_seen_alert_key(self, category: str, key: str) -> None:
+        """Persist a fired alert key. No-op if table missing."""
+        if not self._alert_keys_table_ok:
+            return
+        try:
+            from datetime import date
+            self.client.table("alert_seen_keys").upsert(
+                {"category": category, "key": key, "seen_date": date.today().isoformat()},
+                on_conflict="category,key"
+            ).execute()
+        except Exception as e:
+            if "404" in str(e) or "does not exist" in str(e).lower() or "relation" in str(e).lower():
+                self.__class__._alert_keys_table_ok = False

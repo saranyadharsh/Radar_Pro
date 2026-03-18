@@ -19,6 +19,48 @@ export default function PageDashboard({ onNavigate, onSectorChange, selectedSect
   const [breadthTimeframe, setBreadthTimeframe] = useState("1D");
   const [scalpFilter,     setScalpFilter]     = useState("ALL");
 
+  // ── News Feed state ──
+  const [news,        setNews]        = useState([]);
+  const [newsLoading, setNewsLoading] = useState(true);
+  const [newsFilter,  setNewsFilter]  = useState("ALL"); // ALL | WATCHLIST
+  const [newsBadge,   setNewsBadge]   = useState(0);    // unread count for news card
+
+  // ── Options Flow state ──
+  const [optionsFlow,    setOptionsFlow]    = useState([]);
+  const [optionsLoading, setOptionsLoading] = useState(true);
+  const [optionsFilter,  setOptionsFilter]  = useState("ALL"); // ALL | CALLS | PUTS | SWEEP
+
+  // ── Earnings badge state (live SSE earnings_alert) ──
+  const [earningsBadge, setEarningsBadge] = useState(0);
+
+  // ── Live SSE listener: prepend incoming news/earnings alerts to the news feed ──
+  // DASHBOARD-SSE-NEWS-FIX: /api/news fetches once on mount (Polygon REST).
+  // Real-time watchlist news/earnings alerts arrive via SSE → nexradar_alert window event.
+  // Wire those in here so the dashboard News Feed card updates live without a refresh.
+  useEffect(() => {
+    const NEWS_TYPES = new Set(['news_alert', 'edgar_alert', 'earnings_alert', 'fda_alert']);
+    const handler = (e) => {
+      const a = e.detail;
+      if (!a || !NEWS_TYPES.has(a.type)) return;
+      // Normalise to Polygon article shape so the existing news card renders it
+      const synthetic = {
+        title:         a.title || a.sub || '',
+        article_url:   a.url   || null,
+        published_utc: new Date(a.ts ?? Date.now()).toISOString(),
+        publisher:     { name: a.type === 'edgar_alert' ? 'SEC EDGAR' : a.type === 'earnings_alert' ? 'Earnings' : a.type === 'fda_alert' ? 'FDA' : 'Watchlist' },
+        tickers:       a.ticker ? [a.ticker] : [],
+        _live:         true,
+        _color:        a.color ?? 'cyan',
+        _emoji:        a.emoji ?? '📰',
+      };
+      setNews(prev => [synthetic, ...prev].slice(0, 50));
+      setNewsBadge(prev => prev + 1);
+      if (a.type === 'earnings_alert') setEarningsBadge(prev => prev + 1);
+    };
+    window.addEventListener('nexradar_alert', handler);
+    return () => window.removeEventListener('nexradar_alert', handler);
+  }, []);
+
   useEffect(() => {
     // WATCHLIST-DEDUP-FIX: only fetch if prop not provided (standalone / no root shell)
     if (watchlistProp === null) {
@@ -53,17 +95,46 @@ export default function PageDashboard({ onNavigate, onSectorChange, selectedSect
         setEarningsLoading(false);
       })
       .catch(() => { setEarnings([]); setEarningsLoading(false); });
+
+    // ── News Feed: proxied through /api/news (Polygon key stays server-side) ──
+    // NEWS-BACKEND-FIX: Polygon key no longer lives in the browser.
+    // Backend builds ticker.any_of= filter from Supabase watchlist so articles
+    // are directly about held tickers, not just tagged post-hoc.
+    fetch(`${API_BASE}/api/news?limit=25`)
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(j => {
+        const items = Array.isArray(j?.results) ? j.results
+                    : Array.isArray(j)           ? j
+                    : [];
+        setNews(items);
+        setNewsLoading(false);
+      })
+      .catch(() => { setNews([]); setNewsLoading(false); });
+
+    // ── Options Flow: proxied through /api/options-flow (mock data removed) ──
+    // OPTIONS-MOCK-REMOVED: backend fetches Polygon /v3/snapshot/options per
+    // watchlist ticker. Requires Polygon Starter tier+. Returns { data: [] }
+    // with a message if key missing or tier insufficient — no fake rows.
+    fetch(`${API_BASE}/api/options-flow`)
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(j => {
+        const rows = Array.isArray(j?.data) ? j.data : Array.isArray(j) ? j : [];
+        setOptionsFlow(rows);
+        setOptionsLoading(false);
+      })
+      .catch(() => { setOptionsFlow([]); setOptionsLoading(false); });
   }, []);
 
   const fmt2 = n => Number(n || 0).toFixed(2);
 
   return (
-    <div className="page-enter" style={{ display:"flex", flexDirection:"column", gap:18 }}>
+    <div className="page-enter" style={{ display:"flex", gap:18, flexWrap:"wrap", alignItems:"stretch" }}>
+      <style>{`@keyframes badge_pulse { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(1.18);opacity:0.85} }`}</style>
 
-      {/* Market Breadth + Scalp Signals */}
-      <div style={{ display:"flex", gap:18, flexWrap:"wrap", alignItems:"stretch" }}>
+      {/* ── LEFT COLUMN ── */}
+      <div style={{ flex:2, minWidth:460, display:"flex", flexDirection:"column", gap:18, alignSelf:"flex-start" }}>
 
-        {/* Market Breadth card */}
+        {/* Row 1: Market Breadth — full width of left column */}
         <div className="card card-glow" style={{ flex:2, minWidth:340 }}>
           <SectionHeader title="Market Breadth" T={T}>
             {["1D","1W"].map(tf => (
@@ -104,8 +175,247 @@ export default function PageDashboard({ onNavigate, onSectorChange, selectedSect
           </div>
         </div>
 
-        {/* Scalp Signals */}
-        <div className="card" style={{ flex:1, minWidth:200, display:"flex", flexDirection:"column" }}>
+        {/* Row 2: Top Gainers | Dark Pool Activity | Top Losers */}
+        <div style={{ display:"flex", gap:18 }}>
+
+          {/* 1. Top Gainers */}
+          <div className="card" style={{ flex:1, minWidth:160 }}>
+            <SectionHeader title={selectedSectors.includes("ALL")?"Top Gainers":`Top Gainers · ${selectedSectors.join(" + ")}`} T={T}>
+              <button className="btn-ghost" style={{ fontSize:8 }} onClick={() => onNavigate("live")}>VIEW ALL</button>
+            </SectionHeader>
+            <div style={{ padding:"8px 14px" }}>
+              {(() => {
+                let all = Array.from(tickers.values());
+                if (!selectedSectors.includes("ALL")) all = all.filter(t => selectedSectors.some(s => normalizeSector(t.sector) === s));
+                const top = all.filter(t=>(t.percent_change||0)>0).sort((a,b)=>b.percent_change-a.percent_change).slice(0,5);
+                if (top.length===0) return Array(5).fill(0).map((_,i)=>(<div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}><Shimmer w={44} h={11}/><Shimmer w={55} h={11} opacity={0.5}/></div>));
+                return top.map((t,i)=>(<div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}><span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{t.ticker}</span><span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{pct(t.percent_change)}</span></div>));
+              })()}
+            </div>
+          </div>
+
+          {/* 2. Dark Pool Activity */}
+          <div className="card" style={{ flex:1, minWidth:200, display:"flex", flexDirection:"column" }}>
+            <SectionHeader title="Dark Pool Activity" T={T}>
+              <span style={{ color:T.text2, fontFamily:T.font, fontSize:8.5, letterSpacing:0.5 }}>RVOL≥5× · ΔP&lt;0.3%</span>
+            </SectionHeader>
+            <div style={{ padding:"10px 16px", flex:1 }}>
+              {(() => {
+                const candidates = Array.from(tickers.values())
+                  .filter(t => {
+                    const rvol = t.rvol ?? t.volume_ratio ?? 0;
+                    const chgPct = Math.abs(t.percent_change ?? 0);
+                    return rvol >= 5 && chgPct < 0.3 && t.ticker;
+                  })
+                  .sort((a, b) => (b.rvol ?? b.volume_ratio ?? 0) - (a.rvol ?? a.volume_ratio ?? 0))
+                  .slice(0, 5);
+                if (candidates.length === 0) return (
+                  <div style={{ padding:"14px 0", textAlign:"center", display:"flex", alignItems:"center", justifyContent:"center", gap:12 }}>
+                    <div style={{ fontSize:20 }}>🌑</div>
+                    <div>
+                      <div style={{ color:T.text2, fontFamily:T.font, fontSize:11 }}>No dark pool activity detected</div>
+                      <div style={{ color:T.text2, fontFamily:T.font, fontSize:9.5, marginTop:2, opacity:0.6 }}>High RVOL with flat price signals appear here</div>
+                    </div>
+                  </div>
+                );
+                return (
+                  <div>
+                    {candidates.map((t, i) => {
+                      const rvol   = (t.rvol ?? t.volume_ratio ?? 0).toFixed(1);
+                      const chgPct = (t.percent_change ?? 0).toFixed(2);
+                      const price  = t.live_price ?? t.price ?? 0;
+                      const vol    = t.volume ?? 0;
+                      const volStr = vol >= 1e9 ? `${(vol/1e9).toFixed(1)}B` : vol >= 1e6 ? `${(vol/1e6).toFixed(1)}M` : vol >= 1e3 ? `${(vol/1e3).toFixed(0)}K` : String(vol);
+                      const isUp   = (t.percent_change ?? 0) >= 0;
+                      return (
+                        <div key={t.ticker} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"8px 0", borderBottom:i<candidates.length-1?`1px solid ${T.border}`:"none", gap:8 }}>
+                          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                            <div style={{ width:28, height:28, borderRadius:6, background:"#9c6ee812", border:"1px solid #9c6ee830", display:"flex", alignItems:"center", justifyContent:"center", fontSize:12, flexShrink:0 }}>🌑</div>
+                            <div>
+                              <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:1 }}>
+                                <span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{t.ticker}</span>
+                                <span style={{ background:"#9c6ee818", border:"1px solid #9c6ee835", borderRadius:3, padding:"1px 4px", color:"#9c6ee8", fontFamily:T.font, fontSize:8, fontWeight:700 }}>{rvol}×</span>
+                              </div>
+                              <div style={{ display:"flex", gap:6 }}>
+                                <span style={{ color:T.text2, fontFamily:T.font, fontSize:9 }}>${price.toFixed(2)}</span>
+                                <span style={{ color:isUp?T.green:T.red, fontFamily:T.font, fontSize:9 }}>{isUp?"+":""}{chgPct}%</span>
+                                <span style={{ color:T.text2, fontFamily:T.font, fontSize:9 }}>{volStr}</span>
+                              </div>
+                            </div>
+                          </div>
+                          <div style={{ color:"#9c6ee8", fontFamily:T.font, fontSize:11, fontWeight:700, flexShrink:0 }}>◉</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
+            </div>
+            <div style={{ padding:"6px 14px", borderTop:`1px solid ${T.border}`, display:"flex", justifyContent:"space-between", flexShrink:0 }}>
+              <span style={{ color:T.text2, fontFamily:T.font, fontSize:8.5 }}>Dark venue / block prints</span>
+              <span style={{ color:T.text2, fontFamily:T.font, fontSize:8.5 }}>Live · SSE</span>
+            </div>
+          </div>
+
+          {/* 3. Top Losers */}
+          <div className="card" style={{ flex:1, minWidth:160 }}>
+            <SectionHeader title={selectedSectors.includes("ALL")?"Top Losers":`Top Losers · ${selectedSectors.join(" + ")}`} T={T}>
+              <button className="btn-ghost" style={{ fontSize:8 }} onClick={() => onNavigate("live")}>VIEW ALL</button>
+            </SectionHeader>
+            <div style={{ padding:"8px 14px" }}>
+              {(() => {
+                let all = Array.from(tickers.values());
+                if (!selectedSectors.includes("ALL")) all = all.filter(t => selectedSectors.some(s => normalizeSector(t.sector) === s));
+                const top = all.filter(t=>(t.percent_change||0)<0).sort((a,b)=>a.percent_change-b.percent_change).slice(0,5);
+                if (top.length===0) return Array(5).fill(0).map((_,i)=>(<div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}><Shimmer w={44} h={11}/><Shimmer w={55} h={11} opacity={0.5}/></div>));
+                return top.map((t,i)=>(<div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}><span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{t.ticker}</span><span style={{ color:T.red, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{pct(t.percent_change)}</span></div>));
+              })()}
+            </div>
+          </div>
+
+        </div>{/* end Row 2 */}
+
+        {/* ── Row 3: News Feed | Options Flow ── */}
+        <div style={{ display:"flex", gap:18, flexWrap:"wrap" }}>
+
+          {/* ── NEWS FEED ── */}
+          <div className="card" style={{ flex:1, minWidth:280, display:"flex", flexDirection:"column" }}>
+            <SectionHeader title="News Feed" T={T}>
+              {/* Live unread badge */}
+              {newsBadge > 0 && (
+                <span style={{ background:T.red, color:"#fff", borderRadius:8, padding:"1px 6px", fontSize:8.5, fontWeight:700, fontFamily:T.font, animation:"badge_pulse 1.8s ease-in-out infinite" }}>
+                  {newsBadge > 99 ? "99+" : newsBadge} NEW
+                </span>
+              )}
+              {[{ key:"ALL", label:"ALL" }, { key:"WATCHLIST", label:"★ WL" }].map(f => (
+                <button key={f.key} className="btn-ghost" style={{ fontSize:9, padding:"4px 8px", background:newsFilter===f.key?T.cyan+"20":"transparent", color:newsFilter===f.key?T.cyan:T.text2, border:`1px solid ${newsFilter===f.key?T.cyan+"40":T.border}` }}
+                  onClick={() => { setNewsFilter(f.key); setNewsBadge(0); }}>{f.label}</button>
+              ))}
+            </SectionHeader>
+            <div style={{ flex:1, overflowY:"auto", maxHeight:260 }}>
+              {newsLoading ? (
+                Array(5).fill(0).map((_,i) => (
+                  <div key={i} style={{ padding:"10px 14px", borderBottom:`1px solid ${T.border}`, display:"flex", flexDirection:"column", gap:6 }}>
+                    <Shimmer w={260} h={10}/><Shimmer w={120} h={9} opacity={0.4}/>
+                  </div>
+                ))
+              ) : news.length === 0 ? (
+                <div style={{ padding:"32px 14px", textAlign:"center" }}>
+                  <div style={{ fontSize:20, marginBottom:8 }}>📰</div>
+                  <div style={{ color:T.text2, fontFamily:T.font, fontSize:11 }}>No news loaded</div>
+                  <div style={{ color:T.text2, fontFamily:T.font, fontSize:9, marginTop:4, opacity:0.6 }}>Set POLYGON_API_KEY in backend env vars to enable live headlines</div>
+                </div>
+              ) : (() => {
+                const wlSet = watchlist instanceof Set ? watchlist : new Set(watchlist);
+                const filtered = newsFilter === "WATCHLIST"
+                  ? news.filter(n => (n.tickers ?? []).some(tk => wlSet.has(tk)))
+                  : news;
+                if (filtered.length === 0) return <EmptyState icon="★" label="NO WATCHLIST NEWS" sub="No headlines found for your watchlist tickers" h={120} T={T}/>;
+                return filtered.slice(0, 10).map((item, i) => {
+                  const age = (() => {
+                    const diff = Date.now() - new Date(item.published_utc).getTime();
+                    const m = Math.floor(diff / 60000);
+                    if (m < 60) return `${m}m ago`;
+                    const h = Math.floor(m / 60);
+                    return h < 24 ? `${h}h ago` : `${Math.floor(h/24)}d ago`;
+                  })();
+                  const relTickers = (item.tickers ?? []).filter(tk => wlSet.has(tk));
+                  const colorMap = { green:T.green, red:T.red, gold:T.gold, cyan:T.cyan, purple:T.purple };
+                  const accentColor = item._live ? (colorMap[item._color] ?? T.cyan) : null;
+                  return (
+                    <a key={i} href={item.article_url ?? "#"} target="_blank" rel="noopener noreferrer"
+                      style={{ display:"block", padding:"10px 14px", borderBottom:i<filtered.length-1?`1px solid ${T.border}`:"none", textDecoration:"none", transition:"background 0.15s", borderLeft: accentColor ? `3px solid ${accentColor}` : "3px solid transparent" }}
+                      onMouseEnter={e => e.currentTarget.style.background = T.bg2}
+                      onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:8, marginBottom:4 }}>
+                        {item._live && <span style={{ fontSize:13, flexShrink:0 }}>{item._emoji}</span>}
+                        <span style={{ color:accentColor??T.text0, fontSize:11, fontFamily:T.font, fontWeight:600, lineHeight:1.4, flex:1 }}>{item.title}</span>
+                      </div>
+                      <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+                        {item._live && <span style={{ background:accentColor+"20", border:`1px solid ${accentColor}40`, borderRadius:3, padding:"1px 5px", color:accentColor, fontFamily:T.font, fontSize:8, fontWeight:700 }}>LIVE</span>}
+                        <span style={{ color:T.text3, fontSize:9, fontFamily:T.font }}>{item.publisher?.name ?? "—"}</span>
+                        <span style={{ color:T.text3, fontSize:9, fontFamily:T.font }}>·</span>
+                        <span style={{ color:T.text3, fontSize:9, fontFamily:T.font }}>{age}</span>
+                        {relTickers.map(tk => (
+                          <span key={tk} style={{ background:T.cyan+"18", border:`1px solid ${T.cyan}35`, borderRadius:3, padding:"1px 5px", color:T.cyan, fontFamily:T.font, fontSize:8, fontWeight:700 }}>{tk}</span>
+                        ))}
+                        {(item.tickers ?? []).filter(tk => !wlSet.has(tk)).slice(0,3).map(tk => (
+                          <span key={tk} style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:3, padding:"1px 5px", color:T.text2, fontFamily:T.font, fontSize:8 }}>{tk}</span>
+                        ))}
+                      </div>
+                    </a>
+                  );
+                });
+              })()}
+            </div>
+            <div style={{ padding:"6px 14px", borderTop:`1px solid ${T.border}`, display:"flex", justifyContent:"space-between", flexShrink:0 }}>
+              <span style={{ color:T.text3, fontSize:8.5, fontFamily:T.font }}>Polygon.io · market news</span>
+              <span style={{ color:T.text3, fontSize:8.5, fontFamily:T.font }}>15-min delay</span>
+            </div>
+          </div>
+
+          {/* ── OPTIONS FLOW ── */}
+          <div className="card" style={{ flex:1, minWidth:280, display:"flex", flexDirection:"column" }}>
+            <SectionHeader title="Options Flow" T={T}>
+              {[{ key:"ALL",label:"ALL",color:T.cyan },{ key:"CALLS",label:"CALLS",color:T.green },{ key:"PUTS",label:"PUTS",color:T.red },{ key:"SWEEP",label:"⚡ SWEEP",color:T.gold }].map(f => (
+                <button key={f.key} className="btn-ghost" style={{ fontSize:9, padding:"4px 8px", background:optionsFilter===f.key?f.color+"20":"transparent", color:optionsFilter===f.key?f.color:T.text2, border:`1px solid ${optionsFilter===f.key?f.color+"40":T.border}` }} onClick={() => setOptionsFilter(f.key)}>{f.label}</button>
+              ))}
+            </SectionHeader>
+            {/* Column headers */}
+            <div style={{ display:"grid", gridTemplateColumns:"56px 44px 52px 52px 1fr 48px", gap:4, padding:"6px 14px", borderBottom:`1px solid ${T.border}`, fontSize:8.5, fontFamily:T.font, fontWeight:700, color:T.text2, textTransform:"uppercase", letterSpacing:0.5 }}>
+              <span>TICKER</span><span>TYPE</span><span>STRIKE</span><span>EXP</span><span style={{ textAlign:"right" }}>PREMIUM</span><span style={{ textAlign:"right" }}>SIZE</span>
+            </div>
+            <div style={{ flex:1, overflowY:"auto", maxHeight:220 }}>
+              {optionsLoading ? (
+                Array(5).fill(0).map((_,i) => (
+                  <div key={i} style={{ display:"grid", gridTemplateColumns:"56px 44px 52px 52px 1fr 48px", gap:4, padding:"9px 14px", borderBottom:`1px solid ${T.border}`, alignItems:"center" }}>
+                    <Shimmer w={36} h={11}/><Shimmer w={30} h={10}/><Shimmer w={40} h={10}/><Shimmer w={40} h={10}/><Shimmer w={60} h={11} opacity={0.5}/><Shimmer w={30} h={10} opacity={0.4}/>
+                  </div>
+                ))
+              ) : (() => {
+                let rows = [...optionsFlow];
+                if (optionsFilter === "CALLS")  rows = rows.filter(r => r.type === "CALL");
+                if (optionsFilter === "PUTS")   rows = rows.filter(r => r.type === "PUT");
+                if (optionsFilter === "SWEEP")  rows = rows.filter(r => r.sweep);
+                if (rows.length === 0) return <EmptyState icon="◈" label="NO FLOW DETECTED" sub="No unusual options activity" h={120} T={T}/>;
+                return rows.map((r, i) => {
+                  const isCall = r.type === "CALL";
+                  const typeColor = isCall ? T.green : T.red;
+                  const premStr = r.premium >= 1e6 ? `$${(r.premium/1e6).toFixed(2)}M` : `$${(r.premium/1e3).toFixed(0)}K`;
+                  return (
+                    <div key={i}
+                      style={{ display:"grid", gridTemplateColumns:"56px 44px 52px 52px 1fr 48px", gap:4, padding:"9px 14px", borderBottom:i<rows.length-1?`1px solid ${T.border}`:"none", alignItems:"center", transition:"background 0.15s" }}
+                      onMouseEnter={e => e.currentTarget.style.background = T.bg2}
+                      onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                      <div style={{ display:"flex", alignItems:"center", gap:5 }}>
+                        <span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{r.ticker}</span>
+                        {r.sweep && <span style={{ color:T.gold, fontSize:10 }}>⚡</span>}
+                      </div>
+                      <span style={{ background:typeColor+"18", border:`1px solid ${typeColor}35`, borderRadius:3, padding:"2px 5px", color:typeColor, fontFamily:T.font, fontSize:8.5, fontWeight:700, width:"fit-content" }}>{r.type}</span>
+                      <span style={{ color:T.text1, fontSize:11, fontFamily:T.font }}>${r.strike}</span>
+                      <span style={{ color:T.text2, fontSize:10, fontFamily:T.font }}>{r.expiry}</span>
+                      <span style={{ color:T.gold, fontSize:11, fontFamily:T.font, fontWeight:700, textAlign:"right" }}>{premStr}</span>
+                      <span style={{ color:T.text2, fontSize:10, fontFamily:T.font, textAlign:"right" }}>{r.size.toLocaleString()}</span>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+            <div style={{ padding:"6px 14px", borderTop:`1px solid ${T.border}`, display:"flex", justifyContent:"space-between", flexShrink:0 }}>
+              <span style={{ color:T.text3, fontSize:8.5, fontFamily:T.font }}>Unusual activity · premium ≥ $500K</span>
+              <span style={{ color:T.text3, fontSize:8.5, fontFamily:T.font }}>Mock · swap /api/options-flow</span>
+            </div>
+          </div>
+
+        </div>{/* end Row 3 */}
+
+      </div>{/* end left column */}
+
+      {/* ── RIGHT COLUMN ── */}
+      <div style={{ flex:1, minWidth:260, display:"flex", flexDirection:"column", gap:18 }}>
+
+        {/* Row 1: Scalp Signals */}
+        <div className="card" style={{ flex:"0 0 auto", minWidth:200, display:"flex", flexDirection:"column" }}>
           <SectionHeader title="Scalp Signals" T={T}>
             {[{ key:"ALL",label:"ALL",color:T.cyan },{ key:"LONG",label:"LONG",color:T.green },{ key:"SHORT",label:"SHORT",color:T.red },{ key:"INST",label:"🐋 INST",color:T.purple }].map(f => (
               <button key={f.key} className="btn-ghost" style={{ fontSize:9, padding:"4px 8px", background:scalpFilter===f.key?f.color+"20":"transparent", color:scalpFilter===f.key?f.color:T.text2, border:`1px solid ${scalpFilter===f.key?f.color+"40":T.border}` }} onClick={() => setScalpFilter(f.key)}>{f.label}</button>
@@ -121,16 +431,21 @@ export default function PageDashboard({ onNavigate, onSectorChange, selectedSect
                 const highRvol  = (row.rvol ?? 0) >= 2.0;
                 const highScore = Math.abs(row.score ?? 0) >= 3;
                 const bbAlert   = row.bb_status?.includes("Overextended");
-                if (!isInst && !highRvol && !highScore && !bbAlert) return;
+                // Dark pool: rvol >= 5× but price barely moved (< 0.3%) — institutional stealth
+                const liveTicker = tickers.get(row.ticker);
+                const liveChgPct = Math.abs(liveTicker?.percent_change ?? 0);
+                const isDarkPool = (row.rvol ?? 0) >= 5 && liveChgPct < 0.3;
+                if (!isInst && !highRvol && !highScore && !bbAlert && !isDarkPool) return;
                 const isBullish = row.score > 0 || isAccum || row.trend === "Bullish" || row.rsi_signal === "Oversold";
                 const isBearish = row.score < 0 || isDist  || row.trend === "Bearish" || row.rsi_signal === "Overbought";
                 const direction = isBullish && !isBearish ? "LONG" : isBearish && !isBullish ? "SHORT" : row.score >= 0 ? "LONG" : "SHORT";
                 const tags = [];
+                if (isDarkPool) tags.push({ label:"🌑 DARK POOL", color:"#9c6ee8", priority:0 });
                 if (isInst) tags.push({ label:isAccum?"🐋 ACCUM":"🔻 DIST", color:isAccum?T.purple:T.orange, priority:1 });
                 if (highRvol) tags.push({ label:`⚡ ${row.rvol?.toFixed(1)}x VOL`, color:T.gold, priority:2 });
                 if (highScore) tags.push({ label:`◈ ${row.score>0?"+":""}${row.score} SCORE`, color:row.score>=3?T.green:T.red, priority:3 });
                 if (bbAlert) tags.push({ label:"⚠ BB EXT", color:T.orange, priority:4 });
-                alerts.push({ ticker:row.ticker, price:row.price, direction, isInst, tags, score:row.score??0, rvol:row.rvol??0, priority:Math.min(...tags.map(t=>t.priority)) });
+                alerts.push({ ticker:row.ticker, price:row.price, direction, isInst, isDarkPool, tags, score:row.score??0, rvol:row.rvol??0, priority:Math.min(...tags.map(t=>t.priority)) });
               });
               alerts.sort((a,b) => a.priority!==b.priority?a.priority-b.priority:b.rvol!==a.rvol?b.rvol-a.rvol:Math.abs(b.score)-Math.abs(a.score));
               let filtered = alerts;
@@ -165,48 +480,19 @@ export default function PageDashboard({ onNavigate, onSectorChange, selectedSect
             </div>
           )}
         </div>
-      </div>
 
-      {/* Gainers / Losers / Earnings Today */}
-      <div style={{ display:"flex", gap:18, flexWrap:"wrap" }}>
-        {/* Top Gainers */}
-        <div className="card" style={{ flex:1, minWidth:200, alignSelf:"flex-start" }}>
-          <SectionHeader title={selectedSectors.includes("ALL")?"Top Gainers":`Top Gainers · ${selectedSectors.join(" + ")}`} T={T}>
-            <button className="btn-ghost" style={{ fontSize:8 }} onClick={() => onNavigate("live")}>VIEW ALL</button>
-          </SectionHeader>
-          <div style={{ padding:"8px 14px" }}>
-            {(() => {
-              let all = Array.from(tickers.values());
-              if (!selectedSectors.includes("ALL")) all = all.filter(t => selectedSectors.some(s => normalizeSector(t.sector) === s));
-              const top = all.filter(t=>(t.percent_change||0)>0).sort((a,b)=>b.percent_change-a.percent_change).slice(0,5);
-              if (top.length===0) return Array(5).fill(0).map((_,i)=>(<div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}><Shimmer w={44} h={11}/><Shimmer w={55} h={11} opacity={0.5}/></div>));
-              return top.map((t,i)=>(<div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}><span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{t.ticker}</span><span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{pct(t.percent_change)}</span></div>));
-            })()}
-          </div>
-        </div>
-
-        {/* Top Losers */}
-        <div className="card" style={{ flex:1, minWidth:200, alignSelf:"flex-start" }}>
-          <SectionHeader title={selectedSectors.includes("ALL")?"Top Losers":`Top Losers · ${selectedSectors.join(" + ")}`} T={T}>
-            <button className="btn-ghost" style={{ fontSize:8 }} onClick={() => onNavigate("live")}>VIEW ALL</button>
-          </SectionHeader>
-          <div style={{ padding:"8px 14px" }}>
-            {(() => {
-              let all = Array.from(tickers.values());
-              if (!selectedSectors.includes("ALL")) all = all.filter(t => selectedSectors.some(s => normalizeSector(t.sector) === s));
-              const top = all.filter(t=>(t.percent_change||0)<0).sort((a,b)=>a.percent_change-b.percent_change).slice(0,5);
-              if (top.length===0) return Array(5).fill(0).map((_,i)=>(<div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}><Shimmer w={44} h={11}/><Shimmer w={55} h={11} opacity={0.5}/></div>));
-              return top.map((t,i)=>(<div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}><span style={{ color:T.text0, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{t.ticker}</span><span style={{ color:T.red, fontSize:12, fontFamily:T.font, fontWeight:700 }}>{pct(t.percent_change)}</span></div>));
-            })()}
-          </div>
-        </div>
-
-        {/* Earnings Today */}
-        <div className="card" style={{ flex:1, minWidth:280 }}>
+        {/* Row 2+: Earnings Today */}
+        <div className="card" style={{ flex:"1 1 0", minHeight:0, display:"flex", flexDirection:"column" }}>
           <SectionHeader title="Earnings Today" T={T}>
+            {earningsBadge > 0 && (
+              <span style={{ background:T.gold, color:"#000", borderRadius:8, padding:"1px 6px", fontSize:8.5, fontWeight:700, fontFamily:T.font, animation:"badge_pulse 1.8s ease-in-out infinite" }}
+                onClick={() => setEarningsBadge(0)}>
+                ⚡ {earningsBadge} NEW
+              </span>
+            )}
             <button className="btn-ghost" style={{ fontSize:8 }} onClick={() => onNavigate("earnings")}>VIEW ALL</button>
           </SectionHeader>
-          <div style={{ padding:"8px 14px" }}>
+          <div style={{ padding:"8px 14px", flex:1, overflowY:"auto", minHeight:0 }}>
             {earningsLoading ? (
               Array(5).fill(0).map((_,i)=>(<div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"10px 0", borderBottom:i<4?`1px solid ${T.border}`:"none" }}><Shimmer w={44} h={11}/><Shimmer w={55} h={11} opacity={0.5}/></div>))
             ) : (() => {
@@ -245,7 +531,9 @@ export default function PageDashboard({ onNavigate, onSectorChange, selectedSect
             })()}
           </div>
         </div>
-      </div>
+
+      </div>{/* end right column */}
+
     </div>
   );
 }

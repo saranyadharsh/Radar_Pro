@@ -86,6 +86,8 @@ function NexRadarDashboard({
   const [isMobile,       setIsMobile]       = useState(() => window.innerWidth < 768);
   const [mobileDrawer,   setMobileDrawer]   = useState(false);
   const [liveAlerts,     setLiveAlerts]     = useState([]);
+  const [newsAlerts,     setNewsAlerts]     = useState([]);
+  const [unreadNews,     setUnreadNews]     = useState(0); // NEW: unread badge counter for 📰
 
   useEffect(() => {
     const handler = () => setIsMobile(window.innerWidth < 768);
@@ -94,17 +96,16 @@ function NexRadarDashboard({
   }, []);
 
   useEffect(() => {
-    // Only genuinely actionable events get the overlay toast
+    // Technical real-time signals only — news/edgar/earnings/fda go to the 📰 News panel
     const TOAST_TYPES = new Set([
       'gap', 'vol_spike', 'ah_momentum', 'hod_break', 'lod_break',
       'luld_halt', 'luld_resume',
-      'edgar_alert', 'earnings_alert', 'fda_alert', 'news_alert',
     ]);
     const handler = (e) => {
       const a = e.detail;
       if (!a || !TOAST_TYPES.has(a.type)) return;
-      const stamped = { ...a, ts: a.ts ?? Date.now(), _key: Math.random() };
-      setLiveAlerts(prev => [stamped, ...prev].slice(0, 3));
+      const stamped = { ...a, ts: a.ts ?? Date.now(), _key: `${Date.now()}_${Math.random()}` };
+      setLiveAlerts(prev => [stamped, ...prev].slice(0, 5));
     };
     window.addEventListener('nexradar_alert', handler);
     return () => window.removeEventListener('nexradar_alert', handler);
@@ -112,9 +113,25 @@ function NexRadarDashboard({
 
   useEffect(() => {
     if (!liveAlerts.length) return;
-    const t = setTimeout(() => setLiveAlerts(prev => prev.slice(0, -1)), 8000);
+    const t = setTimeout(() => setLiveAlerts(prev => prev.slice(0, -1)), 9500);
     return () => clearTimeout(t);
   }, [liveAlerts]);
+
+  // News feed panel: news/edgar/earnings/fda alerts grouped by date
+  useEffect(() => {
+    const NEWS_TYPES = new Set(['news_alert', 'edgar_alert', 'earnings_alert', 'fda_alert']);
+    const handler = (e) => {
+      const a = e.detail;
+      if (!a || !NEWS_TYPES.has(a.type)) return;
+      setNewsAlerts(prev => [{
+        ...a, _key: `${Date.now()}_${Math.random()}`, ts: a.ts ?? Date.now(),
+      }, ...prev].slice(0, 200));
+      // Increment unread badge unless panel is already open
+      setUnreadNews(prev => prev + 1);
+    };
+    window.addEventListener('nexradar_alert', handler);
+    return () => window.removeEventListener('nexradar_alert', handler);
+  }, []);
 
   const [headerPanel, setHeaderPanel] = useState(null);
 
@@ -135,7 +152,7 @@ function NexRadarDashboard({
   }, [sectorProp]);
 
   // ── Data hooks ───────────────────────────────────────────────────────────────
-  const { tickers, wsStatus, marketSession, sseRef, notifications, unreadCount, clearNotifications, staleTickers }
+  const { tickers, wsStatus, marketSession, sseRef, notifications, unreadCount, markNotificationsRead, clearNotifications, staleTickers }
     = useTickerData();
   const { techData, techLoading, techError, techLastFetch, techCached, techDataAge, fetchTechData }
     = useTechData();
@@ -330,7 +347,9 @@ function NexRadarDashboard({
   // ── RENDER ───────────────────────────────────────────────────────────────────
   return (
     <div style={{ display:'flex', height:'100vh', background:T.bg0, color:T.text0, fontFamily:T.font, overflow:'hidden' }}>
-      <style>{getCSS(T)}</style>
+      <style>{getCSS(T)}
+        {`@keyframes badge_pulse { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(1.18);opacity:0.85} }`}
+      </style>
 
       {/* ── SIDEBAR ── */}
       <div className="nexradar-sidebar" style={{ width:sideCollapsed?56:218, minWidth:sideCollapsed?56:218, background:T.bg1, borderRight:`1px solid ${T.border}`, display:'flex', flexDirection:'column', transition:'width 0.22s,min-width 0.22s', overflow:'hidden' }}>
@@ -425,32 +444,41 @@ function NexRadarDashboard({
             <span style={{ width:8, height:8, borderRadius:'50%', background:T.green, animation:'dotblink 1.4s ease-in-out infinite' }}/>
             <span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:600, letterSpacing:0.3 }}>SYS OK</span>
           </div>
-          {/* Notifications */}
-          <button onClick={()=>{setHeaderPanel(p=>p==='notifications'?null:'notifications');clearNotifications();}}
+          {/* Notifications 🔔 */}
+          <button onClick={()=>{setHeaderPanel(p=>p==='notifications'?null:'notifications');markNotificationsRead();}}
             style={{ width:36, height:36, borderRadius:6, background:headerPanel==='notifications'?T.cyanDim:T.bg2, border:`1px solid ${headerPanel==='notifications'?T.cyanMid:T.border}`, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', color:headerPanel==='notifications'?T.cyan:T.text1, fontSize:16, position:'relative', transition:'all 0.2s' }}
             onMouseEnter={e=>{if(headerPanel!=='notifications'){e.currentTarget.style.borderColor=T.cyanMid;e.currentTarget.style.color=T.cyan;}}}
             onMouseLeave={e=>{if(headerPanel!=='notifications'){e.currentTarget.style.borderColor=T.border;e.currentTarget.style.color=T.text1;}}}
             title="Notifications">
             🔔
             {unreadCount>0&&(
-              <span style={{ position:'absolute', top:3, right:3, minWidth:16, height:16, borderRadius:8, background:T.red, border:`2px solid ${T.bg1}`, color:'#fff', fontSize:9, fontWeight:700, fontFamily:T.font, display:'flex', alignItems:'center', justifyContent:'center', padding:'0 3px' }}>
+              <span style={{ position:'absolute', top:3, right:3, minWidth:16, height:16, borderRadius:8, background:T.red, border:`2px solid ${T.bg1}`, color:'#fff', fontSize:9, fontWeight:700, fontFamily:T.font, display:'flex', alignItems:'center', justifyContent:'center', padding:'0 3px', animation:'badge_pulse 1.8s ease-in-out infinite' }}>
                 {unreadCount>9?'9+':unreadCount}
               </span>
             )}
             {unreadCount===0&&(<span style={{ position:'absolute', top:4, right:4, width:8, height:8, borderRadius:'50%', background:T.border, border:`2px solid ${T.bg1}` }}/>)}
           </button>
-          {/* Settings */}
+          {/* Settings ⚙️ */}
           <button onClick={()=>setHeaderPanel(p=>p==='settings'?null:'settings')}
             style={{ width:36, height:36, borderRadius:6, background:headerPanel==='settings'?T.cyanDim:T.bg2, border:`1px solid ${headerPanel==='settings'?T.cyanMid:T.border}`, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', color:headerPanel==='settings'?T.cyan:T.text1, fontSize:16, transition:'all 0.2s' }}
             onMouseEnter={e=>{if(headerPanel!=='settings'){e.currentTarget.style.borderColor=T.cyanMid;e.currentTarget.style.color=T.cyan;}}}
             onMouseLeave={e=>{if(headerPanel!=='settings'){e.currentTarget.style.borderColor=T.border;e.currentTarget.style.color=T.text1;}}}
             title="Settings">⚙️</button>
-          {/* Signal Engine */}
-          <button onClick={()=>setHeaderPanel(p=>p==='signals'?null:'signals')}
-            style={{ width:36, height:36, borderRadius:6, background:headerPanel==='signals'?T.cyanDim:T.bg2, border:`1px solid ${headerPanel==='signals'?T.cyanMid:T.border}`, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', color:headerPanel==='signals'?T.cyan:T.text1, fontSize:16, transition:'all 0.2s' }}
-            onMouseEnter={e=>{if(headerPanel!=='signals'){e.currentTarget.style.borderColor=T.cyanMid;e.currentTarget.style.color=T.cyan;}}}
-            onMouseLeave={e=>{if(headerPanel!=='signals'){e.currentTarget.style.borderColor=T.border;e.currentTarget.style.color=T.text1;}}}
-            title="Signal Engine">⚡</button>
+          {/* 📰 News & Alerts — live badge clears on open */}
+          <button onClick={()=>{setHeaderPanel(p=>p==='news'?null:'news');setUnreadNews(0);}}
+            style={{ width:36, height:36, borderRadius:6, background:headerPanel==='news'?T.cyanDim:T.bg2, border:`1px solid ${headerPanel==='news'?(unreadNews>0?T.red+'80':T.cyanMid):(unreadNews>0?T.red+'40':T.border)}`, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', color:headerPanel==='news'?T.cyan:T.text1, fontSize:16, position:'relative', transition:'all 0.2s' }}
+            onMouseEnter={e=>{if(headerPanel!=='news'){e.currentTarget.style.borderColor=T.cyanMid;e.currentTarget.style.color=T.cyan;}}}
+            onMouseLeave={e=>{if(headerPanel!=='news'){e.currentTarget.style.borderColor=unreadNews>0?T.red+'40':T.border;e.currentTarget.style.color=T.text1;}}}
+            title="News & Alerts Feed">📰
+            {unreadNews>0&&(
+              <span style={{ position:'absolute', top:3, right:3, minWidth:16, height:16, borderRadius:8, background:T.red, border:`2px solid ${T.bg1}`, color:'#fff', fontSize:9, fontWeight:700, fontFamily:T.font, display:'flex', alignItems:'center', justifyContent:'center', padding:'0 3px', animation:'badge_pulse 1.8s ease-in-out infinite' }}>
+                {unreadNews>99?'99+':unreadNews}
+              </span>
+            )}
+            {unreadNews===0&&newsAlerts.length>0&&(
+              <span style={{ position:'absolute', top:4, right:4, width:8, height:8, borderRadius:'50%', background:T.cyan, border:`2px solid ${T.bg1}` }}/>
+            )}
+          </button>
           {/* User avatar */}
           <div style={{ position:'relative' }}>
             <div onClick={()=>setHeaderPanel(p=>p==='user'?null:'user')}
@@ -583,43 +611,82 @@ function NexRadarDashboard({
             </div>
           )}
 
-          {/* Signal Engine panel — SIGNAL-PANEL-LIVE-FIX: real live values */}
-          {headerPanel==='signals'&&(
-            <div style={{ position:'absolute', right:20, top:64, width:300, background:T.bg1, border:`1px solid ${T.border}`, borderRadius:10, boxShadow:'0 12px 40px rgba(0,0,0,0.5)', zIndex:9999, overflow:'hidden' }}>
-              <div style={{ padding:'14px 16px', borderBottom:`1px solid ${T.border}`, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-                <span style={{ color:T.text0, fontFamily:T.font, fontWeight:700, fontSize:13 }}>⚡ Signal Engine</span>
-                <button onClick={()=>setHeaderPanel(null)} style={{ background:'none', border:'none', color:T.text2, cursor:'pointer', fontSize:16, padding:0 }}>✕</button>
+          {/* 📰 News Feed panel — editorial alerts grouped by date */}
+          {headerPanel==='news'&&(
+            <div style={{ position:'absolute', right:20, top:64, width:360, maxHeight:520, display:'flex', flexDirection:'column', background:T.bg1, border:`1px solid ${T.border}`, borderRadius:10, boxShadow:'0 12px 40px rgba(0,0,0,0.5)', zIndex:9999, overflow:'hidden' }}>
+              <div style={{ padding:'14px 16px', borderBottom:`1px solid ${T.border}`, display:'flex', justifyContent:'space-between', alignItems:'center', flexShrink:0 }}>
+                <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                  <span style={{ color:T.text0, fontFamily:T.font, fontWeight:700, fontSize:13 }}>News & Alerts</span>
+                  {newsAlerts.length>0&&<span style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:10, padding:'1px 7px', color:T.text2, fontFamily:T.font, fontSize:10 }}>{newsAlerts.length}</span>}
+                </div>
+                <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+                  {newsAlerts.length>0&&<button onClick={()=>setNewsAlerts([])} style={{ background:'none', border:'none', color:T.text2, cursor:'pointer', fontFamily:T.font, fontSize:11, padding:0 }}>Clear all</button>}
+                  <button onClick={()=>setHeaderPanel(null)} style={{ background:'none', border:'none', color:T.text2, cursor:'pointer', fontSize:16, padding:0 }}>✕</button>
+                </div>
               </div>
-              <div style={{ padding:'12px 16px', display:'flex', gap:8 }}>
-                {[
-                  ['WATCHING', sideWatchlist,   T.gold],
-                  ['SIGNALS',  sideSignalCount, T.green],
-                  ['BARS',     sideBarsCount,   T.cyan],
-                ].map(([l,v,c])=>(
-                  <div key={l} style={{ flex:1, background:T.bg2, border:`1px solid ${T.border}`, borderRadius:6, padding:'8px 6px', textAlign:'center' }}>
-                    <div style={{ color:T.text2, fontSize:8, letterSpacing:1 }}>{l}</div>
-                    <div style={{ color:v>0?c:T.text2, fontFamily:T.font, fontSize:16, fontWeight:700, marginTop:3 }}>
-                      {v > 0 ? v.toLocaleString() : '—'}
+              <div style={{ overflowY:'auto', flex:1 }}>
+                {newsAlerts.length===0 ? (
+                  <div style={{ padding:'36px 16px', textAlign:'center' }}>
+                    <div style={{ fontSize:30, marginBottom:10 }}>📰</div>
+                    <div style={{ color:T.text2, fontFamily:T.font, fontSize:12 }}>No news alerts yet</div>
+                    <div style={{ color:T.text2, fontFamily:T.font, fontSize:10, marginTop:4, opacity:0.6 }}>Watchlist news · Earnings · SEC filings<br/>FDA approvals appear here in real time</div>
+                  </div>
+                ) : (() => {
+                  const groups = {};
+                  newsAlerts.forEach(a => {
+                    const d=new Date(a.ts??Date.now()), nd=new Date(), yd=new Date(nd);
+                    yd.setDate(yd.getDate()-1);
+                    const lbl=d.toDateString()===nd.toDateString()?'Today':d.toDateString()===yd.toDateString()?'Yesterday':d.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+                    if(!groups[lbl]) groups[lbl]=[];
+                    groups[lbl].push(a);
+                  });
+                  const srcIcon=(a)=>{
+                    if(a.type==='edgar_alert')    return {icon:'📋',bg:'#1a2a40',bd:'#1e3a5f'};
+                    if(a.type==='earnings_alert') return {icon:a.emoji||'📅',bg:'#1a2a1a',bd:'#1e5f1e'};
+                    if(a.type==='fda_alert')      return {icon:'💊',bg:'#2a1a2a',bd:'#5f1e5f'};
+                    const s=(a.sub||'').toLowerCase();
+                    if(s.includes('positive')) return {icon:'📈',bg:'#0d1f14',bd:'#0d3320'};
+                    if(s.includes('negative')) return {icon:'📉',bg:'#1f0d0d',bd:'#3d1515'};
+                    return {icon:'📰',bg:'#0d1a2a',bd:'#1a2d42'};
+                  };
+                  const cmap={green:'#00e676',red:'#ff3d5a',gold:'#ffc400',cyan:'#00d4ff',purple:'#b388ff'};
+                  return Object.entries(groups).map(([grp,items])=>(
+                    <div key={grp}>
+                      <div style={{ padding:'7px 16px 3px', color:T.text2, fontFamily:T.font, fontSize:9.5, letterSpacing:1, fontWeight:600, background:T.bg2, borderBottom:`1px solid ${T.border}` }}>{grp.toUpperCase()}</div>
+                      {items.map(a=>{
+                        const {icon,bg,bd}=srcIcon(a);
+                        const ac=cmap[a.color]||'#00d4ff';
+                        const elapsed=Math.floor((Date.now()-(a.ts??Date.now()))/1000);
+                        const timeStr=elapsed<60?`${elapsed}s ago`:elapsed<3600?`${Math.floor(elapsed/60)}m ago`:`${Math.floor(elapsed/3600)}h ago`;
+                        const sub=a.sub||a.message||'';
+                        const WrapEl=a.url?'a':'div';
+                        const wrapX=a.url?{href:a.url,target:'_blank',rel:'noreferrer'}:{};
+                        return(
+                          <WrapEl key={a._key} {...wrapX} style={{ textDecoration:'none', display:'flex', padding:'10px 16px', borderBottom:`1px solid ${T.border}`, gap:11, alignItems:'flex-start', cursor:a.url?'pointer':'default', transition:'background 0.12s' }}
+                            onMouseEnter={e=>e.currentTarget.style.background=T.bg2}
+                            onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                            <div style={{ width:34,height:34,borderRadius:8,background:bg,border:`1px solid ${bd}`,display:'flex',alignItems:'center',justifyContent:'center',fontSize:15,flexShrink:0 }}>{icon}</div>
+                            <div style={{ flex:1, minWidth:0 }}>
+                              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:3 }}>
+                                <div style={{ display:'flex', gap:5, alignItems:'center' }}>
+                                  {a.ticker&&<span style={{ background:ac+'20',border:`1px solid ${ac}40`,borderRadius:4,padding:'1px 5px',color:ac,fontFamily:T.font,fontSize:9,fontWeight:700,letterSpacing:0.5 }}>{a.ticker}</span>}
+                                  <span style={{ color:T.text2,fontFamily:T.font,fontSize:9 }}>{a.type==='edgar_alert'?'SEC Filing':a.type==='earnings_alert'?'Earnings':a.type==='fda_alert'?'FDA':((a.sub||'').split('·')[0]?.trim()||'News')}</span>
+                                </div>
+                                <span style={{ color:T.text2,fontFamily:T.font,fontSize:9,flexShrink:0 }}>{timeStr}</span>
+                              </div>
+                              <div style={{ color:T.text0,fontFamily:T.font,fontSize:11.5,fontWeight:600,lineHeight:1.4,marginBottom:sub?3:0 }}>{a.title||''}</div>
+                              {sub&&<div style={{ color:T.text2,fontFamily:T.font,fontSize:10,lineHeight:1.3 }}>{sub}</div>}
+                            </div>
+                          </WrapEl>
+                        );
+                      })}
                     </div>
-                  </div>
-                ))}
+                  ));
+                })()}
               </div>
-              <div style={{ padding:'0 16px 12px' }}>
-                <div style={{ color:T.text2, fontFamily:T.font, fontSize:10, marginBottom:6 }}>COOLDOWN · SESSION FILTER · ADX THRESHOLD</div>
-                {[
-                  ['Signal Cooldown','120s'],
-                  ['Min Score','0.45'],
-                  ['Min Confidence','50%'],
-                  ['Session Filter','Midday skipped'],
-                ].map(([l,v])=>(
-                  <div key={l} style={{ display:'flex', justifyContent:'space-between', padding:'5px 0', borderBottom:`1px solid ${T.border}` }}>
-                    <span style={{ color:T.text2, fontFamily:T.font, fontSize:11 }}>{l}</span>
-                    <span style={{ color:T.cyan,  fontFamily:T.font, fontSize:11, fontWeight:600 }}>{v}</span>
-                  </div>
-                ))}
-              </div>
-              <div style={{ padding:'12px 16px', display:'flex', gap:8 }}>
-                <button onClick={()=>{setPage('signals');setHeaderPanel(null);}} style={{ flex:1, padding:'8px 0', borderRadius:6, border:'none', background:T.cyan, color:'#000', fontFamily:T.font, fontSize:12, fontWeight:700, cursor:'pointer' }}>Open Signals Page</button>
+              <div style={{ padding:'10px 16px', borderTop:`1px solid ${T.border}`, flexShrink:0, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                <span style={{ color:T.text2, fontFamily:T.font, fontSize:10 }}>{newsAlerts.length>0?`${newsAlerts.length} alert${newsAlerts.length!==1?'s':''}`:''}</span>
+                <button onClick={()=>{setPage('watchlist');setHeaderPanel(null);}} style={{ background:'none', border:'none', color:T.cyan, fontFamily:T.font, fontSize:11, cursor:'pointer', fontWeight:600 }}>Go to Watchlist →</button>
               </div>
             </div>
           )}

@@ -354,43 +354,78 @@ class IndicatorCalculator:
 
     def _detect_order_block(self, opens: np.ndarray, highs: np.ndarray,
                              lows: np.ndarray, closes: np.ndarray,
-                             volumes: np.ndarray, lookback: int = 5) -> tuple:
+                             volumes: np.ndarray, lookback: int = 10) -> tuple:
         """
-        Detects high-volume impulsive engulfing moves that signal institutional
-        order-block activity. Returns (ob_active: bool, ob_dir: str).
+        ORDER-BLOCK-FIX: Completely rewritten to actually fire on 1-min bars.
 
-        Criteria (all three must be met):
-          1. Body size >= 1.5× ATR(14) — confirms an impulsive move
-          2. Candle volume >= 1.5× rolling-average volume (lookback) — confirms
-             institutional participation
-          3. Direction determined by close vs open of the triggering candle
+        Old logic only checked closes[-1] (the current bar) against 1.5× ATR.
+        On 1-min data, individual bars are almost never 1.5× ATR in body size —
+        that threshold is calibrated for 5-min or 15-min bars. Result: ORDR BLK
+        column was always "—" (NONE) regardless of real institutional activity.
 
-        Returns ('BULLISH_OB' | 'BEARISH_OB' | 'NONE')
+        New logic:
+          1. Scan the last `lookback` bars (default 10) for the most recent
+             impulsive bar — body >= ATR * 0.5 (realistic for 1-min) AND
+             volume >= 1.3× rolling average (lower than 1.5× — still selective).
+          2. The found bar's direction sets BULLISH_OB / BEARISH_OB.
+          3. Relevance decay: the block must be within the last 10 bars.
+             Older blocks have likely been consumed by price and are stale.
+          4. Price proximity check: current price must be within 2× ATR of the
+             block's high (bull) or low (bear) — confirms it's still an active
+             zone not a distant historical print.
+
+        Returns (ob_active: bool, ob_dir: str)
+          ob_dir: 'BULLISH_OB' | 'BEARISH_OB' | 'NONE'
         """
-        if len(closes) < lookback + 2:
+        min_bars = lookback + 3
+        if len(closes) < min_bars:
             return False, "NONE"
 
         atr = self._atr(highs, lows, closes, p=14)
         if atr == 0:
             return False, "NONE"
 
-        body_size = abs(closes[-1] - opens[-1])
-        if body_size < atr * 1.5:
+        # Rolling average volume — use a 20-bar window anchored before the lookback
+        vol_anchor_end   = max(len(volumes) - lookback, 1)
+        vol_window_start = max(vol_anchor_end - 20, 0)
+        vol_baseline = volumes[vol_window_start:vol_anchor_end]
+        avg_vol = float(np.mean(vol_baseline)) if len(vol_baseline) > 0 else 0.0
+        if avg_vol == 0:
             return False, "NONE"
 
-        # Safe slice: ensure we don't underflow on short deque
-        vol_window = volumes[-(lookback + 1):-1] if len(volumes) > lookback else volumes[:-1]
-        if len(vol_window) == 0:
-            return False, "NONE"
+        current_price = closes[-1]
 
-        avg_vol = float(np.mean(vol_window))
-        if avg_vol == 0 or volumes[-1] < avg_vol * 1.5:
-            return False, "NONE"
+        # Scan from most recent bar backwards through the lookback window
+        scan_start = len(closes) - lookback
+        for i in range(len(closes) - 1, scan_start - 1, -1):
+            body   = abs(closes[i] - opens[i])
+            bar_vol = volumes[i]
 
-        if closes[-1] > opens[-1]:
-            return True, "BULLISH_OB"
-        else:
-            return True, "BEARISH_OB"
+            # ORDER-BLOCK-FIX: body >= 0.5× ATR (1-min realistic) AND vol >= 1.3× avg
+            if body < atr * 0.5:
+                continue
+            if bar_vol < avg_vol * 1.3:
+                continue
+
+            # This bar qualifies as an order block — determine direction
+            is_bull = closes[i] > opens[i]
+            ob_high = highs[i]
+            ob_low  = lows[i]
+
+            # Proximity: current price must be within 2× ATR of the block zone
+            if is_bull:
+                # Bullish OB zone: ob_low to ob_high
+                # Price should still be near (not far above) the block
+                if current_price > ob_high + atr * 2:
+                    continue   # price moved far away — block consumed
+                return True, "BULLISH_OB"
+            else:
+                # Bearish OB zone: ob_low to ob_high
+                if current_price < ob_low - atr * 2:
+                    continue   # block consumed
+                return True, "BEARISH_OB"
+
+        return False, "NONE"
 
     @staticmethod
     def _atr_5m(highs, lows, closes, n_agg=5, p=14) -> float:

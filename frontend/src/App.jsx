@@ -83,38 +83,38 @@ export default function App() {
   const [user, setUser] = useState(undefined)
 
   useEffect(() => {
-    // STALE-TOKEN-FIX: scrub stale localStorage tokens BEFORE the SDK's
-    // autoRefreshToken timer fires and makes the 400 call.
-    // This is async but fast (~1 network call on first load only).
-    clearStaleAuthIfNeeded()
+    // AUTH-RACE-FIX: clearStaleAuthIfNeeded() is async. Previously it was called
+    // without awaiting, so onAuthStateChange was registered immediately after —
+    // if the async signOut({ scope:'local' }) resolved at the same moment as the
+    // SDK firing INITIAL_SESSION, both setUser(null) and setUser(session.user)
+    // could execute in undefined order, causing a brief dashboard flash before
+    // the login screen appeared.
+    //
+    // Fix: register the auth listener INSIDE the .then() of clearStaleAuthIfNeeded
+    // so it is always set up AFTER the stale-token cleanup is complete.
+    // The subscription ref is stored so the cleanup function can still unsubscribe.
+    let subscription = null;
 
-    // onAuthStateChange handles all subsequent auth transitions:
-    //   INITIAL_SESSION  — page load with valid stored session
-    //   SIGNED_IN        — Google OAuth redirect or explicit login
-    //   TOKEN_REFRESHED  — SDK successfully refreshed an expiring token
-    //   SIGNED_OUT       — explicit sign-out or local clear
-    //   TOKEN_REFRESH_ERROR — belt-and-suspenders: catches mid-session expiry
-    //     that clearStaleAuthIfNeeded() couldn't prevent (token was valid at
-    //     mount, expired later). signOut({ scope:'local' }) avoids a server
-    //     round-trip for an already-invalid token.
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-      if (
-        event === 'INITIAL_SESSION' ||
-        event === 'SIGNED_IN'       ||
-        event === 'TOKEN_REFRESHED'
-      ) {
-        setUser(session?.user ?? null)
-      } else if (event === 'SIGNED_OUT') {
-        setUser(null)
-      } else if (event === 'TOKEN_REFRESH_ERROR') {
-        // Mid-session token expiry (not caught at mount) — clear and re-login.
-        console.warn('[NexRadar] Refresh token invalid — clearing session')
-        supabase.auth.signOut({ scope: 'local' })
-        setUser(null)
-      }
+    clearStaleAuthIfNeeded().then(() => {
+      const { data } = supabase.auth.onAuthStateChange((event, session) => {
+        if (
+          event === 'INITIAL_SESSION' ||
+          event === 'SIGNED_IN'       ||
+          event === 'TOKEN_REFRESHED'
+        ) {
+          setUser(session?.user ?? null)
+        } else if (event === 'SIGNED_OUT') {
+          setUser(null)
+        } else if (event === 'TOKEN_REFRESH_ERROR') {
+          console.warn('[NexRadar] Refresh token invalid — clearing session')
+          supabase.auth.signOut({ scope: 'local' })
+          setUser(null)
+        }
+      })
+      subscription = data.subscription
     })
 
-    return () => subscription.unsubscribe()
+    return () => { subscription?.unsubscribe() }
   }, [])
 
   // ── Theme system ─────────────────────────────────────────────────────────────

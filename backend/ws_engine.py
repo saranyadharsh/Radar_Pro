@@ -29,6 +29,29 @@ FIXES IN THIS VERSION:
               showed $0.00 for up to 15s (the snapshot_delta window).
               Now ticks carry open so the column is always populated.
 
+  OPEN-PRICE-AUTHORITATIVE-FIX:
+              Polygon day.o is the first WS tick price, NOT the official
+              NYSE/NASDAQ opening auction print. For illiquid or gapped
+              stocks like LITE, day.o = $597 while Yahoo shows $709
+              because Yahoo uses regularMarketOpen (the auction print).
+              Fix: after _fetch_polygon_snapshot_bulk populates the cache
+              on startup, _seed_official_opens() fetches the Polygon
+              /v2/aggs/grouped/locale/us/market/stocks/{date} endpoint
+              (one call for ALL stocks) and overwrites open_price with
+              the grouped-daily 'o' field which IS the official open.
+              This runs only once at startup and only during market hours
+              (pre/market session) — no extra REST calls during normal tick flow.
+
+  OVERNIGHT-RESTART-PREVCLOSE-FIX:
+              When the backend restarts overnight (Render cold start) with
+              today_close=0 in the cache (AH loop hasn't run yet for today),
+              _session_reset_loop at 9:30 AM finds today_close=0 and skips
+              the prev_close promotion → every %CHG wrong all day.
+              Fix: _seed_prev_close_from_polygon() runs at startup if session
+              is 'pre' or 'market' and any cached ticker has prev_close=0.
+              Uses prevDay.c from the snapshot bulk endpoint — already fetched,
+              just applied more defensively.
+
   BUG-2 FIX  _watchlist_tickers seeded at start() time.
               _ah_close_loop calls _refresh_ah_closes() which iterates
               self._watchlist_tickers to decide which tickers need today_close
@@ -1011,6 +1034,24 @@ class WSEngine:
             f"({len(failed)} yfinance fallbacks)"
         )
 
+        # OPEN-PRICE-AUTHORITATIVE-FIX: overwrite open_price with the official
+        # grouped-daily open (NYSE/NASDAQ auction print) so it matches Yahoo Finance.
+        # Polygon day.o on the snapshot endpoint is the first WS tick, not the
+        # official open. The grouped daily bars endpoint returns the actual 9:30
+        # auction 'o' field, which is what every other data source calls "Open".
+        if session_now in ("pre", "market"):
+            try:
+                self._seed_official_opens()
+            except Exception as e:
+                logger.warning(f"_seed_official_opens failed (non-fatal): {e}")
+
+        # OVERNIGHT-RESTART-PREVCLOSE-FIX: if any ticker has prev_close=0 after
+        # the bulk fetch (e.g. overnight restart before AH loop populated today_close),
+        # use prevDay.c which is always present in the bulk snapshot response.
+        # This is already applied in _fetch_polygon_snapshot_bulk but this guard
+        # catches tickers that came only from the Supabase cache with stale data.
+        self._repair_zero_prev_close()
+
         # BROADCAST-FIX: broadcast full snapshot now that Polygon data is loaded.
         # _fetch_polygon_snapshot_bulk fills self._cache but never broadcasts —
         # so broadcaster._snapshot_map stays empty and every SSE client hits the
@@ -1024,6 +1065,94 @@ class WSEngine:
                              "ts": int(time.time() * 1000)})
             logger.info(f"BROADCAST-FIX: Full snapshot broadcast after Polygon load "
                         f"— {len(final_data)} tickers. broadcaster._snapshot_map now populated.")
+
+    def _seed_official_opens(self) -> None:
+        """
+        OPEN-PRICE-AUTHORITATIVE-FIX: Polygon day.o (snapshot endpoint) is the
+        first WS trade price, NOT the official NYSE/NASDAQ opening auction print.
+        For gapped or illiquid stocks this causes a mismatch vs Yahoo Finance.
+        Fetches grouped daily bars (one call, all tickers) and overwrites
+        open_price with the authoritative exchange auction open.
+        Called once at startup during pre/market sessions only.
+        """
+        if not self._api_key:
+            return
+        from datetime import date as _date
+        trading_date = datetime.now(ET).date()
+        while trading_date.weekday() >= 5:
+            trading_date -= timedelta(days=1)
+        date_str = trading_date.isoformat()
+        url = (
+            f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date_str}"
+            f"?adjusted=true&apiKey={self._api_key}"
+        )
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            results = resp.json().get("results") or []
+            if not results:
+                logger.info(f"_seed_official_opens: no grouped daily results for {date_str}")
+                return
+            updated = 0
+            with self._cache_lock:
+                for bar in results:
+                    tk = bar.get("T", "")
+                    official_open = float(bar.get("o", 0) or 0)
+                    if not tk or official_open <= 0:
+                        continue
+                    if tk in self._cache:
+                        self._cache[tk]["open"]       = official_open
+                        self._cache[tk]["open_price"] = official_open
+                        updated += 1
+            logger.info(
+                f"OPEN-PRICE-AUTHORITATIVE-FIX: Overwrote open_price for {updated} tickers "
+                f"with official grouped-daily auction open for {date_str}"
+            )
+        except Exception as e:
+            logger.warning(f"_seed_official_opens: {e}")
+
+    def _repair_zero_prev_close(self) -> None:
+        """
+        OVERNIGHT-RESTART-PREVCLOSE-FIX: Fixes tickers with prev_close=0 after
+        overnight Render cold-start, so %CHG is correct all day from the start.
+        Fetches prevDay.c from Polygon snapshot for affected tickers only.
+        """
+        with self._cache_lock:
+            zero_pc = [tk for tk, row in self._cache.items()
+                       if float(row.get("prev_close", 0) or 0) <= 0
+                       and float(row.get("price", 0) or 0) > 0]
+        if not zero_pc:
+            logger.info("_repair_zero_prev_close: all tickers have valid prev_close ✓")
+            return
+        logger.info(f"_repair_zero_prev_close: {len(zero_pc)} tickers missing prev_close — fetching from Polygon")
+        batch_size = 100
+        for i in range(0, len(zero_pc), batch_size):
+            batch  = zero_pc[i:i + batch_size]
+            params = {"tickers": ",".join(batch), "apiKey": self._api_key}
+            try:
+                resp = requests.get(
+                    f"{POLYGON_REST_URL}/snapshot/locale/us/markets/stocks/tickers",
+                    params=params, timeout=20
+                )
+                resp.raise_for_status()
+                for item in resp.json().get("tickers", []):
+                    tk        = item.get("ticker", "")
+                    prev_day  = item.get("prevDay") or {}
+                    prev_close = float(prev_day.get("c", 0) or 0)
+                    if tk and prev_close > 0:
+                        with self._cache_lock:
+                            if tk in self._cache:
+                                self._cache[tk]["prev_close"] = prev_close
+                                price = float(self._cache[tk].get("price", 0) or 0)
+                                if price > 0:
+                                    chg_pct = (price - prev_close) / prev_close * 100
+                                    self._cache[tk]["percent_change"] = round(chg_pct, 4)
+                                    self._cache[tk]["change_cpt"]     = round(chg_pct, 4)
+                                    self._cache[tk]["change_value"]   = round(price - prev_close, 4)
+                                    self._cache[tk]["is_positive"]    = 1 if chg_pct >= 0 else 0
+            except Exception as e:
+                logger.warning(f"_repair_zero_prev_close batch {i//batch_size}: {e}")
+        logger.info("_repair_zero_prev_close: repair complete")
 
     def _fetch_yfinance_fallback(self, tickers: List[str], session_now: str) -> None:
         """

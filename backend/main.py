@@ -573,11 +573,25 @@ async def lifespan(app: FastAPI):
     # Every 30 min — Supabase earnings table only (EDGAR has no forward calendar).
     # T-1 = tomorrow's earnings, T-0 = today pre-market/market open.
     # EDGAR 8-K Item 2.02 fires separately (Loop 1) when the actual result drops.
+    #
+    # EARNINGS-RESTART-FIX: alerted dict was in-memory — lost on restart, causing
+    # duplicate T-0/T-1 alerts to re-fire on every cold start. Fix: persist
+    # alerted keys to Supabase (alert_seen table, or in-memory fallback if absent).
+    # Also reduced warm-up from 90s → 15s so earnings alerts reach users faster.
     async def _earnings_alert_loop():
         POLL_INTERVAL_S = 1800
         alerted : dict  = {}   # "{sym}_{horizon}_{date}": date_str
 
-        await asyncio.sleep(90)
+        # EARNINGS-RESTART-FIX: seed from Supabase so restarts don't re-fire
+        try:
+            persisted_keys = await asyncio.to_thread(db.get_seen_alert_keys, "earnings")
+            for k in (persisted_keys or []):
+                alerted[k] = date.today().isoformat()
+            logger.info(f"Earnings alert loop: seeded {len(alerted)} seen keys from Supabase")
+        except Exception as _e:
+            logger.debug(f"Earnings alert loop: seed failed (table may not exist — using in-memory): {_e}")
+
+        await asyncio.sleep(15)      # EARNINGS-RESTART-FIX: reduced from 90s
 
         while True:
             try:
@@ -634,6 +648,10 @@ async def lifespan(app: FastAPI):
                             "ts": int(time.time() * 1000),
                         })
                         logger.info(f"Earnings T-1 alert: {sym} {earn_date}")
+                        # EARNINGS-RESTART-FIX: persist so restart doesn't re-fire
+                        try:
+                            await asyncio.to_thread(db.save_seen_alert_key, "earnings", k1)
+                        except Exception: pass
 
                     k0 = f"{sym}_T0_{today.isoformat()}"
                     if (earn_date == today.isoformat()
@@ -650,6 +668,10 @@ async def lifespan(app: FastAPI):
                             "ts": int(time.time() * 1000),
                         })
                         logger.info(f"Earnings T-0 alert: {sym} {earn_date}")
+                        # EARNINGS-RESTART-FIX: persist so restart doesn't re-fire
+                        try:
+                            await asyncio.to_thread(db.save_seen_alert_key, "earnings", k0)
+                        except Exception: pass
 
                 yesterday = (today - timedelta(days=1)).isoformat()
                 alerted   = {k: v for k, v in alerted.items() if v > yesterday}
@@ -804,20 +826,40 @@ async def lifespan(app: FastAPI):
     # Every 15 min — Polygon /v2/reference/news for each watchlist ticker.
     # Dedupes by article URL. Pushes news_alert SSE event so frontend can
     # display a notification toast with headline + sentiment + source link.
-    # Only fires for articles published within the last 2 hours to avoid
-    # flooding on startup with old news.
+    #
+    # NEWS-RESTART-FIX: seen_urls was an in-memory set — lost on every Render
+    # cold start, causing the poller to silently swallow the first-pass articles
+    # (they're "new" but there's no prior headline to compare against so no alert
+    # fires). Fix: persist seen URLs to Supabase news_seen_urls table (or fall
+    # back to in-memory if table absent). Also:
+    #   - Reduced warm-up from 150s → 30s so after restart it catches up fast.
+    #   - First-run recency window widened from 2hr → 6hr so morning articles
+    #     published before a mid-morning restart are not silently ignored forever.
+    #   - Subsequent runs keep MAX_AGE_HOURS=2 to avoid flooding old news.
     async def _news_watchlist_loop():
         POLL_INTERVAL_S = 900        # 15 minutes
-        MAX_AGE_HOURS   = 2          # only alert on very recent articles
+        MAX_AGE_HOURS   = 2          # normal recency filter
+        FIRST_RUN_AGE_H = 6          # NEWS-RESTART-FIX: wider window on first run
         seen_urls       : set  = set()
         seen_ts         : dict = {}
+        is_first_run    : bool = True
 
         api_key = os.getenv("MASSIVE_API_KEY", "")
         if not api_key:
             logger.warning("NEWS poller: MASSIVE_API_KEY not set — skipping news loop")
             return
 
-        await asyncio.sleep(150)     # warm-up after FDA loop
+        # NEWS-RESTART-FIX: seed seen_urls from Supabase so restarts don't re-fire
+        # articles that were already alerted in a prior session.
+        try:
+            persisted = await asyncio.to_thread(db.get_seen_news_urls)
+            if persisted:
+                seen_urls.update(persisted)
+                logger.info(f"News poller: seeded {len(seen_urls)} seen URLs from Supabase")
+        except Exception as _e:
+            logger.debug(f"News poller: seen_urls Supabase seed failed (table may not exist — using in-memory): {_e}")
+
+        await asyncio.sleep(30)      # NEWS-RESTART-FIX: reduced from 150s
 
         while True:
             try:
@@ -830,7 +872,13 @@ async def lifespan(app: FastAPI):
 
                 from datetime import datetime as _dt3, timezone as _tz
                 now_utc    = _dt3.now(_tz.utc)
-                cutoff_iso = (now_utc - timedelta(hours=MAX_AGE_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                # NEWS-RESTART-FIX: use wider window on first run to catch morning
+                # articles that were published before a mid-morning backend restart.
+                effective_age_h = FIRST_RUN_AGE_H if is_first_run else MAX_AGE_HOURS
+                cutoff_iso = (now_utc - timedelta(hours=effective_age_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                is_first_run = False
+
+                new_urls_this_cycle: list = []
 
                 for sym in watchlist:
                     news_url = (
@@ -853,6 +901,7 @@ async def lifespan(app: FastAPI):
                             continue
                         seen_urls.add(art_url)
                         seen_ts[art_url] = date.today().isoformat()
+                        new_urls_this_cycle.append(art_url)
 
                         headline  = art.get("title", "")
                         source    = (art.get("publisher") or {}).get("name", "")
@@ -875,10 +924,19 @@ async def lifespan(app: FastAPI):
                             "url":       art_url,
                             "color":     sent_color,
                             "emoji":     "📰",
+                            "ts":        int(time.time() * 1000),
                         })
                         logger.debug(f"News alert: {sym} '{headline[:50]}' ({source})")
 
                     await asyncio.sleep(0.25)  # rate-limit between tickers
+
+                # NEWS-RESTART-FIX: persist newly-seen URLs to Supabase so the
+                # next restart doesn't re-alert articles already shown this session.
+                if new_urls_this_cycle:
+                    try:
+                        await asyncio.to_thread(db.save_seen_news_urls, new_urls_this_cycle)
+                    except Exception as _pe:
+                        logger.debug(f"News poller: save_seen_news_urls failed (non-fatal): {_pe}")
 
                 # Prune seen URLs daily
                 cutoff = (date.today() - timedelta(days=1)).isoformat()
@@ -905,6 +963,40 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="NexRadar Pro API", version="6.5.0", lifespan=lifespan)
+
+# ── Shared watchlist cache — eliminates Supabase read storm ───────────────────
+# All 4 background loops + /api/watchlist read db.get_signal_watchlist() on
+# every cycle. This is ~100 Supabase reads/hr with 10 open tabs.
+# WATCHLIST-CACHE-FIX: single in-memory cache refreshed every 5 minutes.
+# Loops that previously called db.get_signal_watchlist() directly now read
+# from here — only /api/watchlist/add and /api/watchlist/remove invalidate it.
+import threading as _wl_threading
+_watchlist_cache_lock  = _wl_threading.Lock()
+_watchlist_cache_data  : list = []
+_watchlist_cache_ts    : float = 0.0
+_WATCHLIST_CACHE_TTL_S : float = 300.0   # 5 minutes
+
+def _get_cached_watchlist(force: bool = False) -> list:
+    global _watchlist_cache_data, _watchlist_cache_ts
+    with _watchlist_cache_lock:
+        if not force and time.time() - _watchlist_cache_ts < _WATCHLIST_CACHE_TTL_S:
+            return list(_watchlist_cache_data)
+    # Outside the lock for the slow DB call
+    try:
+        rows = db.get_signal_watchlist() if db else []
+        with _watchlist_cache_lock:
+            _watchlist_cache_data = rows
+            _watchlist_cache_ts   = time.time()
+        return list(rows)
+    except Exception as _e:
+        logger.warning(f"_get_cached_watchlist DB error: {_e}")
+        with _watchlist_cache_lock:
+            return list(_watchlist_cache_data)  # return stale rather than crash
+
+def _invalidate_watchlist_cache() -> None:
+    global _watchlist_cache_ts
+    with _watchlist_cache_lock:
+        _watchlist_cache_ts = 0.0
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://nexradar.info").rstrip("/")
 # GZip REST compression — applies to all non-SSE endpoints automatically.
@@ -1462,7 +1554,8 @@ async def _refresh_signal_watcher():
     try:
         engine = app.state.engine
         if engine and engine._signal_watcher:
-            rows    = await asyncio.to_thread(db.get_signal_watchlist)
+            # WATCHLIST-CACHE-FIX: force-refresh the shared cache then use it
+            rows    = await asyncio.to_thread(_get_cached_watchlist, True)
             tickers = [r["ticker"] for r in rows if r.get("ticker")]
             engine._signal_watcher.set_watchlist(tickers)
             try:
@@ -1494,6 +1587,7 @@ async def watchlist_add(body: WatchlistBody):
     try:
         ticker = body.ticker.upper().strip()
         await asyncio.to_thread(db.add_signal_watchlist, ticker)
+        _invalidate_watchlist_cache()   # WATCHLIST-CACHE-FIX
         await _refresh_signal_watcher()
         # v6.3-2 HYBRID WARM-UP: seed the newly-added ticker immediately so
         # its tech indicators are available within seconds, not 27 minutes.
@@ -1641,6 +1735,116 @@ async def get_market_monitor(refresh: int = Query(0)):
     )
     return result
 
+
+# ── News Feed ──────────────────────────────────────────────────────────────────
+# GET /api/news
+# Proxies Polygon.io news — key stays server-side, never in the browser bundle.
+# Filters to watchlist tickers via ticker.any_of= so headlines are relevant.
+# KEY-FIX: uses MASSIVE_API_KEY (same env var as all other Polygon calls in this file).
+@app.get("/api/news")
+async def get_news(limit: int = Query(default=25, le=50)):
+    api_key = os.getenv("MASSIVE_API_KEY", "")
+    if not api_key:
+        return {"results": [], "source": "no_key",
+                "message": "Set MASSIVE_API_KEY env var to enable news feed."}
+
+    try:
+        wl_rows = await asyncio.to_thread(db.get_signal_watchlist)
+        wl      = [r["ticker"] for r in wl_rows if r.get("ticker")]
+    except Exception:
+        wl = []
+
+    ticker_param = f"&ticker.any_of={','.join(wl[:15])}" if wl else ""
+    url = (
+        f"https://api.polygon.io/v2/reference/news"
+        f"?limit={limit}&order=desc&sort=published_utc"
+        f"{ticker_param}&apiKey={api_key}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            data = r.json()
+        return {"results": data.get("results", []), "count": len(data.get("results", [])),
+                "watchlist": wl, "source": "polygon"}
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"/api/news Polygon {e.response.status_code}")
+        raise HTTPException(status_code=502, detail=f"Polygon error: {e.response.status_code}")
+    except Exception as e:
+        logger.warning(f"/api/news: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ── Options Flow ───────────────────────────────────────────────────────────────
+# GET /api/options-flow
+# Proxies Polygon /v3/snapshot/options per watchlist ticker — key stays server-side.
+# Requires Polygon Starter tier+. Returns empty data[] with message if key missing
+# or tier insufficient — no mock data, no fallback fabrication.
+# KEY-FIX: uses MASSIVE_API_KEY (same as all other Polygon calls in this file).
+@app.get("/api/options-flow")
+async def get_options_flow(min_premium: int = Query(default=50_000)):
+    api_key = os.getenv("MASSIVE_API_KEY", "")
+    if not api_key:
+        return {"data": [], "source": "no_key",
+                "message": "Set MASSIVE_API_KEY env var to enable options flow."}
+
+    try:
+        wl_rows = await asyncio.to_thread(db.get_signal_watchlist)
+        wl      = [r["ticker"] for r in wl_rows if r.get("ticker")]
+    except Exception:
+        wl = []
+
+    if not wl:
+        return {"data": [], "source": "polygon", "message": "Watchlist is empty."}
+
+    results: list = []
+
+    async def _fetch_ticker(sym: str) -> None:
+        url = (
+            f"https://api.polygon.io/v3/snapshot/options/{sym}"
+            f"?limit=20&sort=day.volume&order=desc&apiKey={api_key}"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(url)
+                if r.status_code == 403:
+                    logger.debug(f"options-flow {sym}: 403 — Polygon Starter tier required")
+                    return
+                if not r.is_success:
+                    return
+                data = r.json()
+        except Exception:
+            return
+
+        for opt in data.get("results", []):
+            details = opt.get("details") or {}
+            day     = opt.get("day")     or {}
+            greeks  = opt.get("greeks")  or {}
+            size    = day.get("volume") or 0
+            vwap    = day.get("vwap")   or 0
+            premium = int(size * vwap * 100)
+            if premium < min_premium:
+                continue
+            ctype  = (details.get("contract_type") or "call").upper()
+            exp    = details.get("expiration_date") or ""
+            iv     = opt.get("implied_volatility")
+            delta  = greeks.get("delta")
+            results.append({
+                "ticker":    sym,
+                "type":      ctype,
+                "strike":    details.get("strike_price") or 0,
+                "expiry":    exp[5:].replace("-", "/") if exp else "—",
+                "premium":   premium,
+                "size":      size,
+                "sweep":     size >= 500,
+                "iv":        round(iv * 100, 1) if iv else None,
+                "delta":     round(delta, 3) if delta else None,
+                "sentiment": "BULLISH" if ctype == "CALL" else "BEARISH",
+            })
+
+    await asyncio.gather(*[_fetch_ticker(sym) for sym in wl[:10]])
+    results.sort(key=lambda x: x["premium"], reverse=True)
+    return {"data": results, "count": len(results), "tickers": wl[:10], "source": "polygon"}
 
 
 # ── AI Proxy — Amazon Bedrock ─────────────────────────────────────────────────

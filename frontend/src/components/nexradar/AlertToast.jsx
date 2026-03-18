@@ -26,8 +26,6 @@ function Toast({ alert, onDismiss, T }) {
   const [show, setShow]    = useState(false);
   const [exit, setExit]    = useState(false);
   const c = COLOR_MAP[alert.color] || COLOR_MAP.cyan;
-  // ALERT-TS-FIX: ts may be missing from older alert paths — default to now
-  // so the composite key and time display are always valid.
   const alertTs = alert.ts ?? Date.now();
 
   useEffect(() => {
@@ -37,9 +35,13 @@ function Toast({ alert, onDismiss, T }) {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   function dismiss() {
+    if (exit) return;   // guard: click + auto-timeout racing each other
     setExit(true);
-    // ALERT-TS-FIX: use alertTs (never undefined) for the composite key
-    setTimeout(() => onDismiss(`${alertTs}_${alert.type}_${alert.ticker}`), 300);
+    // TOAST-KEY-FIX: dismiss by _key (always unique Math.random string).
+    // Old code used ts-based composite key — two alerts for the same ticker
+    // arriving in the same millisecond produce identical ts values → filter
+    // matched nothing → toast stayed visible forever after clicking.
+    setTimeout(() => onDismiss(alert._key), 300);
   }
 
   return (
@@ -94,13 +96,56 @@ function Toast({ alert, onDismiss, T }) {
 }
 
 // ── Alert history panel — exported for optional use in bell dropdown ───────────
+// ALERT-HISTORY-FIX: The old panel only fetched /api/alerts (SmartAlertsEngine
+// in-memory list). news_alert / edgar_alert / earnings_alert / fda_alert events
+// bypass SmartAlertsEngine entirely — they go directly through broadcaster.publish().
+// So the bell dropdown showed only technical alerts (VWAP/EMA/RVOL) and silently
+// dropped all watchlist news/earnings/edgar/fda alerts even when toasts fired.
+//
+// Fix:
+//   1. Fetch /api/alerts for historical technical alerts (SmartAlertsEngine).
+//   2. Also listen to 'nexradar_alert' window event (which covers ALL alert types
+//      including news/edgar/earnings/fda dispatched by useTickerData.js).
+//   3. Normalise color field so COLOR_MAP lookup works for both alert paths.
+//      SmartAlertsEngine uses string color keys ('green','red','gold','cyan').
+//      useTickerData.js maps them to hex before dispatching — normalise back.
+const COLOR_KEY_MAP = {
+  '#00e676': 'green', '#ff3d5a': 'red', '#ffc400': 'gold',
+  '#00d4ff': 'cyan',  '#b388ff': 'purple',
+};
+function _normalizeColor(c) {
+  return COLOR_KEY_MAP[c] ?? c ?? 'cyan';
+}
+
 export function AlertHistoryPanel({ T }) {
   const [history, setHistory] = useState([]);
 
   useEffect(() => {
+    // Seed with existing SmartAlertsEngine technical alerts
     fetch(`${API_BASE}/api/alerts?limit=60`)
-      .then(r => r.json()).then(j => setHistory(j.data || [])).catch(() => {});
-    const handler = (e) => setHistory(p => [e.detail, ...p].slice(0, 100));
+      .then(r => r.json())
+      .then(j => {
+        const items = (j.data || []).map(a => ({
+          ...a,
+          color: _normalizeColor(a.color),
+          ts: a.ts ?? Date.now(),
+        }));
+        setHistory(items);
+      })
+      .catch(() => {});
+
+    // ALERT-HISTORY-FIX: also capture live news/edgar/earnings/fda events
+    // dispatched via window 'nexradar_alert' — these never reach /api/alerts.
+    const handler = (e) => {
+      const a = e.detail;
+      if (!a) return;
+      setHistory(p => [{
+        ...a,
+        color:   _normalizeColor(a.color),
+        message: a.message || a.sub || '',
+        ts:      a.ts ?? Date.now(),
+      }, ...p].slice(0, 100));
+    };
     window.addEventListener('nexradar_alert', handler);
     return () => window.removeEventListener('nexradar_alert', handler);
   }, []);
@@ -128,17 +173,24 @@ export function AlertHistoryPanel({ T }) {
         const c = COLOR_MAP[a.color] || COLOR_MAP.cyan;
         const elapsed = Math.floor((Date.now() - (a.ts ?? Date.now())) / 1000);
         const timeStr = elapsed < 60 ? `${elapsed}s ago` : elapsed < 3600 ? `${Math.floor(elapsed/60)}m ago` : `${Math.floor(elapsed/3600)}h ago`;
+        // ALERT-HISTORY-FIX: news/edgar/fda alerts use 'sub' not 'message'
+        const bodyText = a.message || a.sub || '';
+        const WrapEl = a.url ? 'a' : 'div';
+        const wrapProps = a.url
+          ? { href: a.url, target: '_blank', rel: 'noreferrer', style: { textDecoration: 'none' } }
+          : {};
         return (
-          <div key={i} style={{ padding:'9px 14px', borderBottom:`1px solid ${T.border}`, display:'flex', gap:10, alignItems:'flex-start', transition:'background 0.12s' }}
+          <WrapEl key={i} {...wrapProps}
+            style={{ padding:'9px 14px', borderBottom:`1px solid ${T.border}`, display:'flex', gap:10, alignItems:'flex-start', transition:'background 0.12s', cursor: a.url ? 'pointer' : 'default' }}
             onMouseEnter={e=>e.currentTarget.style.background=T.bg2}
             onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
-            <span style={{ fontSize:14 }}>{a.emoji}</span>
+            <span style={{ fontSize:14 }}>{a.emoji || '⚡'}</span>
             <div style={{ flex:1 }}>
               <div style={{ color:c.text, fontFamily:T.font, fontSize:11, fontWeight:600 }}>{a.title}</div>
-              <div style={{ color:T.text2, fontFamily:T.font, fontSize:10, marginTop:2 }}>{a.message}</div>
+              {bodyText && <div style={{ color:T.text2, fontFamily:T.font, fontSize:10, marginTop:2 }}>{bodyText}</div>}
             </div>
             <span style={{ color:T.text2, fontSize:9, flexShrink:0 }}>{timeStr}</span>
-          </div>
+          </WrapEl>
         );
       })}
     </>
@@ -155,16 +207,16 @@ export default function AlertToast({ alerts, setAlerts, T }) {
         display:'flex', flexDirection:'column-reverse', gap:8,
         pointerEvents:'none',
       }}>
-        {alerts.slice(0, 5).map((a, i) => (
-          // ALERT-TS-FIX: use (a.ts ?? a._key) for key — a.ts may be undefined
-          // for news/edgar/earnings/fda alerts from background pollers.
-          // Stamp a stable _key on each alert when it enters liveAlerts state
-          // (done in NexRadarDashboard handler), or fall back to index-based key.
-          <div key={`${a.ts ?? a._key ?? i}_${a.type}_${a.ticker}`} style={{ pointerEvents:'all' }}>
+        {alerts.slice(0, 5).map((a) => (
+          // TOAST-KEY-FIX: _key is the sole stable unique ID for each alert.
+          // Using ts caused duplicate key warnings when two alerts for the same
+          // ticker arrived in the same millisecond. _key is set in the dashboard
+          // handler as `${Date.now()}_${Math.random()}` — always unique.
+          // onDismiss also filters by _key — single source of truth for identity.
+          <div key={a._key} style={{ pointerEvents:'all' }}>
             <Toast alert={a}
-              onDismiss={(key) => setAlerts(prev => prev.filter(
-                x => `${x.ts ?? x._key ?? ''}_${x.type}_${x.ticker}` !== key
-              ))} T={T} />
+              onDismiss={(key) => setAlerts(prev => prev.filter(x => x._key !== key))}
+              T={T} />
           </div>
         ))}
       </div>

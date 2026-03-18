@@ -40,8 +40,14 @@ import { API_BASE } from "../../config.js";
 import { getMarketSession } from "./utils.js";
 import { normalizeTicker } from "./normalizer.js";
 
-const NOTIF_CAP         = 50;
-const NOTIF_COOLDOWN_MS = 60_000;
+const NOTIF_CAP           = 60;    // max items in bell panel
+const NOTIF_COOLDOWN_MS   = 60_000; // per ticker+type dedup window (1 min)
+// NOTIF-FLOOD-FIX: global rate cap — max this many new notifications per
+// NOTIF_RATE_WINDOW_MS regardless of ticker variety. EMA cross signals can
+// fire for 30 watchlist tickers simultaneously; without a global cap the bell
+// fills instantly and the count bounces from 0 to 11+ every few seconds.
+const NOTIF_RATE_CAP      = 5;      // max new notifs per rate window
+const NOTIF_RATE_WINDOW_MS= 10_000; // 10-second sliding window
 const AH_FIELDS         = ['ah_dollar','ah_pct','today_close','prev_close','ah_momentum'];
 
 export function useTickerData() {
@@ -65,6 +71,8 @@ export function useTickerData() {
   const midnightTimerRef    = useRef(null);
   const notifRef            = useRef([]);
   const notifCooldownRef    = useRef({});
+  // NOTIF-FLOOD-FIX: global rate window — timestamps of recent pushes
+  const notifRateWindowRef  = useRef([]);
 
   // FEED-WARNING-DEBOUNCE: timer ref — prevents false alarm banner on brief bounces
   const feedWarningTimerRef = useRef(null);
@@ -107,12 +115,39 @@ export function useTickerData() {
   const _pushNotif = useCallback((entry) => {
     const key = `${entry.ticker}_${entry.type}`;
     const now  = Date.now();
+
+    // Per-ticker+type cooldown: skip duplicates within 60s
     if ((notifCooldownRef.current[key] || 0) + NOTIF_COOLDOWN_MS > now) return;
     notifCooldownRef.current[key] = now;
-    const next = [{ ...entry, id:now+Math.random(), ts:now }, ...notifRef.current].slice(0, NOTIF_CAP);
+
+    // NOTIF-FLOOD-FIX: global rate cap — drop if > NOTIF_RATE_CAP new
+    // notifications have already been pushed in the last NOTIF_RATE_WINDOW_MS.
+    // This prevents the bell count bouncing from 0 → 11+ every few seconds
+    // when EMA cross signals fire for all watchlist tickers simultaneously.
+    const rateWindow = notifRateWindowRef.current;
+    const cutoff = now - NOTIF_RATE_WINDOW_MS;
+    // Evict entries older than the window
+    notifRateWindowRef.current = rateWindow.filter(t => t > cutoff);
+    if (notifRateWindowRef.current.length >= NOTIF_RATE_CAP) return;
+    notifRateWindowRef.current.push(now);
+
+    const next = [{ ...entry, id: now + Math.random(), ts: now }, ...notifRef.current].slice(0, NOTIF_CAP);
     notifRef.current = next;
     setNotifications([...next]);
     setUnreadCount(c => c + 1);
+  }, []);
+
+  // NOTIF-READ-FIX: two separate actions:
+  //   markNotificationsRead() — zeros the unread badge but KEEPS the list.
+  //     Called when the bell panel opens so the user can actually read the items.
+  //   clearNotifications()    — wipes the list AND zeros the count.
+  //     Called by the explicit "Clear all" button inside the panel.
+  //
+  // Old behaviour: clearNotifications() was called on every bell click, which
+  // cleared the list before the user could read it, then new signals immediately
+  // refilled the count → badge bounced 9 → 0 → 9 every few seconds.
+  const markNotificationsRead = useCallback(() => {
+    setUnreadCount(0);
   }, []);
 
   const clearNotifications = useCallback(() => {
@@ -587,5 +622,5 @@ export function useTickerData() {
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  return { tickers, wsStatus, marketSession, sseRef, notifications, unreadCount, clearNotifications, staleTickers };
+  return { tickers, wsStatus, marketSession, sseRef, notifications, unreadCount, markNotificationsRead, clearNotifications, staleTickers };
 }
