@@ -274,12 +274,6 @@ class WSEngine:
         t.start()
         self._threads.append(t)
 
-        # NOI-PLAN-FIX: REST-based imbalance poll (WS I.* requires Business plan)
-        self._imbalance_cache: Dict[str, dict] = {}
-        t = threading.Thread(target=self._noi_poll_loop, daemon=True, name="noi-poll")
-        t.start()
-        self._threads.append(t)
-
         logger.info(f"WSEngine started  -  {len(tickers)} tickers")
 
     def shutdown(self) -> None:
@@ -448,6 +442,9 @@ class WSEngine:
         with self._cache_lock:
             entry = self._cache.get(ticker, {})
             prev_close  = entry.get("prev_close", 0) or 0
+            # OPEN-PRICE-STALE-FIX: "or price" fires when open_price=0
+            # (zeroed by _session_reset_loop at 9:30 AM ET). The first tick
+            # of the new session self-heals open_price to the opening print.
             open_price  = entry.get("open_price", 0) or price
             today_close = entry.get("today_close", 0) or 0
 
@@ -538,19 +535,9 @@ class WSEngine:
                     self._dirty_tickers.discard(k)
                 logger.info(f"Cache eviction: removed {len(evict)} unknown tickers")
 
-        # Feed to signal watcher — pass imbalance data if available
+        # Feed to signal watcher
         if self._signal_watcher:
-            # NOI-FIX: look up current imbalance for this ticker so Scalping_Signal
-            # on_tick() can apply the NOI institutional filter during AH sessions.
-            # _imbalance_cache is written by _noi_poll_loop (REST poll thread).
-            _imb = getattr(self, "_imbalance_cache", {}).get(ticker, {})
-            self._signal_watcher.on_tick(
-                ticker,
-                price,
-                msg.get("t"),
-                imbalance_side=_imb.get("side", "N"),
-                imbalance_size=_imb.get("size", 0),
-            )
+            self._signal_watcher.on_tick(ticker, price, msg.get("t"))
 
         # Buffer for DB write  -  capped to prevent unbounded growth during DB outage
         with self._pending_lock:
@@ -580,127 +567,6 @@ class WSEngine:
             self._cache[ticker]["_last_sent_ts"]    = now_ms
             with self._batch_lock:
                 self._tick_batch[ticker] = updated
-
-    # ── NOI Imbalance REST poll loop ──────────────────────────────────────────
-    #
-    # NOI-PLAN-FIX: Polygon "I" (Imbalance) WS events require the Business plan
-    # ($199/mo). The current plan (Starter/Advanced) covers T.* and A.* only —
-    # subscribing to I.* returns ev="status" status="error" "not authorized".
-    #
-    # Alternative: poll Polygon REST /v2/snapshot for watchlist tickers every 30s
-    # during pre-market and market-open window (7:00–10:00 AM ET) when opening
-    # imbalances are most active. The snapshot response includes:
-    #   todaysChangePerc, todaysChange, day.o/h/l/c/v, fmv (fair market value)
-    # We derive a synthetic imbalance from price vs FMV:
-    #   price > fmv → buy pressure (market bid above fair value)
-    #   price < fmv → sell pressure
-    # This is not as precise as the "I" event but is free, accurate enough for
-    # the visual bar, and feeds the NOI institutional filter in Scalping_Signal.py.
-    #
-    # During AH (4–8 PM ET), the same poll runs every 60s using the watchlist
-    # tickers that are already being refreshed by _ah_close_loop.
-
-    def _noi_from_snapshot(self, item: dict, ticker: str) -> dict:
-        """
-        Derive synthetic imbalance from Polygon REST snapshot item.
-        Returns {side: "B"/"S"/"N", size: int, ts: ms}.
-
-        Logic:
-          last_price vs fmv (fair market value):
-            > fmv by ≥0.1% → buy pressure (B)
-            < fmv by ≥0.1% → sell pressure (S)
-            within 0.1%    → neutral (N)
-          size = abs(last_price - fmv) / fmv * 100_000  (synthetic shares proxy)
-        """
-        last_trade = item.get("lastTrade") or {}
-        day        = item.get("day") or {}
-        fmv        = float(item.get("fmv") or 0)
-        price      = float(last_trade.get("p") or day.get("c") or 0)
-
-        if fmv <= 0 or price <= 0:
-            return {"side": "N", "size": 0, "ts": int(time.time() * 1000)}
-
-        diff_pct = (price - fmv) / fmv * 100
-        if diff_pct >= 0.1:
-            side = "B"
-        elif diff_pct <= -0.1:
-            side = "S"
-        else:
-            return {"side": "N", "size": 0, "ts": int(time.time() * 1000)}
-
-        # Synthetic size: 0.1% diff = 100 shares, 1% diff = 1000, 5% = 5000
-        size = int(abs(diff_pct) * 1000)
-        return {"side": side, "size": size, "ts": int(time.time() * 1000)}
-
-    def _noi_poll_loop(self) -> None:
-        """
-        Polls Polygon REST snapshot for watchlist tickers to derive NOI imbalance.
-        Runs during pre-market (4–9:30 AM ET) and market-open window (9:30–10:00 AM)
-        and after-hours (4–8 PM ET) — the periods when imbalances matter most.
-        Interval: 30s during opening window, 60s otherwise.
-        """
-        if not hasattr(self, "_imbalance_cache"):
-            self._imbalance_cache: Dict[str, dict] = {}
-
-        while not self._shutdown.is_set():
-            session = _get_session()
-            active  = session in ("pre", "after", "market")
-
-            if not active:
-                # Market closed/weekend — check every 5 min, do nothing
-                for _ in range(300):
-                    if self._shutdown.is_set(): return
-                    time.sleep(1)
-                continue
-
-            interval_s = 30  # 30s during active sessions
-
-            try:
-                with self._cache_lock:
-                    target = list(self._watchlist_tickers)
-
-                if not target:
-                    time.sleep(interval_s)
-                    continue
-
-                params = {"tickers": ",".join(target), "apiKey": self._api_key}
-                resp = requests.get(
-                    f"{POLYGON_REST_URL}/snapshot/locale/us/markets/stocks/tickers",
-                    params=params, timeout=15
-                )
-                resp.raise_for_status()
-                items = resp.json().get("tickers", [])
-
-                changed = []
-                for item in items:
-                    tk = item.get("ticker", "")
-                    if not tk:
-                        continue
-                    noi = self._noi_from_snapshot(item, tk)
-                    prev = self._imbalance_cache.get(tk, {})
-                    # Only broadcast if side changed or size moved >10%
-                    size_moved = abs(noi["size"] - prev.get("size", 0)) > max(prev.get("size", 0) * 0.1, 100)
-                    if noi["side"] != prev.get("side") or (noi["side"] != "N" and size_moved):
-                        self._imbalance_cache[tk] = noi
-                        if noi["side"] != "N":
-                            self._broadcast({
-                                "type":           "noi_update",
-                                "ticker":         tk,
-                                "imbalance_side": noi["side"],
-                                "imbalance_size": noi["size"],
-                                "ts":             noi["ts"],
-                            })
-                            changed.append(tk)
-
-                if changed:
-                    logger.debug(f"NOI-POLL: {len(changed)} imbalance updates: {changed[:5]}")
-
-            except Exception as e:
-                logger.debug(f"NOI poll error: {e}")
-
-            for _ in range(interval_s):
-                if self._shutdown.is_set(): return
-                time.sleep(1)
 
     # ── Tick flush loop ────────────────────────────────────────────────────────
 
@@ -913,6 +779,20 @@ class WSEngine:
 
                 last_update = int(row.get("last_update") or 0)
                 age_s = now_ts - last_update
+
+                # OPEN-PRICE-STALE-FIX: also flag rows from a prior calendar date
+                # as stale, regardless of how many hours ago they were updated.
+                # A row from 3:55 PM ET yesterday is only 7h old but carries
+                # yesterday's open_price — it must be refreshed for today's session.
+                # Use ET midnight as the day boundary (matches market convention).
+                from datetime import datetime as _dt_local
+                try:
+                    row_et_date  = _dt_local.fromtimestamp(last_update, tz=ET).date()
+                    today_et     = _dt_local.now(ET).date()
+                    if row_et_date < today_et:
+                        age_s = self._STALE_THRESHOLD_S + 1  # force into stale list
+                except Exception:
+                    pass
 
                 # Re-map DB column names back to cache field names
                 cache_row = {
@@ -1436,6 +1316,14 @@ class WSEngine:
                         row["ah_dollar"]   = 0.0
                         row["ah_pct"]      = 0.0
                         row["ah_momentum"] = False
+                        # OPEN-PRICE-STALE-FIX: zero open_price so _handle_tick's
+                        # "or price" fallback fires on the first 9:30 AM trade,
+                        # setting a correct open instead of carrying yesterday's
+                        # open_price forward indefinitely.
+                        # Polygon snapshot_bulk at next startup also repopulates
+                        # open_price from day.o for any ticker that's been refreshed.
+                        row["open"]       = 0.0
+                        row["open_price"] = 0.0
                 gc.collect()
                 logger.info(
                     f"Session reset complete — prev_close promoted for {promoted} tickers, "
