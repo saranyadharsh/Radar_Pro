@@ -522,7 +522,7 @@ export default function PageSignals({
                         {row.signal==='BUY'?'▲ BUY':row.signal==='SELL'?'▼ SELL':'◈ HOLD'}
                       </span>
                     </div>
-                    <div style={{ padding:'10px 8px', display:'flex', alignItems:'center' }}><span style={{ color:_sigClr(row.signal), fontSize:12, fontWeight:700, fontFamily:T.font }}>{row.prediction}%</span></div>
+                    <div style={{ padding:'10px 8px', display:'flex', alignItems:'center' }}><span style={{ color:_sigClr(row.signal), fontSize:12, fontWeight:700, fontFamily:T.font }}>{(row.prediction ?? (row.confidence != null ? +(row.confidence * 100).toFixed(1) : null) ?? '—')}{row.prediction != null || row.confidence != null ? '%' : ''}</span></div>
                     <div style={{ padding:'10px 8px', display:'flex', alignItems:'center' }}><span style={{ color:_vwapClr(row.vwap_status), fontSize:10, fontWeight:700, fontFamily:T.font, padding:'2px 6px', borderRadius:4, background:_vwapClr(row.vwap_status)+'15' }}>{row.vwap_status}</span></div>
                     <div style={{ padding:'10px 8px', color:T.green, fontSize:11, fontFamily:T.font, fontWeight:600, display:'flex', alignItems:'center' }}>${fmt2(row.support)}</div>
                     <div style={{ padding:'10px 8px', color:T.red,   fontSize:11, fontFamily:T.font, fontWeight:600, display:'flex', alignItems:'center' }}>${fmt2(row.resistance)}</div>

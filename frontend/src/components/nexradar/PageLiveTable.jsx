@@ -174,16 +174,14 @@ function NOIBar({ noi, T }) {
 
 // ─── Memoized table row — skips re-render when visible data unchanged ─────────
 const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatchlist, subMode, gridCols, scalpSignals, setSelectedSymbol, haltedTickers, noiBySym, isStale = false, T }) {
-  // MH: use day-over-day change_value / percent_change
+  // MH: $ CHG = live_price - open  /  % CHG = (live_price - open) / open × 100
+  //   This reflects intraday movement from today's open, which is consistent
+  //   with the OPEN column shown in the same row. change_value (price - prev_close)
+  //   was misleading when displayed next to OPEN — e.g. LNG open=283, price=287
+  //   showed +20.98 (vs prev_close ~266) instead of the expected +4.08 (vs open).
   // AH: use ah_dollar / ah_pct (live_price vs today_close)
   //
   // BUG-3 FIX: AH $ CHG fallback is now null (renders "—"), NOT ticker.change_value.
-  // Previously: when today_close = 0 (before _ah_close_loop runs, BUG-2),
-  // the fallback silently showed the MH day-change labeled as AH change — wrong data.
-  // Now: null → "—" makes the missing state explicit rather than misleadingly showing
-  // a value that belongs to a different session.
-  // Once BUG-2 (ws_engine.py) is deployed, today_close will be populated from
-  // the first AH refresh cycle and these cells will show correct values.
   const ahDollar = ticker.ah_dollar != null
     ? ticker.ah_dollar
     : (ticker.today_close > 0 ? ticker.live_price - ticker.today_close : null);
@@ -193,8 +191,16 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
         ? (ticker.live_price - ticker.today_close) / ticker.today_close * 100
         : null);
 
-  const displayChg  = subMode === 'AH' ? ahDollar : (ticker.change_value || 0);
-  const displayPct  = subMode === 'AH' ? ahPct    : (ticker.percent_change || 0);
+  // MH intraday change: live_price vs today's open
+  const mhDollar = (ticker.open > 0 && ticker.live_price > 0)
+    ? +(ticker.live_price - ticker.open).toFixed(4)
+    : (ticker.change_value || 0);
+  const mhPct = (ticker.open > 0 && ticker.live_price > 0)
+    ? +((ticker.live_price - ticker.open) / ticker.open * 100).toFixed(4)
+    : (ticker.percent_change || 0);
+
+  const displayChg  = subMode === 'AH' ? ahDollar : mhDollar;
+  const displayPct  = subMode === 'AH' ? ahPct    : mhPct;
   const isPositive  = (displayChg ?? 0) >= 0;
   const changeColor = isPositive ? T.green : T.red;
   const isHalted    = haltedTickers?.has(ticker.ticker) ?? ticker.is_halted ?? false;
@@ -593,17 +599,22 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
         });
       } else {
         // Synchronous fallback (Worker unavailable — sandboxed environments)
-        let fa = arr.filter(t => Math.abs(t.change_value || 0) >= minDelta);
+        // MH intraday delta helper (mirrors LiveTableRow mhDollar)
+        const mhChg = (t) => (t.open > 0 && t.live_price > 0) ? t.live_price - t.open : (t.change_value || 0);
+        const mhPct = (t) => (t.open > 0 && t.live_price > 0) ? (t.live_price - t.open) / t.open * 100 : (t.percent_change || 0);
+        let fa = arr.filter(t => Math.abs(subMode === 'AH' ? (t.ah_dollar ?? t.change_value ?? 0) : mhChg(t)) >= minDelta);
         if (quickFilter === 'VOL_SPIKES') fa = fa.filter(t => t.volume_spike);
         if (quickFilter === 'GAP_PLAYS')  fa = fa.filter(t => t.is_gap_play);
         if (quickFilter === 'AH_MOMT')    fa = fa.filter(t => t.ah_momentum);
         if (quickFilter === 'EARN_GAPS')  fa = fa.filter(t => t.is_earnings_gap_play);
-        if (quickFilter === 'DIAMOND')    fa = fa.filter(t => Math.abs(t.percent_change || 0) >= 5);
+        if (quickFilter === 'DIAMOND')    fa = fa.filter(t => Math.abs(subMode === 'AH' ? (t.ah_pct ?? t.percent_change ?? 0) : mhPct(t)) >= 5);
         const dir = sortDir === 'desc' ? -1 : 1;
         fa = fa.slice().sort((a, b) => {
           if (sortKey === 'symbol') return dir * (a.ticker || '').localeCompare(b.ticker || '');
-          const kmap = { open:'open', price:'live_price', change:'change_value', pct:'percent_change', volume:'volume', prev_close:'prev_close', today_close:'today_close', live_price:'live_price' };
-          const k = kmap[sortKey] ?? 'change_value';
+          if (sortKey === 'change') return dir * (mhChg(a) - mhChg(b));
+          if (sortKey === 'pct')    return dir * (mhPct(a) - mhPct(b));
+          const kmap = { open:'open', price:'live_price', volume:'volume', prev_close:'prev_close', today_close:'today_close', live_price:'live_price' };
+          const k = kmap[sortKey] ?? 'live_price';
           return dir * ((a[k] || 0) - (b[k] || 0));
         });
         setSortedSymbols(fa.map(t => t.ticker));
@@ -798,11 +809,13 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
               {(() => {
                 const live=tickers.get(selectedSymbol);
                 if(!live) return null;
-                const chg=live.percent_change||0, isPos=chg>=0;
+                const mhChgVal = (live.open > 0 && live.live_price > 0) ? live.live_price - live.open : (live.change_value || 0);
+                const mhPctVal = (live.open > 0 && live.live_price > 0) ? (live.live_price - live.open) / live.open * 100 : (live.percent_change || 0);
+                const isPos=mhChgVal>=0;
                 return (
                   <div style={{ display:"flex", gap:16, padding:"8px 14px", borderBottom:`1px solid ${T.border}`, background:T.bg2, flexShrink:0 }}>
                     <span style={{ color:T.text0, fontFamily:T.font, fontSize:13, fontWeight:700 }}>${(live.live_price||0).toFixed(2)}</span>
-                    <span style={{ color:isPos?T.green:T.red, fontFamily:T.font, fontSize:12 }}>{isPos?"+":" "}{(live.change_value||0).toFixed(2)} ({isPos?"+":""}{chg.toFixed(2)}%)</span>
+                    <span style={{ color:isPos?T.green:T.red, fontFamily:T.font, fontSize:12 }}>{isPos?"+":" "}{mhChgVal.toFixed(2)} ({isPos?"+":""}{mhPctVal.toFixed(2)}%)</span>
                     <span style={{ color:T.text2, fontFamily:T.font, fontSize:11 }}>Vol {live.volume?(live.volume/1e6).toFixed(1)+"M":"—"}</span>
                   </div>
                 );

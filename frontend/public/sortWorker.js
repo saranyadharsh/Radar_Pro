@@ -64,13 +64,17 @@ function getVal(t, sortKey, subMode) {
     case 'symbol':      return null   // handled separately (string compare)
     case 'open':        return t.open        || 0
     case 'price':       return t.live_price  || 0
-    case 'change':      return subMode === 'AH' ? (t.ah_dollar || 0)  : (t.change_value   || 0)
-    case 'pct':         return subMode === 'AH' ? (t.ah_pct    || 0)  : (t.percent_change || 0)
+    case 'change':      return subMode === 'AH'
+      ? (t.ah_dollar || 0)
+      : (t.open > 0 && t.live_price > 0 ? t.live_price - t.open : (t.change_value || 0))
+    case 'pct':         return subMode === 'AH'
+      ? (t.ah_pct    || 0)
+      : (t.open > 0 && t.live_price > 0 ? (t.live_price - t.open) / t.open * 100 : (t.percent_change || 0))
     case 'volume':      return t.volume       || 0
     case 'prev_close':  return t.prev_close   || 0
     case 'today_close': return t.today_close  || 0
     case 'live_price':  return t.live_price   || 0
-    default:            return t.change_value || 0
+    default:            return t.open > 0 && t.live_price > 0 ? t.live_price - t.open : (t.change_value || 0)
   }
 }
 
@@ -112,12 +116,21 @@ self.onmessage = (e) => {
     }
 
     // ── Step 3: minDelta + quickFilter ────────────────────────────────────
-    arr = arr.filter(t => Math.abs(t.change_value || 0) >= (minDelta || 0))
+    // minDelta filter: use intraday (vs open) change for MH, AH dollar for AH
+    const getChgAbs = (t) => subMode === 'AH'
+      ? Math.abs(t.ah_dollar || 0)
+      : Math.abs(t.open > 0 && t.live_price > 0 ? t.live_price - t.open : (t.change_value || 0))
+    arr = arr.filter(t => getChgAbs(t) >= (minDelta || 0))
     if (quickFilter === 'VOL_SPIKES') arr = arr.filter(t => t.volume_spike)
     if (quickFilter === 'GAP_PLAYS')  arr = arr.filter(t => t.is_gap_play)
     if (quickFilter === 'AH_MOMT')    arr = arr.filter(t => t.ah_momentum)
     if (quickFilter === 'EARN_GAPS')  arr = arr.filter(t => t.is_earnings_gap_play)
-    if (quickFilter === 'DIAMOND')    arr = arr.filter(t => Math.abs(t.percent_change || 0) >= 5)
+    if (quickFilter === 'DIAMOND')    arr = arr.filter(t => {
+      const pct = subMode === 'AH'
+        ? Math.abs(t.ah_pct || 0)
+        : Math.abs(t.open > 0 && t.live_price > 0 ? (t.live_price - t.open) / t.open * 100 : (t.percent_change || 0))
+      return pct >= 5
+    })
 
     // ── Step 4: sort ──────────────────────────────────────────────────────
     arr = arr.slice().sort((a, b) => {
