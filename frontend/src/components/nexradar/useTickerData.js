@@ -157,46 +157,14 @@ export function useTickerData() {
   }, []);
 
   // ── Market-open heartbeat ─────────────────────────────────────────────────
-  // MARKET-OPEN-FIX: no longer touches sseRef.current directly.
-  // Previously called .onopen=null / .close() which only work on EventSource,
-  // not SharedWorker — silently failed, left UI blank with no recovery.
-  // Now sends { type:'clear_cache' } to the worker, which flears its cache
-  // and forces a fresh SSE reconnect → backend sends new session snapshot.
-  useEffect(() => {
-    const schedule = () => {
-      const now   = new Date();
-      const etNow = new Date(now.toLocaleString("en-US", { timeZone:"America/New_York" }));
-      const target = new Date(etNow);
-      target.setHours(9, 30, 5, 0);
-      if (etNow >= target) target.setDate(target.getDate() + 1);
-      const msUntil = target.getTime() - etNow.getTime();
-      console.log(`[NexRadar] Market open reset in ${(msUntil/3_600_000).toFixed(2)}h`);
-      return setTimeout(() => {
-        console.log("[NexRadar] 🔔 Market Open — flushing stale session data");
-        // MARKET-OPEN-FIX: signal the worker to clear its cache.
-        // Worker handles this by clearing state.cache and reconnecting SSE.
-        const sse = sseRef.current;
-        if (sse && typeof sse.port?.postMessage === 'function') {
-          // SharedWorker path
-          sse.port.postMessage({ type: 'clear_cache' });
-        } else if (sse && typeof sse.close === 'function') {
-          // Direct EventSource fallback path — close and reconnect is handled
-          // by the onerror handler in connectDirect()
-          sse.close();
-          sseRef.current = null;
-        }
-        // Clear React-side cache too
-        tickerCacheRef.current      = new Map();
-        tickerCacheDirtyRef.current = true;
-        tickerReceivedTsRef.current = new Map();
-        setTickers(new Map());
-        schedule();
-      }, msUntil);
-    };
-    const timerId = schedule();
-    return () => clearTimeout(timerId);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
+  // DUAL-TIMER-FIX: this separate useEffect previously scheduled an independent
+  // 9:30 AM ET reset alongside scheduleMidnight() inside the SSE useEffect below.
+  // Both targeted 9:30 ET but fired ~5 seconds apart, causing two cache clears and
+  // two SSE reconnects back-to-back at market open — a double full-snapshot blast
+  // that briefly blanked the dashboard.
+  // Fix: removed this duplicate. scheduleMidnight() in the SSE useEffect is now
+  // the single source of truth for the 9:30 AM reset on both SharedWorker and
+  // direct EventSource paths.
 
   // ── SSE connection via SharedWorker (tab-switch & refresh safe) ───────────
   //

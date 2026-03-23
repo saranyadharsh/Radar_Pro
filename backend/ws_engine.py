@@ -661,9 +661,13 @@ class WSEngine:
                 dirty = list(self._dirty_tickers)
                 self._dirty_tickers.clear()
 
-            # Read rows outside the lock — individual dict reads are safe
+            # DATA-RACE-FIX: shallow-copy each row before mutation.
+            # The original code held references to the actual dicts inside _cache.
+            # Mutating row["stale"] / row["last_tick_ts"] below without the lock
+            # raced with _handle_tick writing to the same dict on the WS thread.
+            # dict() copy is O(fields) per row — negligible vs. the broadcast cost.
             with self._cache_lock:
-                delta_rows = [self._cache[t] for t in dirty if t in self._cache]
+                delta_rows = [dict(self._cache[t]) for t in dirty if t in self._cache]
 
             if delta_rows:
                 # TIER3-9: stamp last_tick_ts on every delta row and flag stale
@@ -1247,8 +1251,13 @@ class WSEngine:
                         prev_close = float(
                             live.get("prev_close") or row.get("prev_close") or 0
                         )
-                        # PORTFIX-3: always compute change directly from live_price vs prev_close.
-                        if prev_close > 0 and live_price > 0:
+                        # PORTFIX-3 / INTRADAY-CONSISTENCY-FIX: use open_price as baseline,
+                        # matching Live Table $ CHG (also price − open). Fallback chain:
+                        # open_price → prev_close → cached change fields.
+                        if open_price > 0 and live_price > 0:
+                            change_value   = round(live_price - open_price, 4)
+                            percent_change = round((live_price - open_price) / open_price * 100, 4)
+                        elif prev_close > 0 and live_price > 0:
                             change_value   = round(live_price - prev_close, 4)
                             percent_change = round((live_price - prev_close) / prev_close * 100, 4)
                         else:
@@ -1304,7 +1313,12 @@ class WSEngine:
                 if self._shutdown.is_set():
                     return
                 time.sleep(1)
-            if _get_session() == "after":
+            if _get_session() in ("after", "pre"):
+                # PRE-MARKET-AH-FIX: also refresh during pre-market (4:00–9:30 AM ET).
+                # Previously only "after" triggered a refresh. Pre-market extended-hours
+                # trading also needs a current today_close to compute ah_dollar/ah_pct —
+                # without this, pre-market % was wrong for the first cycle (~60s) because
+                # it was using a stale today_close from the prior evening's AH session.
                 try:
                     self._refresh_ah_closes()
                 except Exception as e:

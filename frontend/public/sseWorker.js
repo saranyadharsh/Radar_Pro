@@ -254,28 +254,23 @@ function connect() {
       const cacheAge  = Date.now() - state.snapTs
       const FRESH_MS  = 5 * 60 * 1000
 
-      // BUG-5 FIX: msg.partial === true means this is a Tier-2 zero-delta fallback
-      // from main.py (changed rows only, not a full replacement). Always MERGE,
-      // never wipe. The old isEarly size heuristic could decide to wipe and rebuild
-      // from only the partial rows, dropping the rest of the cache entirely.
-      const isPartial = msg.partial === true
-      const isEarly   = !isPartial &&
-                        cacheSize > 100 &&
-                        incoming.length < cacheSize * 0.5 &&
-                        cacheAge < FRESH_MS
+      // BUG-5 FIX (corrected): the server Tier-2 reconnect sends type="snapshot_delta"
+      // with partial:true — NOT type="snapshot". The original isPartial check here
+      // was dead code that never matched. Removed isPartial; snapshot_delta always
+      // merges so partial behaviour is implicitly correct in that handler.
+      // isEarly: small incoming vs large fresh cache → merge rather than wipe
+      // (handles early full-snapshot races against an already-populated cache).
+      const isEarly = cacheSize > 100 &&
+                      incoming.length < cacheSize * 0.5 &&
+                      cacheAge < FRESH_MS
 
-      if (isPartial || isEarly) {
-        // Merge partial/early snapshot — never wipe full cache
+      if (isEarly) {
+        // Merge early snapshot — never wipe full cache
         incoming.forEach(row => { if (row?.ticker) state.cache[row.ticker] = row })
         state.snapTs = msg.ts ?? Date.now()
-        console.info(
-          `[sseWorker] ${isPartial ? 'Partial' : 'Early'} snapshot (${incoming.length} rows) ` +
-          `merged into ${cacheSize} cached`
-        )
+        console.info(`[sseWorker] Early snapshot (${incoming.length} rows) merged into ${cacheSize} cached`)
       } else {
         // ATOMIC-SWAP-FIX: build newCache first, then assign atomically.
-        // The old pattern (state.cache = {} then rebuild) created a visible
-        // empty window. This eliminates it entirely.
         const newCache = {}
         incoming.forEach(row => { if (row?.ticker) newCache[row.ticker] = row })
         state.cache  = newCache
@@ -286,10 +281,13 @@ function connect() {
       flushPendingPorts()
     }
     else if (msg.type === 'snapshot_delta') {
+      // BUG-5 FIX (corrected): Tier-2 reconnect sends type="snapshot_delta"+partial:true.
+      // snapshot_delta always merges (never wipes) so partial:true is implicitly honoured —
+      // no separate check needed. The original fix was checking msg.partial on the
+      // 'snapshot' handler above, which never received it, making the guard dead code.
       ;(msg.data ?? []).forEach(row => { if (row?.ticker) state.cache[row.ticker] = row })
       state.snapTs = msg.ts ?? Date.now()
       _evictStaleCache()
-      // If there were pending ports and we now have data, flush them
       if (state.pendingPorts.size > 0 && Object.keys(state.cache).length > 0) {
         flushPendingPorts()
       }

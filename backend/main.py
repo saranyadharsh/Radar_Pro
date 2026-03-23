@@ -252,6 +252,15 @@ class SSEBroadcaster:
                 tk = row.get("ticker")
                 if tk:
                     self._ticker_ts[tk] = _now_ms
+                    # TIER2-TICKBATCH-FIX: merge slim delta into _snapshot_map so
+                    # get_changed_since() returns tick_batch rows on Tier-2 reconnect.
+                    # Previously _snapshot_map was only updated by snapshot/snapshot_delta
+                    # (every 15s). A client reconnecting within that 15s window got 0
+                    # changed rows — table appeared frozen for up to 15s after reconnect.
+                    if tk in self._snapshot_map:
+                        self._snapshot_map[tk] = {**self._snapshot_map[tk], **row}
+                    else:
+                        self._snapshot_map[tk] = row
             # GAP-4b: tick_batch may arrive before any snapshot on reconnect.
             # Unblock SSE connects if snapshot_map already has data seeded from
             # the engine cache fallback, otherwise they wait the full 8s timeout.
@@ -263,13 +272,20 @@ class SSEBroadcaster:
             except Exception:
                 pass
 
-        # SEQ-FIX: stamp sequence number on every outgoing message
-        self._seq += 1
-        payload["seq"] = self._seq
-
-        # FIX-1: zero-client guard
+        # SEQ-REPLAY-FIX: only increment seq and store in replay buffer when clients
+        # are actually connected. Previously seq incremented unconditionally, then the
+        # zero-client early-return fired BEFORE replay_buf.append — so during pre-market
+        # / zero-browser windows thousands of ticks advanced the counter but nothing was
+        # stored. Reconnecting clients detected huge gaps that the replay buffer couldn't
+        # fill, forcing every first-connect into a needless full-snapshot blast.
+        # By gating both operations on _queues, seq numbers stay contiguous for the
+        # duration of any connected session.
         if not self._queues:
             return
+
+        # FIX-1: zero-client guard (kept for clarity — already returned above)
+        self._seq += 1
+        payload["seq"] = self._seq
 
         msg  = "data: " + _dumps(payload) + "\n\n"  # GAP-4: orjson
 
@@ -880,55 +896,59 @@ async def lifespan(app: FastAPI):
 
                 new_urls_this_cycle: list = []
 
-                for sym in watchlist:
-                    news_url = (
-                        f"https://api.polygon.io/v2/reference/news"
-                        f"?ticker={sym}&limit=5&order=desc&sort=published_utc"
-                        f"&published_utc.gte={cutoff_iso}&apiKey={api_key}"
-                    )
-                    try:
-                        async with httpx.AsyncClient(timeout=8) as client:
+                # HTTPX-POOL-FIX: one shared AsyncClient wraps the entire per-ticker loop.
+                # Previously a new client was opened and closed for every symbol in the
+                # watchlist — 30 TCP+TLS handshakes per 15-min cycle for a 30-ticker list.
+                # One pooled client reuses the connection across all tickers (keep-alive).
+                async with httpx.AsyncClient(timeout=8) as client:
+                    for sym in watchlist:
+                        news_url = (
+                            f"https://api.polygon.io/v2/reference/news"
+                            f"?ticker={sym}&limit=5&order=desc&sort=published_utc"
+                            f"&published_utc.gte={cutoff_iso}&apiKey={api_key}"
+                        )
+                        try:
                             resp = await client.get(news_url)
                             resp.raise_for_status()
                             articles = resp.json().get("results", [])
-                    except Exception:
-                        await asyncio.sleep(0.2)
-                        continue
-
-                    for art in articles:
-                        art_url = art.get("article_url", "")
-                        if not art_url or art_url in seen_urls:
+                        except Exception:
+                            await asyncio.sleep(0.2)
                             continue
-                        seen_urls.add(art_url)
-                        seen_ts[art_url] = date.today().isoformat()
-                        new_urls_this_cycle.append(art_url)
 
-                        headline  = art.get("title", "")
-                        source    = (art.get("publisher") or {}).get("name", "")
-                        published = art.get("published_utc", "")
-                        sentiment = (art.get("insights") or [{}])[0].get("sentiment", "neutral")
-                        sent_color = (
-                            "green" if sentiment == "positive"
-                            else "red" if sentiment == "negative"
-                            else "cyan"
-                        )
-                        await broadcaster.publish({
-                            "type":      "news_alert",
-                            "ticker":    sym,
-                            "title":     f"{sym} — {headline[:60]}{'…' if len(headline)>60 else ''}",
-                            "sub":       f"{source} · {sentiment}",
-                            "headline":  headline,
-                            "source":    source,
-                            "published": published,
-                            "sentiment": sentiment,
-                            "url":       art_url,
-                            "color":     sent_color,
-                            "emoji":     "📰",
-                            "ts":        int(time.time() * 1000),
-                        })
-                        logger.debug(f"News alert: {sym} '{headline[:50]}' ({source})")
+                        for art in articles:
+                            art_url = art.get("article_url", "")
+                            if not art_url or art_url in seen_urls:
+                                continue
+                            seen_urls.add(art_url)
+                            seen_ts[art_url] = date.today().isoformat()
+                            new_urls_this_cycle.append(art_url)
 
-                    await asyncio.sleep(0.25)  # rate-limit between tickers
+                            headline  = art.get("title", "")
+                            source    = (art.get("publisher") or {}).get("name", "")
+                            published = art.get("published_utc", "")
+                            sentiment = (art.get("insights") or [{}])[0].get("sentiment", "neutral")
+                            sent_color = (
+                                "green" if sentiment == "positive"
+                                else "red" if sentiment == "negative"
+                                else "cyan"
+                            )
+                            await broadcaster.publish({
+                                "type":      "news_alert",
+                                "ticker":    sym,
+                                "title":     f"{sym} — {headline[:60]}{'…' if len(headline)>60 else ''}",
+                                "sub":       f"{source} · {sentiment}",
+                                "headline":  headline,
+                                "source":    source,
+                                "published": published,
+                                "sentiment": sentiment,
+                                "url":       art_url,
+                                "color":     sent_color,
+                                "emoji":     "📰",
+                                "ts":        int(time.time() * 1000),
+                            })
+                            logger.debug(f"News alert: {sym} '{headline[:50]}' ({source})")
+
+                        await asyncio.sleep(0.25)  # rate-limit between tickers
 
                 # NEWS-RESTART-FIX: persist newly-seen URLs to Supabase so the
                 # next restart doesn't re-alert articles already shown this session.
@@ -978,10 +998,19 @@ _WATCHLIST_CACHE_TTL_S : float = 300.0   # 5 minutes
 
 def _get_cached_watchlist(force: bool = False) -> list:
     global _watchlist_cache_data, _watchlist_cache_ts
+    # TOCTOU-FIX: stamp an optimistic timestamp INSIDE the lock before releasing it.
+    # The old pattern released the lock between the TTL check and the DB call —
+    # two concurrent callers could both see stale, both call db.get_signal_watchlist(),
+    # and both write back, defeating the cache and doubling Supabase load.
+    # Fix: set _watchlist_cache_ts = now inside the lock so any concurrent caller
+    # that acquires it next sees "fresh" and returns the (slightly stale) prior value.
     with _watchlist_cache_lock:
-        if not force and time.time() - _watchlist_cache_ts < _WATCHLIST_CACHE_TTL_S:
+        now = time.time()
+        if not force and now - _watchlist_cache_ts < _WATCHLIST_CACHE_TTL_S:
             return list(_watchlist_cache_data)
-    # Outside the lock for the slow DB call
+        stale_snapshot = list(_watchlist_cache_data)   # snapshot before releasing
+        _watchlist_cache_ts = now                      # optimistic stamp — blocks concurrent fetches
+    # DB call outside lock — other callers see the optimistic ts and skip
     try:
         rows = db.get_signal_watchlist() if db else []
         with _watchlist_cache_lock:
@@ -990,13 +1019,38 @@ def _get_cached_watchlist(force: bool = False) -> list:
         return list(rows)
     except Exception as _e:
         logger.warning(f"_get_cached_watchlist DB error: {_e}")
-        with _watchlist_cache_lock:
-            return list(_watchlist_cache_data)  # return stale rather than crash
+        return stale_snapshot  # return pre-lock snapshot rather than crash
 
 def _invalidate_watchlist_cache() -> None:
     global _watchlist_cache_ts
     with _watchlist_cache_lock:
         _watchlist_cache_ts = 0.0
+
+# SIGNAL-SNAPSHOT-CACHE: /api/stream sends db.get_recent_signals(50) on every
+# Tier-1 SSE connect. With 10+ tabs opening simultaneously this fires 10 parallel
+# Supabase queries with no dedup. Cache for 30s — signals are written every ~30s
+# by the signal engine so the TTL loses nothing meaningful.
+_signal_cache_lock  = _wl_threading.Lock()
+_signal_cache_data  : list = []
+_signal_cache_ts    : float = 0.0
+_SIGNAL_CACHE_TTL_S : float = 30.0
+
+def _get_cached_signals(limit: int = 50) -> list:
+    global _signal_cache_data, _signal_cache_ts
+    with _signal_cache_lock:
+        if time.time() - _signal_cache_ts < _SIGNAL_CACHE_TTL_S:
+            return list(_signal_cache_data)
+        _signal_cache_ts = time.time()   # optimistic stamp
+    try:
+        rows = db.get_recent_signals(limit) if db else []
+        with _signal_cache_lock:
+            _signal_cache_data = rows
+            _signal_cache_ts   = time.time()
+        return list(rows)
+    except Exception as _e:
+        logger.warning(f"_get_cached_signals DB error: {_e}")
+        with _signal_cache_lock:
+            return list(_signal_cache_data)
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://nexradar.info").rstrip("/")
 # GZip REST compression — applies to all non-SSE endpoints automatically.
@@ -1234,8 +1288,10 @@ async def sse_stream(request: Request, client_ts: int = Query(0)):
                     }) + "\n\n"
 
                 # PATCH-MAIN-1: Signal snapshot on connect
+                # SIGNAL-SNAPSHOT-CACHE: use 30s cached result to avoid Supabase
+                # storm when multiple tabs open simultaneously.
                 try:
-                    signals = await asyncio.to_thread(db.get_recent_signals, 50)
+                    signals = await asyncio.to_thread(_get_cached_signals, 50)
                     if signals:
                         # Normalize ticker field — signals table may store as 'symbol'
                         for s in signals:
@@ -1494,9 +1550,15 @@ async def get_portfolio():
                 open_price = float(live.get("open_price") or live.get("open") or
                                    row.get("open_price") or row.get("open") or 0)
                 prev_close = float(live.get("prev_close") or row.get("prev_close") or 0)
-                # PORTFIX-3: compute directly from live_price − prev_close.
-                # Trusting cached change_value = 0 at cold-start or pre-market.
-                if prev_close > 0 and live_price > 0:
+                # PORTFIX-3 / INTRADAY-CONSISTENCY-FIX: use live_price − open_price
+                # (intraday vs open), matching the Live Table $ CHG column which was
+                # updated to the same basis. Previously portfolio used prev_close while
+                # Live Table used open → same ticker showed different $ CHG on different
+                # pages. Fallback to prev_close only when open_price not yet available.
+                if open_price > 0 and live_price > 0:
+                    change_value   = round(live_price - open_price, 4)
+                    percent_change = round((live_price - open_price) / open_price * 100, 4)
+                elif prev_close > 0 and live_price > 0:
                     change_value   = round(live_price - prev_close, 4)
                     percent_change = round((live_price - prev_close) / prev_close * 100, 4)
                 else:
@@ -1660,6 +1722,10 @@ async def watchlist_remove(body: WatchlistBody):
     try:
         ticker = body.ticker.upper().strip()
         await asyncio.to_thread(db.remove_signal_watchlist, ticker)
+        _invalidate_watchlist_cache()   # REMOVE-INVALIDATE-FIX: was missing on the remove
+                                        # path. Without this, background loops (news/edgar/
+                                        # earnings/fda) kept alerting the removed ticker for
+                                        # up to 5 minutes (the cache TTL).
         await _refresh_signal_watcher()
         rows = await asyncio.to_thread(db.get_signal_watchlist)
         wl   = sorted([r["ticker"] for r in rows if r.get("ticker")])
