@@ -724,8 +724,8 @@ export default function AgenticPanel({ ticker, rowHint={}, context="watchlist", 
                       marginTop:2 }}>{tech.setupQuality}</div>
                   </div>
                 </div>
-                <ScoreBar label="Overall Score"  score={tech.overallScore}/>
-                <ScoreBar label="Trend Strength" score={tech.trendStrength}/>
+                <ScoreBar label="Overall Score"  score={tech.overallScore}  T={T}/>
+                <ScoreBar label="Trend Strength" score={tech.trendStrength} T={T}/>
                 <p style={{ color:T.text1, fontFamily:T.font, fontSize:10.5,
                   lineHeight:1.7, marginTop:6 }}>{tech.summary}</p>
               </div>
