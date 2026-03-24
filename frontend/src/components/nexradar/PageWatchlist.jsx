@@ -37,6 +37,7 @@ import { API_BASE } from '../../config.js';
 
 // ── Range bar (52-week position) ─────────────────────────────────────────────
 function RangeBar({ price, high, low, T }) {
+  if (!T) return null;
   if (!price||!high||!low||high===low) return <span style={{color:T.text2,fontSize:9}}>—</span>;
   const pct   = Math.round(((price-low)/(high-low))*100);
   const color = pct>70?T.green:pct>40?T.gold:T.red;
@@ -52,7 +53,7 @@ function RangeBar({ price, high, low, T }) {
 
 // ── Alert badge: shows latest edgar/news/fda hit per ticker ──────────────────
 function AlertBadge({ alert, T }) {
-  if (!alert) return null;
+  if (!alert || !T) return null;
   const isEdgar = alert.type === 'edgar_alert';
   const isFda   = alert.type === 'fda_alert';
   const color   = isEdgar ? T.orange : isFda ? T.purple : T.gold;
@@ -70,7 +71,7 @@ function AlertBadge({ alert, T }) {
 
 // ── Floating toast for real-time alerts ──────────────────────────────────────
 function AlertToastWL({ toast, onDismiss, T }) {
-  if (!toast) return null;
+  if (!toast || !T) return null;
   const isEdgar = toast.type === 'edgar_alert';
   const isFda   = toast.type === 'fda_alert';
   const color   = isEdgar ? T.orange : isFda ? T.purple : T.gold;
@@ -239,6 +240,9 @@ export default function PageWatchlist({
   }, [watchlist, search]);
 
   const COL = '82px 120px 78px 82px 78px 70px 38px';
+
+  // Guard: T (theme) may be undefined on first render if parent hasn't loaded yet
+  if (!T) return null;
 
   return (
     <div style={{ background:T.bg0, height:'100vh', fontFamily:T.font,
