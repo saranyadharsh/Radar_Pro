@@ -231,9 +231,9 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
             </div>
           </div>
           <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.open||0)}</div>
-          <div style={{ padding:"10px 14px", color:T.text0, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{fmt2(ticker.live_price||0)}</div>
-          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{isPositive?"+":" "}{fmt2(displayChg)}</div>
-          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{pct(displayPct)}</div>
+          <div style={{ padding:"10px 14px", color:T.text0, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmt2(ticker.live_price||0)}</div>
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{isPositive?"+":" "}{fmt2(displayChg)}</div>
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{pct(displayPct)}</div>
           <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmtVol(ticker.volume||0)}</div>
           <div style={{ padding:"10px 14px", display:"flex", alignItems:"center", gap:5 }}>
             {(() => {
@@ -276,14 +276,14 @@ const LiveTableRow = memo(function LiveTableRow({ ticker, isWatched, toggleWatch
           </div>
           <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{ticker.prev_close>0?`$${fmt2(ticker.prev_close)}`:"—"}</div>
           <div style={{ padding:"10px 14px", color:T.text1, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{ticker.today_close>0?`$${fmt2(ticker.today_close)}`:"—"}</div>
-          <div style={{ padding:"10px 14px", color:T.cyan, fontFamily:T.font, fontSize:13, display:"flex", flexDirection:"column", alignItems:"flex-start", justifyContent:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>
+          <div style={{ padding:"10px 14px", color:T.cyan, fontFamily:T.font, fontSize:13, display:"flex", flexDirection:"column", alignItems:"flex-start", justifyContent:"center" }}>
             <span>{fmt2(ticker.live_price||0)}</span>
             {/* NOI-FIX: show imbalance bar in AH mode — most critical during auctions */}
             {noi && noi.imbalance_side !== 'N' && <NOIBar noi={noi} T={T} />}
           </div>
           {/* BUG-3 FIX: fmtChg / fmtPct_ return "—" when value is null (today_close not yet populated) */}
-          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{fmtChg(displayChg)}</div>
-          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center", filter:isStale?'blur(1.5px)':'none', opacity:isStale?0.4:1, transition:'filter 0.4s ease, opacity 0.4s ease' }}>{fmtPct_(displayPct)}</div>
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmtChg(displayChg)}</div>
+          <div style={{ padding:"10px 14px", color:changeColor, fontFamily:T.font, fontSize:13, display:"flex", alignItems:"center" }}>{fmtPct_(displayPct)}</div>
         </>
       )}
     </div>
@@ -661,11 +661,21 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
   };
 
 
-  const MH_COLS = [
+  // MOBILE-FIX: responsive column widths.
+  // Desktop (>768px): full 7-column layout with 260px symbol.
+  // Mobile (<=768px): compact layout — smaller symbol, tighter columns, horizontal scroll enabled.
+  const isMobileView = typeof window !== 'undefined' && window.innerWidth < 768;
+  const MH_COLS = isMobileView ? [
+    {key:"symbol",w:"140px",label:"SYMBOL"},{key:"open",w:"75px",label:"OPEN"},{key:"price",w:"75px",label:"PRICE"},
+    {key:"change",w:"75px",label:"$ CHG"},{key:"pct",w:"70px",label:"% CHG"},{key:"volume",w:"65px",label:"VOL"},{key:"signal",w:"80px",label:"SIGNAL"},
+  ] : [
     {key:"symbol",w:"260px",label:"SYMBOL"},{key:"open",w:"1fr",label:"OPEN"},{key:"price",w:"1fr",label:"PRICE"},
     {key:"change",w:"1fr",label:"$ CHG"},{key:"pct",w:"1fr",label:"% CHG"},{key:"volume",w:"1fr",label:"VOLUME"},{key:"signal",w:"120px",label:"SIGNAL"},
   ];
-  const AH_COLS = [
+  const AH_COLS = isMobileView ? [
+    {key:"symbol",w:"140px",label:"SYMBOL"},{key:"prev_close",w:"75px",label:"PREV CL"},{key:"today_close",w:"75px",label:"TODAY CL"},
+    {key:"live_price",w:"75px",label:"LIVE"},{key:"change",w:"75px",label:"$ CHG"},{key:"pct",w:"70px",label:"% CHG"},
+  ] : [
     {key:"symbol",w:"260px",label:"SYMBOL"},{key:"prev_close",w:"1fr",label:"PREV CLOSE"},{key:"today_close",w:"1fr",label:"TODAY CLOSE"},
     {key:"live_price",w:"1fr",label:"LIVE PRICE"},{key:"change",w:"1fr",label:"$ CHG"},{key:"pct",w:"1fr",label:"% CHG"},
   ];
@@ -750,7 +760,10 @@ export default function PageLiveTable({ selectedSectors, onSectorChange, tickers
             </div>
 
             {/* T2-6: Virtual scroll container — only ~20 DOM nodes at a time regardless of 6,000+ tickers */}
-            <div ref={tableScrollRef} style={{ height:"calc(100vh - 420px)", minHeight:"300px", overflowY:"auto", overflowX:"hidden", position:"relative" }}>
+            {/* MOBILE-FIX: overflowX changed from "hidden" to "auto" so users can
+                horizontally scroll to see $ CHG, % CHG, VOLUME, SIGNAL columns on mobile.
+                On desktop the 1fr columns auto-fill so no horizontal scroll appears. */}
+            <div ref={tableScrollRef} style={{ height:"calc(100vh - 420px)", minHeight:"300px", overflowY:"auto", overflowX:"auto", position:"relative" }}>
               {tickers.size===0&&wsStatus==='connecting'&&<div style={{ padding:40, textAlign:"center", color:T.gold, fontSize:13, fontFamily:T.font }}>🔄 Reconnecting to live feed…</div>}
               {tickers.size===0&&wsStatus==='connected'&&<div style={{ padding:40, textAlign:"center", color:T.cyan, fontSize:13, fontFamily:T.font }}>⏳ Connected — waiting for snapshot…</div>}
               {tickers.size===0&&wsStatus==='disconnected'&&<div style={{ padding:40, textAlign:"center", color:T.red, fontSize:13, fontFamily:T.font }}>❌ WebSocket disconnected — reconnecting</div>}

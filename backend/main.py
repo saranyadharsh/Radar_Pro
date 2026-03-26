@@ -533,13 +533,18 @@ async def lifespan(app: FastAPI):
     # Every 10 min — all material forms across full watchlist.
     # seen_accessions dedupes so each filing fires exactly one SSE alert.
     async def _edgar_watchlist_loop():
-        POLL_INTERVAL_S = 600
-        LOOKBACK_DAYS   = 1
+        # EDGAR-TUNING-FIX: improved detection sensitivity
+        #   LOOKBACK_DAYS: 1→3 (catches filings missed on weekends / holidays)
+        #   POLL_INTERVAL_S: 600→300 (5-min polls for timelier detection)
+        #   Initial sleep: 45→15s (faster first poll after deploy/restart)
+        #   Added debug logging when no new filings found (confirms loop is running)
+        POLL_INTERVAL_S = 300
+        LOOKBACK_DAYS   = 3
         FORMS           = ["8-K", "SC 13D", "SC 13G", "S-4", "DEFR14A", "10-Q", "10-K"]
         seen_accessions : set  = set()
         seen_ts         : dict = {}
 
-        await asyncio.sleep(45)
+        await asyncio.sleep(15)
 
         while True:
             try:
@@ -550,11 +555,13 @@ async def lifespan(app: FastAPI):
                 wl_rows   = await asyncio.to_thread(db.get_signal_watchlist)
                 watchlist = [r["ticker"] for r in wl_rows if r.get("ticker")]
                 if not watchlist:
+                    logger.debug("EDGAR poll: watchlist empty — skipping")
                     await asyncio.sleep(POLL_INTERVAL_S)
                     continue
 
                 # BATCH-FIX: 7 bulk calls (one per form) instead of 30×7=210
                 # per-ticker calls. 1,260 req/hr → 42 req/hr (97% reduction).
+                new_count = 0
                 for form in FORMS:
                     raw_hits = await _edgar_fetch_form_bulk(watchlist, form, startdt)
                     for hit in raw_hits:
@@ -572,9 +579,14 @@ async def lifespan(app: FastAPI):
                         seen_ts[accession] = date.today().isoformat()
                         alert = _edgar_build_alert(sym, form, hit)
                         await broadcaster.publish(alert)
+                        new_count += 1
                         logger.info(f"EDGAR alert: {sym} {form} items={items_str or '—'}")
 
-                cutoff = (date.today() - timedelta(days=2)).isoformat()
+                # EDGAR-DEBUG-FIX: log when no new filings found — confirms loop is alive
+                if new_count == 0:
+                    logger.debug(f"EDGAR poll: no new filings for {len(watchlist)} tickers (lookback={LOOKBACK_DAYS}d, seen={len(seen_accessions)})")
+
+                cutoff = (date.today() - timedelta(days=LOOKBACK_DAYS + 1)).isoformat()
                 for a in [k for k, v in seen_ts.items() if v < cutoff]:
                     seen_accessions.discard(a); seen_ts.pop(a, None)
 
@@ -583,7 +595,7 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(POLL_INTERVAL_S)
 
     asyncio.create_task(_edgar_watchlist_loop())
-    logger.info("EDGAR watchlist poller started (10-min, 7 form types)")
+    logger.info("EDGAR watchlist poller started (5-min, 7 form types, 3-day lookback)")
 
     # ── Loop 2: Earnings proximity alert loop ─────────────────────────────────
     # Every 30 min — Supabase earnings table only (EDGAR has no forward calendar).
@@ -1911,6 +1923,60 @@ async def get_options_flow(min_premium: int = Query(default=50_000)):
     await asyncio.gather(*[_fetch_ticker(sym) for sym in wl[:10]])
     results.sort(key=lambda x: x["premium"], reverse=True)
     return {"data": results, "count": len(results), "tickers": wl[:10], "source": "polygon"}
+
+
+# ── Momentum Scanner API ──────────────────────────────────────────────────────
+# Returns real-time intraday momentum scores for ALL tickers.
+# Score is a composite of price velocity (5m), volume acceleration, and VWAP distance.
+# No additional Polygon API calls — computed purely from the live ws_engine cache.
+# Frontend: powers the Scanner page + Dashboard "Momentum Leaders" widget.
+#
+# Query params:
+#   direction: "all" | "up" | "down" — filter by momentum direction
+#   min_score: float — minimum absolute score threshold (default 0)
+#   limit: int — max results (default 50)
+#   sector: str — filter by sector (optional)
+@app.get("/api/momentum-scan")
+async def momentum_scan(
+    direction: str = Query(default="all"),
+    min_score: float = Query(default=0),
+    limit: int = Query(default=50, ge=1, le=500),
+    sector: str = Query(default=""),
+):
+    eng = getattr(app.state, "engine", None)
+    if not eng:
+        return {"data": [], "message": "Engine not ready", "count": 0}
+
+    with eng._momentum_lock:
+        scores = list(eng._momentum_scores.values())
+
+    if not scores:
+        return {"data": [], "message": "Momentum data warming up — scores populate after 5 min of market data", "count": 0}
+
+    # Direction filter
+    if direction == "up":
+        scores = [s for s in scores if s["direction"] == "UP"]
+    elif direction == "down":
+        scores = [s for s in scores if s["direction"] == "DOWN"]
+
+    # Min score filter
+    if min_score > 0:
+        scores = [s for s in scores if abs(s["score"]) >= min_score]
+
+    # Sector filter (uses ws_engine _sector_map)
+    if sector:
+        sector_upper = sector.upper()
+        scores = [s for s in scores if eng._sector_map.get(s["ticker"], "").upper() == sector_upper]
+
+    # Sort by absolute score descending (strongest momentum first)
+    scores.sort(key=lambda x: abs(x["score"]), reverse=True)
+
+    return {
+        "data": scores[:limit],
+        "count": len(scores),
+        "total_scored": len(eng._momentum_scores),
+        "source": "ws_engine_cache",
+    }
 
 
 # ── AI Proxy — Amazon Bedrock ─────────────────────────────────────────────────

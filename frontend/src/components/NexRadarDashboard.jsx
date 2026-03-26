@@ -97,8 +97,12 @@ function NexRadarDashboard({
 
   useEffect(() => {
     // Technical real-time signals only — news/edgar/earnings/fda go to the 📰 News panel
+    // TOAST-TYPE-FIX: useTickerData.js dispatches alerts with types:
+    //   'vol' (not 'vol_spike'), 'ah' (not 'ah_momentum'), 'gap'
+    // Both old and new type strings are included for forward/backward compat.
     const TOAST_TYPES = new Set([
-      'gap', 'vol_spike', 'ah_momentum', 'hod_break', 'lod_break',
+      'gap', 'vol_spike', 'vol', 'ah_momentum', 'ah',
+      'hod_break', 'lod_break',
       'luld_halt', 'luld_resume',
     ]);
     const handler = (e) => {
@@ -352,6 +356,10 @@ function NexRadarDashboard({
       </style>
 
       {/* ── SIDEBAR ── */}
+      {/* MOBILE-FIX: sidebar hidden on mobile (< 768px) — bottom tabbar provides navigation.
+          The sidebar was still rendering at 56-218px width on mobile, stealing ~15-30% of
+          the viewport and pushing page content into overflow. */}
+      {!isMobile && (
       <div className="nexradar-sidebar" style={{ width:sideCollapsed?56:218, minWidth:sideCollapsed?56:218, background:T.bg1, borderRight:`1px solid ${T.border}`, display:'flex', flexDirection:'column', transition:'width 0.22s,min-width 0.22s', overflow:'hidden' }}>
         {/* Logo */}
         <div style={{ padding:'17px 13px', borderBottom:`1px solid ${T.border}`, display:'flex', alignItems:'center', gap:10, overflow:'hidden', flexShrink:0 }}>
@@ -409,13 +417,15 @@ function NexRadarDashboard({
           {sideCollapsed?'›':'‹'}
         </button>
       </div>
+      )} {/* end MOBILE-FIX: sidebar conditional */}
 
       {/* ── MAIN ── */}
       <div className="nexradar-main" style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
         {/* Top bar */}
-        <div style={{ background:T.bg1, borderBottom:`1px solid ${T.border}`, padding:'0 20px', height:56, display:'flex', alignItems:'center', gap:14, flexShrink:0, position:'relative' }}>
-          <span style={{ fontFamily:T.font, fontWeight:700, fontSize:16, color:T.text0, letterSpacing:0.5 }}>
-            {current?.icon}&nbsp;{current?.label.toUpperCase()}
+        {/* MOBILE-FIX: reduced padding and gap on mobile, hide non-essential items */}
+        <div style={{ background:T.bg1, borderBottom:`1px solid ${T.border}`, padding: isMobile ? '0 10px' : '0 20px', height:56, display:'flex', alignItems:'center', gap: isMobile ? 8 : 14, flexShrink:0, position:'relative', overflowX: isMobile ? 'auto' : 'visible' }}>
+          <span style={{ fontFamily:T.font, fontWeight:700, fontSize: isMobile ? 13 : 16, color:T.text0, letterSpacing:0.5, whiteSpace:'nowrap', flexShrink:0 }}>
+            {current?.icon}&nbsp;{isMobile ? '' : current?.label.toUpperCase()}
           </span>
           {activeLabel&&(
             <div style={{ display:'flex', alignItems:'center', gap:6, background:T.cyan+'10', border:`1px solid ${T.cyan}30`, borderRadius:6, padding:'4px 12px' }}>
@@ -435,14 +445,14 @@ function NexRadarDashboard({
                 if(s){setChartInitSymbol(s);setPage('chart');searchInputRef.current='';e.target.value='';}
               }
             }}
-            style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:6, padding:'8px 14px', color:T.text0, fontFamily:T.font, fontSize:13, outline:'none', width:180 }}
+            style={{ background:T.bg2, border:`1px solid ${T.border}`, borderRadius:6, padding: isMobile ? '6px 10px' : '8px 14px', color:T.text0, fontFamily:T.font, fontSize: isMobile ? 11 : 13, outline:'none', width: isMobile ? 100 : 180, flexShrink: isMobile ? 1 : 0 }}
             onFocus={e=>e.target.style.borderColor=T.cyanMid}
             onBlur={e=>e.target.style.borderColor=T.border}/>
-          <div style={{ width:1, height:24, background:T.border }}/>
-          {/* SYS OK */}
-          <div style={{ display:'flex', alignItems:'center', gap:6, background:T.greenDim, border:`1px solid ${T.green}30`, borderRadius:6, padding:'6px 12px', cursor:'pointer' }} title="System Status: All services operational">
+          {!isMobile && <div style={{ width:1, height:24, background:T.border }}/>}
+          {/* SYS OK — MOBILE-FIX: show only dot on mobile, full label on desktop */}
+          <div style={{ display:'flex', alignItems:'center', gap: isMobile ? 0 : 6, background:T.greenDim, border:`1px solid ${T.green}30`, borderRadius:6, padding: isMobile ? '6px 8px' : '6px 12px', cursor:'pointer', flexShrink:0 }} title="System Status: All services operational">
             <span style={{ width:8, height:8, borderRadius:'50%', background:T.green, animation:'dotblink 1.4s ease-in-out infinite' }}/>
-            <span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:600, letterSpacing:0.3 }}>SYS OK</span>
+            {!isMobile && <span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:600, letterSpacing:0.3 }}>SYS OK</span>}
           </div>
           {/* Notifications 🔔 */}
           <button onClick={()=>{setHeaderPanel(p=>p==='notifications'?null:'notifications');markNotificationsRead();}}

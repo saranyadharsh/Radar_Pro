@@ -170,12 +170,21 @@ class IndicatorCalculator:
         """
         FIX-1: Reset VWAP, OBV, and MACD history together at market open.
         Original only reset VWAP — OBV accumulated cross-day making it meaningless.
+
+        BARS-RESET-FIX: Also clear the bars deque. Without this, the 27-bar
+        warmup check (add_bar) passes instantly at 9:30 AM because 200 bars
+        from yesterday are still in the deque. Indicators for the first ~30 min
+        are computed using yesterday's OHLCV mixed with today's — producing
+        stale/wrong RSI, EMA, Stochastic, and MACD values until 200 new bars
+        push out the old ones (~3.3 hours at 1-min resolution).
         """
         self._vwap_cum_pv  = 0.0
         self._vwap_cum_vol = 0.0
         self._obv          = 0.0          # FIX-1
         self._macd_history.clear()        # fresh MACD signal baseline each day
         self._delta_history.clear()       # ALIGN-6: fresh delta baseline each day
+        self.bars.clear()                 # BARS-RESET-FIX: flush yesterday's price data
+        self._latest_ind = None           # invalidate stale cached indicators
 
     def add_bar(self, bar: OHLCVBar) -> Optional[dict]:
         """Add bar -> return indicator dict or None if warming up."""
@@ -354,30 +363,32 @@ class IndicatorCalculator:
 
     def _detect_order_block(self, opens: np.ndarray, highs: np.ndarray,
                              lows: np.ndarray, closes: np.ndarray,
-                             volumes: np.ndarray, lookback: int = 10) -> tuple:
+                             volumes: np.ndarray, lookback: int = 15) -> tuple:
         """
-        ORDER-BLOCK-FIX: Completely rewritten to actually fire on 1-min bars.
+        ORDER-BLOCK-FIX-v2: Further tuned for reliable 1-min detection.
 
-        Old logic only checked closes[-1] (the current bar) against 1.5× ATR.
-        On 1-min data, individual bars are almost never 1.5× ATR in body size —
-        that threshold is calibrated for 5-min or 15-min bars. Result: ORDR BLK
-        column was always "—" (NONE) regardless of real institutional activity.
+        v1 (prior) used body >= 0.5× ATR + proximity 2× ATR + lookback 10.
+        On 1-min bars for stocks like $150 AAPL (ATR ~$0.12), 0.5× ATR = $0.06
+        body threshold is reasonable, but proximity 2× ATR = $0.24 was too tight —
+        price naturally drifts $0.20-0.50 within 10 minutes, invalidating most
+        detected blocks before they could be rendered to the user.
 
-        New logic:
-          1. Scan the last `lookback` bars (default 10) for the most recent
-             impulsive bar — body >= ATR * 0.5 (realistic for 1-min) AND
-             volume >= 1.3× rolling average (lower than 1.5× — still selective).
-          2. The found bar's direction sets BULLISH_OB / BEARISH_OB.
-          3. Relevance decay: the block must be within the last 10 bars.
-             Older blocks have likely been consumed by price and are stale.
-          4. Price proximity check: current price must be within 2× ATR of the
-             block's high (bull) or low (bear) — confirms it's still an active
-             zone not a distant historical print.
+        v2 changes:
+          1. lookback 10 → 15 bars (15 min window — OBs stay relevant longer).
+          2. Body threshold 0.5× ATR → 0.35× ATR (catches moderate institutional
+             candles; still filters noise since avg body is ~0.15× ATR on 1-min).
+          3. Proximity 2× ATR → 4× ATR (allows normal price drift without
+             invalidating the block; 4× ATR on 1-min ≈ $0.48 for AAPL — realistic).
+          4. Volume threshold 1.3× → 1.2× avg (slightly more sensitive — most
+             institutional prints are 1.2-1.5× avg even on 1-min granularity).
+          5. NEW: if no volume-qualified block found, check for the single largest
+             body bar in the lookback — institutions sometimes split volume across
+             multiple bars but the price impact concentrates in one candle.
 
         Returns (ob_active: bool, ob_dir: str)
           ob_dir: 'BULLISH_OB' | 'BEARISH_OB' | 'NONE'
         """
-        min_bars = lookback + 3
+        min_bars = lookback + 5
         if len(closes) < min_bars:
             return False, "NONE"
 
@@ -394,35 +405,52 @@ class IndicatorCalculator:
             return False, "NONE"
 
         current_price = closes[-1]
+        proximity_mult = 4.0   # OB-PROXIMITY-FIX: 2→4× ATR — realistic for 1-min drift
 
-        # Scan from most recent bar backwards through the lookback window
+        # ── Pass 1: volume + body qualified blocks (strongest signal) ──────────
         scan_start = len(closes) - lookback
-        for i in range(len(closes) - 1, scan_start - 1, -1):
-            body   = abs(closes[i] - opens[i])
+        for i in range(len(closes) - 1, max(scan_start - 1, 0), -1):
+            body    = abs(closes[i] - opens[i])
             bar_vol = volumes[i]
 
-            # ORDER-BLOCK-FIX: body >= 0.5× ATR (1-min realistic) AND vol >= 1.3× avg
-            if body < atr * 0.5:
+            # OB-THRESHOLD-FIX: body >= 0.35× ATR AND vol >= 1.2× avg
+            if body < atr * 0.35:
                 continue
-            if bar_vol < avg_vol * 1.3:
+            if bar_vol < avg_vol * 1.2:
                 continue
 
-            # This bar qualifies as an order block — determine direction
             is_bull = closes[i] > opens[i]
             ob_high = highs[i]
             ob_low  = lows[i]
 
-            # Proximity: current price must be within 2× ATR of the block zone
             if is_bull:
-                # Bullish OB zone: ob_low to ob_high
-                # Price should still be near (not far above) the block
-                if current_price > ob_high + atr * 2:
-                    continue   # price moved far away — block consumed
+                if current_price > ob_high + atr * proximity_mult:
+                    continue
                 return True, "BULLISH_OB"
             else:
-                # Bearish OB zone: ob_low to ob_high
-                if current_price < ob_low - atr * 2:
-                    continue   # block consumed
+                if current_price < ob_low - atr * proximity_mult:
+                    continue
+                return True, "BEARISH_OB"
+
+        # ── Pass 2: body-only fallback — largest body bar in lookback ──────────
+        # Catches institutional prints split across multiple bars (volume diluted
+        # per bar but price impact concentrates in the move candle).
+        best_idx  = -1
+        best_body = 0.0
+        for i in range(len(closes) - 1, max(scan_start - 1, 0), -1):
+            body = abs(closes[i] - opens[i])
+            if body > best_body:
+                best_body = body
+                best_idx  = i
+
+        # Only qualify if the best body is at least 0.6× ATR (meaningful move)
+        if best_idx >= 0 and best_body >= atr * 0.6:
+            is_bull = closes[best_idx] > opens[best_idx]
+            ob_high = highs[best_idx]
+            ob_low  = lows[best_idx]
+            if is_bull and current_price <= ob_high + atr * proximity_mult:
+                return True, "BULLISH_OB"
+            elif not is_bull and current_price >= ob_low - atr * proximity_mult:
                 return True, "BEARISH_OB"
 
         return False, "NONE"

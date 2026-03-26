@@ -217,10 +217,12 @@ export default function PagePortfolio({ tickers=new Map(), marketSession='market
                      || position.live_price   // ← PORTFIX-2 enriched by backend
                      || position.price
                      || 0;
-      const openPrice = ticker?.open_price || ticker?.open
-                     || position.open_price || position.open || 0;
-      const prevClose = ticker?.prev_close || position.prev_close || 0;
-      const todayClose= ticker?.today_close|| position.today_close || 0;
+      // PORTFOLIO-CHANGE-FIX: use ?? instead of || so that 0 is preserved as valid.
+      // || treats 0 as falsy → falls through to next source → dayBase = livePrice → change = 0.
+      const openPrice = ticker?.open_price ?? ticker?.open
+                     ?? position.open_price ?? position.open ?? 0;
+      const prevClose = ticker?.prev_close ?? position.prev_close ?? 0;
+      const todayClose= ticker?.today_close ?? position.today_close ?? 0;
       const shares    = position.shares    || 0;
       const avgCost   = position.avg_cost  || 0;
       const marketValue = shares * livePrice;
@@ -228,10 +230,32 @@ export default function PagePortfolio({ tickers=new Map(), marketSession='market
       const totalPnL    = marketValue - costBasis;
       const totalPnLPct = costBasis > 0 ? (totalPnL / costBasis) * 100 : 0;
       const isAH        = marketSession !== 'market';
-      const dayBase     = isAH ? (todayClose || prevClose || livePrice) : (openPrice || prevClose || livePrice);
-      const dayChange   = dayBase > 0 ? livePrice - dayBase : 0;
-      const dayPnL      = shares * dayChange;
-      const dayPct      = dayBase > 0 ? (dayChange / dayBase) * 100 : 0;
+
+      // PORTFOLIO-CHANGE-FIX: prefer backend-computed change_value/percent_change
+      // from _portfolio_loop (always correct) over client-side recomputation.
+      // Client-side open_price can be 0 during cold start before first tick arrives,
+      // causing dayChange = livePrice - livePrice = 0 (the reported bug).
+      // Backend computes these in _portfolio_loop with the live cache which has open_price
+      // populated from the Polygon snapshot (always available before first tick).
+      const backendChange = position.change_value ?? position.day_change;
+      const backendPct    = position.percent_change ?? position.change_pct ?? position.day_pct;
+      const backendDayPl  = position.day_pl;
+
+      let dayChange, dayPct, dayPnL;
+
+      if (backendChange != null && backendChange !== 0 && openPrice === 0) {
+        // Backend has computed values but client has no open_price yet — trust backend
+        dayChange = backendChange;
+        dayPct    = backendPct ?? 0;
+        dayPnL    = backendDayPl != null ? backendDayPl : shares * dayChange;
+      } else {
+        // Normal path: compute from live data (most up-to-date when open_price is available)
+        const dayBase = isAH ? (todayClose || prevClose || livePrice) : (openPrice || prevClose || livePrice);
+        dayChange = (dayBase > 0 && dayBase !== livePrice) ? livePrice - dayBase : (backendChange ?? 0);
+        dayPct    = (dayBase > 0 && dayBase !== livePrice) ? (dayChange / dayBase) * 100 : (backendPct ?? 0);
+        dayPnL    = shares * dayChange;
+      }
+
       return {
         ...position,
         livePrice, openPrice, prevClose, todayClose,

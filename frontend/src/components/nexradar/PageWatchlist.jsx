@@ -239,7 +239,15 @@ export default function PageWatchlist({
     return watchlist.filter(w => w.symbol.includes(s) || (w.companyName||'').toUpperCase().includes(s));
   }, [watchlist, search]);
 
-  const COL = '82px 120px 78px 82px 78px 70px 38px';
+  // MOBILE-FIX: detect mobile for responsive layout
+  const _isMobile = typeof window !== 'undefined' && window.innerWidth < 768;
+  // MOBILE-FIX: on mobile, collapse grid to essential columns only
+  const COL = _isMobile
+    ? '70px 1fr 68px 68px 30px'       // SYMBOL, COMPANY, PRICE, CHANGE, ✕
+    : '82px 120px 78px 82px 78px 70px 38px';
+  const COL_HEADERS = _isMobile
+    ? ['SYMBOL','COMPANY','PRICE','CHANGE','✕']
+    : ['SYMBOL','COMPANY','PRICE','CHANGE','VOLUME','52W','✕'];
 
   // Guard: T (theme) may be undefined on first render if parent hasn't loaded yet
   if (!T) return null;
@@ -308,17 +316,23 @@ export default function PageWatchlist({
       </div>
 
       {/* Split layout */}
-      <div style={{ display:'flex', flex:1, overflow:'hidden' }}>
+      {/* MOBILE-FIX: on mobile, use column layout. Right panel becomes a
+          full-width bottom section that only appears when a ticker is selected.
+          On desktop, keeps the original side-by-side layout. */}
+      <div style={{ display:'flex', flexDirection: _isMobile ? 'column' : 'row', flex:1, overflow:'hidden' }}>
 
         {/* LEFT — table */}
+        {/* MOBILE-FIX: on mobile when a ticker is selected, hide the table to
+            give full screen to the detail panel. Tap back to return. */}
+        {(!_isMobile || !selectedTick) && (
         <div style={{ flex:1, display:'flex', flexDirection:'column',
-          overflow:'hidden', borderRight:`1px solid ${T.border}` }}>
+          overflow:'hidden', borderRight: _isMobile ? 'none' : `1px solid ${T.border}` }}>
 
           {/* Headers */}
           <div style={{ display:'grid', gridTemplateColumns:COL,
             background:T.bg0, borderBottom:`2px solid ${T.border}`,
             padding:'0 14px', flexShrink:0 }}>
-            {['SYMBOL','COMPANY','PRICE','CHANGE','VOLUME','52W','✕'].map(h=>(
+            {COL_HEADERS.map(h=>(
               <div key={h} style={{ padding:'7px 4px', color:T.text2, fontSize:8,
                 fontFamily:T.font, letterSpacing:0.8, fontWeight:700 }}>{h}</div>
             ))}
@@ -406,16 +420,20 @@ export default function PageWatchlist({
                       : <Shimmer w={40} h={10} T={T}/>}
                   </div>
 
-                  {/* VOLUME */}
+                  {/* VOLUME — hidden on mobile */}
+                  {!_isMobile && (
                   <div style={{ padding:'9px 4px', color:T.text1, fontSize:10,
                     fontFamily:T.font, display:'flex', alignItems:'center' }}>
                     {live?.volume ? fmtVol(live.volume) : '—'}
                   </div>
+                  )}
 
-                  {/* 52W range */}
+                  {/* 52W range — hidden on mobile */}
+                  {!_isMobile && (
                   <div style={{ padding:'9px 4px', display:'flex', alignItems:'center' }}>
                     <RangeBar price={live?.price} high={live?.high} low={live?.low} T={T}/>
                   </div>
+                  )}
 
                   {/* Remove */}
                   <div style={{ padding:'9px 4px', display:'flex', alignItems:'center' }}>
@@ -442,10 +460,25 @@ export default function PageWatchlist({
             </span>
           </div>
         </div>
+        )} {/* end MOBILE-FIX: left panel conditional */}
 
         {/* RIGHT — AgenticPanel (Edgar + Polygon + AI) */}
-        <div style={{ width:320, flexShrink:0, display:'flex',
+        {/* MOBILE-FIX: on mobile, takes full width and only shows when a ticker
+            is selected. Back button returns to the ticker list. On desktop,
+            keeps fixed 320px width. */}
+        {(!_isMobile || selectedTick) && (
+        <div style={{ width: _isMobile ? '100%' : 320, flexShrink:0, display:'flex',
           flexDirection:'column', background:T.bg1, overflow:'hidden' }}>
+          {/* MOBILE-FIX: back button to return to ticker list */}
+          {_isMobile && selectedTick && (
+            <button onClick={() => { setSelectedTick(null); setSelectedRow(null); }}
+              style={{ display:'flex', alignItems:'center', gap:6, padding:'10px 14px',
+                background:T.bg0, border:'none', borderBottom:`1px solid ${T.border}`,
+                color:T.cyan, fontFamily:T.font, fontSize:11, fontWeight:700,
+                cursor:'pointer', flexShrink:0 }}>
+              ← Back to watchlist
+            </button>
+          )}
           <AgenticPanel
             ticker={selectedTick}
             rowHint={selectedRow}
@@ -455,6 +488,7 @@ export default function PageWatchlist({
             T={T}
           />
         </div>
+        )} {/* end MOBILE-FIX: right panel conditional */}
       </div>
 
       {/* Floating alert toast */}

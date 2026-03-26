@@ -28,6 +28,7 @@ export default function PageDashboard({ onNavigate, onSectorChange, selectedSect
   // ── Options Flow state ──
   const [optionsFlow,    setOptionsFlow]    = useState([]);
   const [optionsLoading, setOptionsLoading] = useState(true);
+  const [optionsMessage, setOptionsMessage] = useState('');  // OPTIONS-MSG-FIX: surface backend message
   const [optionsFilter,  setOptionsFilter]  = useState("ALL"); // ALL | CALLS | PUTS | SWEEP
 
   // ── Earnings badge state (live SSE earnings_alert) ──
@@ -115,14 +116,19 @@ export default function PageDashboard({ onNavigate, onSectorChange, selectedSect
     // OPTIONS-MOCK-REMOVED: backend fetches Polygon /v3/snapshot/options per
     // watchlist ticker. Requires Polygon Starter tier+. Returns { data: [] }
     // with a message if key missing or tier insufficient — no fake rows.
+    // OPTIONS-MSG-FIX: capture backend message so user sees WHY it's empty.
     fetch(`${API_BASE}/api/options-flow`)
       .then(r => r.ok ? r.json() : Promise.reject(r.status))
       .then(j => {
         const rows = Array.isArray(j?.data) ? j.data : Array.isArray(j) ? j : [];
         setOptionsFlow(rows);
+        // OPTIONS-MSG-FIX: surface backend message when data is empty
+        if (rows.length === 0 && j?.message) {
+          setOptionsMessage(j.message);
+        }
         setOptionsLoading(false);
       })
-      .catch(() => { setOptionsFlow([]); setOptionsLoading(false); });
+      .catch(() => { setOptionsFlow([]); setOptionsMessage('Failed to load options flow'); setOptionsLoading(false); });
   }, []);
 
   const fmt2 = n => Number(n || 0).toFixed(2);
@@ -132,16 +138,21 @@ export default function PageDashboard({ onNavigate, onSectorChange, selectedSect
       <style>{`@keyframes badge_pulse { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(1.18);opacity:0.85} }`}</style>
 
       {/* ── LEFT COLUMN ── */}
-      <div style={{ flex:2, minWidth:460, display:"flex", flexDirection:"column", gap:18, alignSelf:"flex-start" }}>
+      {/* MOBILE-FIX: minWidth reduced from 460→0 so the flex-wrap actually works on
+          mobile screens. 460px exceeds the 375px viewport of an iPhone, causing the
+          right column to never wrap and the entire page to overflow horizontally. */}
+      <div style={{ flex:2, minWidth:0, display:"flex", flexDirection:"column", gap:18, alignSelf:"flex-start" }}>
 
         {/* Row 1: Market Breadth — full width of left column */}
-        <div className="card card-glow" style={{ flex:2, minWidth:340 }}>
+        {/* MOBILE-FIX: minWidth reduced from 340→0 and grid minmax from 115→95px
+            so 3 columns fit on a 375px screen (3×95 + 2×8gap + 28padding = 329px). */}
+        <div className="card card-glow" style={{ flex:2, minWidth:0 }}>
           <SectionHeader title="Market Breadth" T={T}>
             {["1D","1W"].map(tf => (
               <button key={tf} className="btn-ghost" style={{ fontSize:9, background:breadthTimeframe===tf?T.cyan+"20":"transparent", color:breadthTimeframe===tf?T.cyan:T.text2 }} onClick={() => setBreadthTimeframe(tf)}>{tf}</button>
             ))}
           </SectionHeader>
-          <div style={{ padding:14, display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(115px,1fr))", gap:8 }}>
+          <div style={{ padding:14, display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(95px,1fr))", gap:8 }}>
             {sectorTiles.map(s => {
               const active = selectedSectors.includes(s.id);
               const perf = sectorPerformance[s.id] || { avgReturn:0, count:0, gainers:0, losers:0 };
@@ -377,7 +388,16 @@ export default function PageDashboard({ onNavigate, onSectorChange, selectedSect
                 if (optionsFilter === "CALLS")  rows = rows.filter(r => r.type === "CALL");
                 if (optionsFilter === "PUTS")   rows = rows.filter(r => r.type === "PUT");
                 if (optionsFilter === "SWEEP")  rows = rows.filter(r => r.sweep);
-                if (rows.length === 0) return <EmptyState icon="◈" label="NO FLOW DETECTED" sub="No unusual options activity" h={120} T={T}/>;
+                if (rows.length === 0) return (
+                  <div style={{ padding:'20px 14px', textAlign:'center' }}>
+                    <EmptyState icon="◈" label="NO FLOW DATA" sub={optionsMessage || "No unusual options activity"} h={80} T={T}/>
+                    {optionsMessage && (
+                      <div style={{ marginTop:8, padding:'8px 12px', background:T.gold+'10', border:`1px solid ${T.gold}30`, borderRadius:6 }}>
+                        <span style={{ color:T.gold, fontSize:9.5, fontFamily:T.font }}>ℹ {optionsMessage}</span>
+                      </div>
+                    )}
+                  </div>
+                );
                 return rows.map((r, i) => {
                   const isCall = r.type === "CALL";
                   const typeColor = isCall ? T.green : T.red;
@@ -403,7 +423,7 @@ export default function PageDashboard({ onNavigate, onSectorChange, selectedSect
             </div>
             <div style={{ padding:"6px 14px", borderTop:`1px solid ${T.border}`, display:"flex", justifyContent:"space-between", flexShrink:0 }}>
               <span style={{ color:T.text3, fontSize:8.5, fontFamily:T.font }}>Unusual activity · premium ≥ $500K</span>
-              <span style={{ color:T.text3, fontSize:8.5, fontFamily:T.font }}>Mock · swap /api/options-flow</span>
+              <span style={{ color:T.text3, fontSize:8.5, fontFamily:T.font }}>Polygon Starter+ required</span>
             </div>
           </div>
 

@@ -215,6 +215,15 @@ class WSEngine:
         self._last_tick_mono: Dict[str, float] = {}  # ticker → time.monotonic()
         self._tick_mono_lock = threading.Lock()
 
+        # ── MOMENTUM-SCANNER: real-time intraday momentum scoring ──────────
+        # Computes momentum_score for ALL tickers on every tick_flush.
+        # Score = weighted(price_velocity_5m, vol_acceleration, vwap_distance).
+        # Top 20 by |momentum_score| broadcast as 'momentum_leaders' every 30s.
+        # No additional API calls — uses data already in _cache.
+        self._momentum_scores: Dict[str, dict] = {}  # ticker → {score, velocity, vol_accel, vwap_dist, direction, ts}
+        self._momentum_lock   = threading.Lock()
+        self._price_history_5m: Dict[str, deque] = {}  # ticker → deque of (ts, price) tuples, maxlen=300 (5min@1s)
+
         # TIER3-10: Polygon WS message-rate monitor
         # Counts T/A messages per 10s window. If rate drops to 0 during market
         # hours for > FEED_SILENCE_S, broadcasts feed_warning (distinct from
@@ -294,6 +303,11 @@ class WSEngine:
 
         # TIER3-10: Polygon message-rate monitor
         t = threading.Thread(target=self._feed_rate_monitor_loop, daemon=True, name="feed-rate-monitor")
+        t.start()
+        self._threads.append(t)
+
+        # MOMENTUM-SCANNER: real-time intraday momentum scoring (30s interval)
+        t = threading.Thread(target=self._momentum_loop, daemon=True, name="momentum-scanner")
         t.start()
         self._threads.append(t)
 
@@ -590,6 +604,10 @@ class WSEngine:
             self._cache[ticker]["_last_sent_ts"]    = now_ms
             with self._batch_lock:
                 self._tick_batch[ticker] = updated
+            # MOMENTUM-SCANNER: track price history for velocity calculation
+            _p = float(updated.get("live_price") or updated.get("price") or 0)
+            if _p > 0:
+                self._update_price_history(ticker, _p)
 
     # ── Tick flush loop ────────────────────────────────────────────────────────
 
@@ -632,6 +650,148 @@ class WSEngine:
                 batch_data = [self._make_delta(v) for v in self._tick_batch.values()]
                 self._tick_batch.clear()
             self._broadcast({"type": "tick_batch", "data": batch_data})
+
+    # ── Momentum Scanner ───────────────────────────────────────────────────────
+    # Real-time intraday momentum scoring across ALL tickers.
+    # Runs in its own thread, computes scores every 30s using cached price data.
+    # Broadcasts top 20 momentum leaders via SSE for frontend rendering.
+    #
+    # Score formula (0-100 scale):
+    #   momentum_score = (
+    #     0.40 × price_velocity_5m_normalized +   -- price move vs 5min ago
+    #     0.30 × vol_acceleration_normalized  +   -- current vol vs expected
+    #     0.30 × vwap_distance_normalized         -- price distance from VWAP
+    #   )
+    #
+    # No additional API calls — purely computed from the live _cache.
+
+    def _update_price_history(self, ticker: str, price: float) -> None:
+        """Track rolling 5-min price history for momentum velocity calculation."""
+        now = time.monotonic()
+        if ticker not in self._price_history_5m:
+            self._price_history_5m[ticker] = deque(maxlen=300)
+        self._price_history_5m[ticker].append((now, price))
+
+    def _compute_momentum_scores(self) -> None:
+        """
+        Compute momentum scores for WATCHLIST tickers only.
+
+        WATCHLIST-SCOPE-FIX: Originally computed for ALL 5,500+ tickers which
+        was wasteful — the user only cares about their starred tickers for
+        momentum tracking. Now reads self._watchlist_tickers (same list used
+        by the signal engine, max 50).
+
+        Also includes intraday_pct (price vs today's open) for cleaner frontend
+        rendering without recomputation.
+        """
+        now_mono = time.monotonic()
+
+        # Read watchlist tickers
+        watchlist = list(self._watchlist_tickers) if self._watchlist_tickers else []
+        if not watchlist:
+            with self._momentum_lock:
+                self._momentum_scores = {}
+            return
+
+        # Pre-compute ET time once (outside the loop)
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        et_now = datetime.now(ZoneInfo("America/New_York"))
+        mins_since_open = (et_now.hour - 9) * 60 + (et_now.minute - 30)
+
+        with self._cache_lock:
+            cache_snap = {tk: self._cache[tk] for tk in watchlist if tk in self._cache}
+
+        scores = {}
+        for ticker, row in cache_snap.items():
+            price = float(row.get("live_price") or row.get("price") or 0)
+            if price <= 0:
+                continue
+            volume    = float(row.get("volume") or 0)
+            vwap      = float(row.get("vwap") or 0)
+            avg_vol   = float(row.get("avg_volume") or row.get("avg_vol") or 0)
+            open_price = float(row.get("open") or row.get("open_price") or 0)
+
+            # ── Intraday % (price vs open) ──
+            intraday_pct = 0.0
+            if open_price > 0:
+                intraday_pct = ((price - open_price) / open_price) * 100
+
+            # ── Price velocity: 5-min price change % ──
+            velocity_pct = 0.0
+            hist = self._price_history_5m.get(ticker)
+            if hist and len(hist) >= 2:
+                target_ts = now_mono - 300
+                old_price = None
+                for ts, p in hist:
+                    if ts <= target_ts:
+                        old_price = p
+                    else:
+                        break
+                if old_price and old_price > 0:
+                    velocity_pct = ((price - old_price) / old_price) * 100
+
+            # ── Volume acceleration: current / expected ──
+            vol_accel = 0.0
+            if avg_vol > 0 and volume > 0 and 0 < mins_since_open <= 390:
+                expected_fraction = mins_since_open / 390.0
+                expected_vol = avg_vol * expected_fraction
+                if expected_vol > 0:
+                    vol_accel = volume / expected_vol  # 1.0 = normal, 2.0 = 2× expected
+
+            # ── VWAP distance % ──
+            vwap_dist_pct = 0.0
+            if vwap > 0:
+                vwap_dist_pct = ((price - vwap) / vwap) * 100
+
+            # ── Composite score (signed: + = bullish momentum, - = bearish) ──
+            # Normalize each component to roughly -10..+10 range before weighting
+            vel_norm  = max(-10, min(10, velocity_pct * 5))    # ±2% move → ±10
+            vol_norm  = max(-5,  min(10, (vol_accel - 1) * 5)) # 3× vol → +10
+            vwap_norm = max(-10, min(10, vwap_dist_pct * 3))   # ±3.3% from VWAP → ±10
+
+            raw_score = (0.40 * vel_norm + 0.30 * vol_norm + 0.30 * vwap_norm)
+            direction = "UP" if raw_score > 0 else "DOWN" if raw_score < 0 else "FLAT"
+
+            scores[ticker] = {
+                "ticker":       ticker,
+                "score":        round(raw_score, 2),
+                "velocity_5m":  round(velocity_pct, 3),
+                "vol_accel":    round(vol_accel, 2),
+                "vwap_dist":    round(vwap_dist_pct, 3),
+                "intraday_pct": round(intraday_pct, 3),
+                "direction":    direction,
+                "price":        round(price, 2),
+                "volume":       int(volume),
+                "sector":       self._sector_map.get(ticker, ""),
+            }
+
+        with self._momentum_lock:
+            self._momentum_scores = scores
+
+    def _momentum_loop(self) -> None:
+        """Background thread: compute + broadcast momentum leaders every 30s."""
+        while not self._shutdown.is_set():
+            time.sleep(30)
+            try:
+                self._compute_momentum_scores()
+
+                with self._momentum_lock:
+                    all_scores = list(self._momentum_scores.values())
+
+                if not all_scores:
+                    continue
+
+                # Top 20 by absolute score (strongest momentum in either direction)
+                leaders = sorted(all_scores, key=lambda x: abs(x["score"]), reverse=True)[:20]
+
+                self._broadcast({
+                    "type": "momentum_leaders",
+                    "data": leaders,
+                    "ts":   int(time.time() * 1000),
+                })
+            except Exception as e:
+                logger.debug(f"Momentum scanner error: {e}")
 
     # ── Snapshot loop ──────────────────────────────────────────────────────────
 
@@ -1285,8 +1445,10 @@ class WSEngine:
                             "open":           open_price,
                             "change_pct":     round(percent_change, 4),
                         })
-                import time as _time_mod
-                self._broadcast({"type": "portfolio_update", "data": enriched, "server_ts": int(_time_mod.time() * 1000)})
+                # TIME-IMPORT-FIX: removed `import time as _time_mod` from inside the while loop.
+                # `time` is already imported at module level (line 73). The repeated import was
+                # harmless (Python caches imports) but wasteful and confusing.
+                self._broadcast({"type": "portfolio_update", "data": enriched, "server_ts": int(time.time() * 1000)})
             except Exception as e:
                 logger.warning(f"Portfolio refresh error: {e}")
             _interval = 5 if _first else PORTFOLIO_REFRESH_S
