@@ -552,8 +552,16 @@ export default function PageScanner({ T, onNavigateToChart, tickers = new Map() 
   const [mtfSortKey, setMtfSortKey] = useState('confluence');
   const [mtfSortDir, setMtfSortDir] = useState('desc');
   const [mtfFilter,  setMtfFilter]  = useState('ALL');
+  // ── Momentum Scanner state ──────────────────────────────────────────────
+  const [momData,      setMomData]      = useState([]);
+  const [momLoading,   setMomLoading]   = useState(false);
+  const [momError,     setMomError]     = useState(null);
+  const [momSortKey,   setMomSortKey]   = useState('score');
+  const [momSortDir,   setMomSortDir]   = useState('desc');
+  const [momFilter,    setMomFilter]    = useState('ALL'); // ALL | UP | DOWN
   const timerRef = useRef(null);
   const mtfTimerRef = useRef(null);
+  const momTimerRef = useRef(null);
 
   const fetchData = useCallback(async (showLoad = false) => {
     if (showLoad) setLoading(true);
@@ -585,6 +593,19 @@ export default function PageScanner({ T, onNavigateToChart, tickers = new Map() 
     finally { setMtfLoading(false); }
   }, []);
 
+  // ── Momentum Scanner fetch ──────────────────────────────────────────────
+  const fetchMomentum = useCallback(async () => {
+    setMomLoading(true);
+    try {
+      const r = await fetch(`${API_BASE}/api/momentum-scan?limit=50`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      setMomData(j.data || []);
+      setMomError(j.message && j.data?.length === 0 ? j.message : null);
+    } catch (e) { setMomError(e.message); }
+    finally { setMomLoading(false); }
+  }, []);
+
   useEffect(() => {
     fetchData(true);
     timerRef.current = setInterval(() => fetchData(false), REFRESH_MS);
@@ -597,6 +618,14 @@ export default function PageScanner({ T, onNavigateToChart, tickers = new Map() 
     mtfTimerRef.current = setInterval(fetchMtf, REFRESH_MS);
     return () => clearInterval(mtfTimerRef.current);
   }, [tab, fetchMtf]);
+
+  // ── Momentum Scanner lifecycle — fetch on tab activate, poll every 30s ──
+  useEffect(() => {
+    if (tab !== 'momentum') { clearInterval(momTimerRef.current); return; }
+    fetchMomentum();
+    momTimerRef.current = setInterval(fetchMomentum, REFRESH_MS);
+    return () => clearInterval(momTimerRef.current);
+  }, [tab, fetchMomentum]);
 
   // ── Sorting ────────────────────────────────────────────────────────────────
   const handleOppSort = (key) => {
@@ -682,6 +711,34 @@ export default function PageScanner({ T, onNavigateToChart, tickers = new Map() 
     return rsSortDir === 'asc' ? av - bv : bv - av;
   });
 
+  // ── Momentum Scanner: sort + filter ─────────────────────────────────────
+  const handleMomSort = (key) => {
+    if (momSortKey === key) setMomSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setMomSortKey(key); setMomSortDir('desc'); }
+  };
+  const momFiltered = momData.filter(r => {
+    if (momFilter === 'UP')   return r.direction === 'UP';
+    if (momFilter === 'DOWN') return r.direction === 'DOWN';
+    return true;
+  });
+  // Enrich momentum rows with live SSE prices for real-time rendering
+  const momRows = momFiltered.map(r => {
+    const live = tickers.get(r.ticker);
+    if (!live) return r;
+    return {
+      ...r,
+      price:        live.live_price ?? r.price,
+      volume:       live.volume ?? r.volume,
+      intraday_pct: (live.open > 0 && live.live_price > 0)
+        ? ((live.live_price - live.open) / live.open * 100)
+        : (r.intraday_pct ?? 0),
+    };
+  }).sort((a, b) => {
+    let av = a[momSortKey] ?? 0, bv = b[momSortKey] ?? 0;
+    if (typeof av === 'string') return momSortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+    return momSortDir === 'asc' ? av - bv : bv - av;
+  });
+
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="page-enter" style={{ display: 'flex', flexDirection: 'column', gap: 12, height: '100%' }}>
@@ -710,11 +767,12 @@ export default function PageScanner({ T, onNavigateToChart, tickers = new Map() 
       />
 
       {/* Sub-tab bar */}
-      <div style={{ display: 'flex', gap: 4 }}>
+      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
         {[
           { id: 'opportunities', label: '◈ OPPORTUNITIES', hint: 'Ranked by composite score'      },
           { id: 'rs',            label: '⇅ REL. STRENGTH', hint: 'Ranked by RS vs SPY'            },
           { id: 'mtf',           label: '⧖ MULTI-TF',      hint: '1m + 5m + 15m confluence scan'  },
+          { id: 'momentum',      label: '🚀 MOMENTUM',      hint: 'Intraday momentum — velocity + volume + VWAP' },
         ].map(t => (
           <button key={t.id} className="btn-ghost"
             onClick={() => setTab(t.id)}
@@ -818,7 +876,209 @@ export default function PageScanner({ T, onNavigateToChart, tickers = new Map() 
           </>
         )}
 
-        {!loading && filtered.length === 0 && data.length > 0 && (
+        {/* ═══ MOMENTUM TAB ═══ */}
+        {tab === 'momentum' && (
+          <>
+            {/* Momentum filter bar */}
+            <div style={{ display:'flex', gap:6, padding:'8px 12px', borderBottom:`1px solid ${T.border}`, flexShrink:0, alignItems:'center', flexWrap:'wrap' }}>
+              {['ALL','UP','DOWN'].map(f => (
+                <button key={f} className="btn-ghost" onClick={() => setMomFilter(f)}
+                  style={{ fontSize:9, padding:'4px 10px', fontWeight:700, letterSpacing:0.5,
+                    background:momFilter===f?T.cyanDim:undefined, color:momFilter===f?T.cyan:undefined,
+                    borderColor:momFilter===f?T.cyanMid:undefined }}>
+                  {f === 'UP' ? '▲ UP' : f === 'DOWN' ? '▼ DOWN' : f}
+                </button>
+              ))}
+              <div style={{ width:1, height:18, background:T.border, flexShrink:0 }}/>
+              {/* Live stats */}
+              {momData.length > 0 && (
+                <>
+                  <div style={{ display:'flex', alignItems:'center', gap:4, background:T.bg2, border:`1px solid ${T.border}`, borderRadius:5, padding:'3px 8px' }}>
+                    <span style={{ color:T.text2, fontSize:8, fontFamily:T.font }}>UP</span>
+                    <span style={{ color:T.green, fontSize:12, fontFamily:T.font, fontWeight:800 }}>{momData.filter(r=>r.direction==='UP').length}</span>
+                  </div>
+                  <div style={{ display:'flex', alignItems:'center', gap:4, background:T.bg2, border:`1px solid ${T.border}`, borderRadius:5, padding:'3px 8px' }}>
+                    <span style={{ color:T.text2, fontSize:8, fontFamily:T.font }}>DOWN</span>
+                    <span style={{ color:T.red, fontSize:12, fontFamily:T.font, fontWeight:800 }}>{momData.filter(r=>r.direction==='DOWN').length}</span>
+                  </div>
+                </>
+              )}
+              <div style={{ flex:1 }}/>
+              <button className="btn-ghost" onClick={fetchMomentum} disabled={momLoading}
+                style={{ fontSize:9, padding:'4px 10px' }}>
+                {momLoading ? '⏳' : '↻'} Refresh
+              </button>
+              <span style={{ color:T.text2, fontSize:9 }}>{momRows.length} tickers</span>
+            </div>
+
+            {/* Column headers */}
+            {momRows.length > 0 && (
+              <div style={{ display:'grid', gridTemplateColumns:'28px 80px 70px 70px 75px 80px 75px 70px 80px 1fr', background:T.bg0, borderBottom:`2px solid ${T.border}`, padding:'0 4px', flexShrink:0 }}>
+                {[
+                  {key:'#',          label:'#',       sort:false},
+                  {key:'ticker',     label:'TICKER',  sort:true},
+                  {key:'price',      label:'PRICE',   sort:true},
+                  {key:'intraday_pct',label:'DAY %',  sort:true},
+                  {key:'velocity_5m',label:'VEL 5M',  sort:true},
+                  {key:'vol_accel',  label:'VOL ACCEL',sort:true},
+                  {key:'vwap_dist',  label:'VWAP Δ',  sort:true},
+                  {key:'score',      label:'SCORE',   sort:true},
+                  {key:'direction',  label:'DIR',     sort:true},
+                  {key:'sector',     label:'SECTOR',  sort:false},
+                ].map(c => (
+                  <div key={c.key} onClick={() => c.sort && handleMomSort(c.key)}
+                    style={{ padding:'9px 6px', color:momSortKey===c.key?T.cyan:T.text1,
+                      fontSize:9, letterSpacing:0.8, fontFamily:T.font, fontWeight:800,
+                      cursor:c.sort?'pointer':'default', userSelect:'none', whiteSpace:'nowrap',
+                      display:'flex', alignItems:'center', gap:3 }}>
+                    {c.label}
+                    {momSortKey===c.key && <span style={{ fontSize:8 }}>{momSortDir==='asc'?'↑':'↓'}</span>}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Loading state */}
+            {momLoading && momData.length === 0 && (
+              <div style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:12, padding:48 }}>
+                <div style={{ color:T.cyan, fontSize:22 }}>🚀</div>
+                <div style={{ color:T.text1, fontSize:13, fontWeight:600 }}>Loading momentum data…</div>
+                <div style={{ color:T.text2, fontSize:11 }}>Scores populate ~5 min after market data flows in</div>
+              </div>
+            )}
+
+            {/* Error state */}
+            {momError && (
+              <div style={{ background:T.redDim, border:`1px solid ${T.red}`, borderRadius:8, padding:'10px 16px', color:T.red, fontSize:12, margin:12 }}>
+                ⚠ {momError}
+              </div>
+            )}
+
+            {/* Empty state */}
+            {!momLoading && momData.length === 0 && !momError && (
+              <div style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:14, padding:48 }}>
+                <div style={{ fontSize:32 }}>🚀</div>
+                <div style={{ color:T.text1, fontSize:14, fontWeight:700 }}>No momentum data yet</div>
+                <div style={{ color:T.text2, fontSize:11, textAlign:'center', maxWidth:400, lineHeight:1.7 }}>
+                  Momentum scores compute every <strong style={{ color:T.cyan }}>30 seconds</strong> for your
+                  <strong style={{ color:T.gold }}> ★ watchlist</strong> tickers.
+                  Star some tickers in the Live Table, then wait ~5 minutes after market open.
+                </div>
+              </div>
+            )}
+
+            {/* Data rows */}
+            {momRows.length > 0 && (
+              <div style={{ flex:1, overflowY:'auto' }}>
+                {momRows.map((row, i) => {
+                  const isUp    = row.direction === 'UP';
+                  const dirClr  = isUp ? T.green : row.direction === 'DOWN' ? T.red : T.text2;
+                  const scoreClr = Math.abs(row.score) >= 5 ? (isUp ? T.green : T.red)
+                                 : Math.abs(row.score) >= 2 ? (isUp ? '#7fff7f' : '#ff9999')
+                                 : T.text2;
+                  const velClr  = row.velocity_5m > 0 ? T.green : row.velocity_5m < 0 ? T.red : T.text2;
+                  const volClr  = row.vol_accel >= 2 ? T.gold : row.vol_accel >= 1.3 ? T.cyan : T.text1;
+                  const vwapClr = row.vwap_dist > 0 ? T.green : row.vwap_dist < 0 ? T.red : T.text2;
+                  const dayClr  = (row.intraday_pct ?? 0) >= 0 ? T.green : T.red;
+
+                  // Score bar — visual gauge from -10 to +10
+                  const barPct = Math.min(100, Math.abs(row.score) / 10 * 100);
+
+                  return (
+                    <div key={row.ticker} className="tr-hover"
+                      onClick={() => onNavigateToChart && onNavigateToChart(row.ticker)}
+                      style={{ display:'grid', gridTemplateColumns:'28px 80px 70px 70px 75px 80px 75px 70px 80px 1fr',
+                        borderBottom:`1px solid ${T.border}`, padding:'0 4px', cursor:'pointer' }}>
+
+                      {/* Rank */}
+                      <div style={{ padding:'9px 4px', color:T.text2, fontSize:10, fontFamily:'monospace', textAlign:'center' }}>
+                        {i + 1}
+                      </div>
+
+                      {/* Ticker */}
+                      <div style={{ padding:'9px 6px', display:'flex', alignItems:'center', gap:5 }}>
+                        <span style={{ color:T.text0, fontWeight:700, fontSize:12, fontFamily:'monospace' }}>{row.ticker}</span>
+                      </div>
+
+                      {/* Price */}
+                      <div style={{ padding:'9px 6px', color:T.text0, fontSize:12, fontFamily:'monospace' }}>
+                        ${row.price?.toFixed(2) ?? '—'}
+                      </div>
+
+                      {/* Day % */}
+                      <div style={{ padding:'9px 6px', color:dayClr, fontSize:12, fontFamily:'monospace', fontWeight:600 }}>
+                        {row.intraday_pct != null ? `${row.intraday_pct >= 0 ? '+' : ''}${row.intraday_pct.toFixed(2)}%` : '—'}
+                      </div>
+
+                      {/* Velocity 5m */}
+                      <div style={{ padding:'9px 6px', color:velClr, fontSize:11, fontFamily:'monospace', fontWeight:600 }}>
+                        {row.velocity_5m != null ? `${row.velocity_5m >= 0 ? '+' : ''}${row.velocity_5m.toFixed(3)}%` : '—'}
+                      </div>
+
+                      {/* Vol Accel */}
+                      <div style={{ padding:'9px 6px', color:volClr, fontSize:11, fontFamily:'monospace', fontWeight:600 }}>
+                        {row.vol_accel != null ? `${row.vol_accel.toFixed(2)}×` : '—'}
+                      </div>
+
+                      {/* VWAP Distance */}
+                      <div style={{ padding:'9px 6px', color:vwapClr, fontSize:11, fontFamily:'monospace', fontWeight:600 }}>
+                        {row.vwap_dist != null ? `${row.vwap_dist >= 0 ? '+' : ''}${row.vwap_dist.toFixed(2)}%` : '—'}
+                      </div>
+
+                      {/* Score with visual bar */}
+                      <div style={{ padding:'9px 6px', display:'flex', flexDirection:'column', gap:3, justifyContent:'center' }}>
+                        <span style={{ color:scoreClr, fontSize:13, fontFamily:'monospace', fontWeight:800 }}>
+                          {row.score >= 0 ? '+' : ''}{row.score?.toFixed(1)}
+                        </span>
+                        <div style={{ width:50, height:3, background:T.bg3, borderRadius:2, overflow:'hidden', position:'relative' }}>
+                          <div style={{ position:'absolute', top:0, left:'50%', width:1, height:'100%', background:T.border }}/>
+                          <div style={{
+                            position:'absolute', top:0, height:'100%', borderRadius:2,
+                            background: dirClr,
+                            left:  isUp ? '50%' : `${50 - barPct/2}%`,
+                            width: `${barPct/2}%`,
+                            opacity: 0.8,
+                          }}/>
+                        </div>
+                      </div>
+
+                      {/* Direction badge */}
+                      <div style={{ padding:'9px 6px', display:'flex', alignItems:'center' }}>
+                        <span style={{
+                          color:dirClr, fontSize:9, fontWeight:700, fontFamily:T.font,
+                          padding:'2px 7px', borderRadius:4, background:dirClr+'15',
+                          letterSpacing:0.5,
+                        }}>
+                          {isUp ? '▲ UP' : row.direction === 'DOWN' ? '▼ DOWN' : '— FLAT'}
+                        </span>
+                      </div>
+
+                      {/* Sector */}
+                      <div style={{ padding:'9px 6px', color:T.text2, fontSize:10, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                        {row.sector || '—'}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Footer */}
+            {momRows.length > 0 && (
+              <div style={{ padding:'10px 16px', borderTop:`2px solid ${T.border}`, flexShrink:0,
+                display:'flex', justifyContent:'space-between', alignItems:'center', background:T.bg0 }}>
+                <span style={{ color:T.text1, fontSize:12, fontFamily:T.font, fontWeight:600 }}>
+                  {momRows.length} tickers · sorted by {momSortKey} {momSortDir === 'asc' ? '↑' : '↓'}
+                </span>
+                <span style={{ color:T.text2, fontSize:10, fontFamily:T.font }}>
+                  ★ Watchlist · 30s refresh · Score = 40% velocity + 30% vol accel + 30% VWAP
+                </span>
+              </div>
+            )}
+          </>
+        )}
+
+        {!loading && filtered.length === 0 && data.length > 0 && tab !== 'momentum' && (
           <div style={{ padding: 32, textAlign: 'center', color: T.text2, fontSize: 12 }}>
             No tickers match the current filters.
           </div>

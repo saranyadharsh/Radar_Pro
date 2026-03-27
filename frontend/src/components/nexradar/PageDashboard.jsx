@@ -138,10 +138,10 @@ export default function PageDashboard({ onNavigate, onSectorChange, selectedSect
       <style>{`@keyframes badge_pulse { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(1.18);opacity:0.85} }`}</style>
 
       {/* ── LEFT COLUMN ── */}
-      {/* MOBILE-FIX: minWidth reduced from 460→0 so the flex-wrap actually works on
-          mobile screens. 460px exceeds the 375px viewport of an iPhone, causing the
-          right column to never wrap and the entire page to overflow horizontally. */}
-      <div style={{ flex:2, minWidth:0, display:"flex", flexDirection:"column", gap:18, alignSelf:"flex-start" }}>
+      {/* MOBILE-FIX-v2: minWidth set to 300px so it takes full width on mobile
+          (300 > 375/2 = forces wrap) but doesn't overflow. On desktop (>768px)
+          flex:2 gives it ~66% of the available width. */}
+      <div style={{ flex:2, minWidth:300, display:"flex", flexDirection:"column", gap:18, alignSelf:"flex-start" }}>
 
         {/* Row 1: Market Breadth — full width of left column */}
         {/* MOBILE-FIX: minWidth reduced from 340→0 and grid minmax from 115→95px
@@ -432,7 +432,9 @@ export default function PageDashboard({ onNavigate, onSectorChange, selectedSect
       </div>{/* end left column */}
 
       {/* ── RIGHT COLUMN ── */}
-      <div style={{ flex:1, minWidth:260, display:"flex", flexDirection:"column", gap:18 }}>
+      {/* MOBILE-FIX-v2: minWidth reduced from 260→200 so flex-wrap triggers
+          on phones. Both columns have minWidth > 50% viewport → forces wrap. */}
+      <div style={{ flex:1, minWidth:200, display:"flex", flexDirection:"column", gap:18 }}>
 
         {/* Row 1: Scalp Signals */}
         <div className="card" style={{ flex:"0 0 auto", minWidth:200, display:"flex", flexDirection:"column" }}>
